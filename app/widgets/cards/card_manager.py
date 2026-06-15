@@ -144,6 +144,7 @@ class CardManager:
 
     def show_card(self, card_id: str, window_id: str):
         """显示指定窗口的指定卡片"""
+        from loguru import logger
         if window_id not in self._window_data:
             return
         

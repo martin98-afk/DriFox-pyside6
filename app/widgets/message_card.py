@@ -1886,11 +1886,23 @@ class CodeWebViewer(QWebEngineView):
         self._resize_timer.setInterval(50)
         self._resize_timer.timeout.connect(self._safe_report_height)
 
-        # PySide6/Qt6 优化：使用全局共享 QWebEngineProfile
-        # 所有消息卡片共享同一 Chromium 渲染进程，显著降低内存
-        from app.utils.web_profile import get_or_create_shared_profile
-        _shared_profile = get_or_create_shared_profile()
-        self._page = ConsoleMonitorPage(self, profile=_shared_profile)
+        # ── 修复 macOS WebEngine 段错误 ──
+        #
+        # Qt 文档明确警告：setPage() 替换 page 时，新 page 的 QWebEngineProfile
+        # 必须与 QWebEngineView 默认 page 的 profile 相同，否则行为未定义。
+        # 旧代码用共享 profile 构造 ConsoleMonitorPage 再 setPage()，在 macOS 上
+        # 会触发 Chromium 子进程 IPC 错乱导致 segfault（崩溃前会伴随
+        # "error messaging the mach port for IMKCFRunLoopWakeUpReliable" 警告），
+        # 表现为：欢迎卡片/任何消息卡片第一次显示时整个进程崩溃。
+        #
+        # 修复：不再传 profile，让 ConsoleMonitorPage 使用 QWebEnginePage 的默认
+        # profile（与 QWebEngineView 内部默认 page 一致），保证 setPage() 安全。
+        #
+        # 代价：放弃了"所有卡片共享同一 Chromium 渲染进程"的内存优化，
+        #       每个 CodeWebViewer 拥有独立 Chromium 进程。若后续要恢复共享，
+        #       必须在 QApplication 启动时调用 page.setProfile(QWebEngineProfile.defaultProfile())
+        #       统一所有页面的 profile，**不能**靠 setPage 切换 profile。
+        self._page = ConsoleMonitorPage(self)
         self.setPage(self._page)
 
         # WebEngineSettings 优化（Qt6 新增/改进的设置项）

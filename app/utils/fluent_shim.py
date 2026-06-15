@@ -263,6 +263,7 @@ class TransparentToolButton(QPushButton):
         super().__init__(parent)
         if isinstance(icon, QIcon):
             self.setIcon(icon)
+        self.setAutoDefault(False)  # 防止 QDialog 按 Enter 时误触发
         self.setFixedSize(32, 32)
         self.setStyleSheet("""
             QPushButton {

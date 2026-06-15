@@ -452,6 +452,9 @@ class _CustomInputCard(QWidget):
                 padding-right: 0px;
                 {get_font_family_css()} font-size: {font_size_css(10)};
             }}
+            QTextEdit::placeholder {{
+                color: rgba(255, 255, 255, 0.55);
+            }}
             QTextEdit:focus {{ border-color: {Colors.REALTIME_ACCENT}; }}
         """)
         # 样式表 color 对 QTextEdit 不稳定，用 QPalette 兜底
