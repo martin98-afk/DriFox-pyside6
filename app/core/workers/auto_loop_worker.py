@@ -516,18 +516,18 @@ class AutoLoopWorker(QThread):
                 self.log_signal.emit("⚠️ Worker 启动失败，重试...")
                 return None
 
-            # 等待 Worker 完成（使用 QThread.wait() + processEvents，避免 QEventLoop 信号残留）
-            # 原因：QEventLoop.exec_() 在多轮迭代间存在旧 worker.finished 信号污染新 loop 的问题，
-            # 导致 loop 提前退出（~0ms），_on_worker_finished 永远得不到执行机会，_is_streaming 卡在 True。
-            # 改用 worker.wait() 阻塞等待线程真正结束，再用 processEvents() 处理排队的信号槽，
-            # 确保 _on_worker_finished 和 adapter.on_finished 在下一轮 execute() 前运行完。
+            # 等待 Worker 完成
+            # 使用 worker.wait() 分片等待（每 1s 检查取消状态），避免 QEventLoop 信号残留
+            # 导致的 loop.exec_() 提前退出。不设总超时 -- worker 执行多久就等多久，
+            # 只在用户主动取消时才中断。
             worker = self._conversation_executor.get_current_worker()
             if worker:
-                finished = worker.wait(60000)  # 阻塞等待线程结束，最多 60 秒
+                while worker.isRunning() and not self._is_cancelled:
+                    worker.wait(1000)  # 每秒醒来检查一次取消状态
                 # 处理排队信号（_on_worker_finished → 重置 _is_streaming；adapter.on_finished → 设置响应）
                 QCoreApplication.processEvents()
-                if not finished:
-                    logger.warning(f"[AutoLoop] Worker did not finish within 60s, forcing cleanup: isRunning={worker.isRunning()}")
+                if self._is_cancelled and worker.isRunning():
+                    logger.info(f"[AutoLoop] 用户取消，中断 worker")
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)
@@ -585,10 +585,10 @@ class AutoLoopWorker(QThread):
                 return False
             worker = self._conversation_executor.get_current_worker()
             if worker:
-                finished = worker.wait(60000)
+                while worker.isRunning() and not self._is_cancelled:
+                    worker.wait(1000)
                 QCoreApplication.processEvents()
-                if not finished:
-                    logger.warning(f"[AutoLoop] Force update worker did not finish within 60s")
+                if self._is_cancelled and worker.isRunning():
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)
