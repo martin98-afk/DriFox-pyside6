@@ -517,6 +517,11 @@ class AutoLoopWorker(QThread):
                 return None
 
             # 使用 QEventLoop 等待 Worker 完成
+            # ⚠️ 注意：不能通过 worker.isRunning() 判断是否提前退出 loop：
+            # QThread.start() 是异步的，刚返回时 isRunning() 可能为 False，
+            # 导致 loop.exec_() 立即返回而 worker 仍在后台运行，进而 _is_streaming
+            # 无法被及时重置，后续所有 execute() 调用都会返回 "Already streaming"。
+            # 60 秒超时已足够兜底，无需额外快速退出。
             worker = self._conversation_executor.get_current_worker()
             if worker:
                 loop = QEventLoop()
@@ -527,8 +532,6 @@ class AutoLoopWorker(QThread):
                 timeout_timer.setSingleShot(True)
                 timeout_timer.timeout.connect(loop.quit)
                 timeout_timer.start(60000)
-                if not worker.isRunning():
-                    loop.quit()
                 loop.exec_()
                 timeout_timer.stop()
             else:
@@ -572,23 +575,25 @@ class AutoLoopWorker(QThread):
 
         try:
             self._adapter.reset()
-            self._conversation_executor.execute(
+            success = self._conversation_executor.execute(
                 messages=force_messages,
                 llm_config=llm_config,
                 tools=current_tools,
                 callbacks=self._make_autoloop_callbacks(),
             )
+            if not success:
+                self.log_signal.emit("⚠️ 强制更新 Worker 启动失败")
+                return False
             worker = self._conversation_executor.get_current_worker()
             if worker:
                 loop = QEventLoop()
                 worker.finished.connect(loop.quit)
                 # 🛡️ 超时保护：60 秒后强制退出 QEventLoop
+                # ⚠️ 不移除 isRunning() 快速退出，参见 _execute_llm_conversation 注释
                 timeout_timer = QTimer()
                 timeout_timer.setSingleShot(True)
                 timeout_timer.timeout.connect(loop.quit)
                 timeout_timer.start(60000)
-                if not worker.isRunning():
-                    loop.quit()
                 loop.exec_()
                 timeout_timer.stop()
         except Exception as e:
