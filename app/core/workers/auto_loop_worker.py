@@ -517,21 +517,23 @@ class AutoLoopWorker(QThread):
                 return None
 
             # 等待 Worker 完成
-            # 使用 worker.wait() 分片等待（每 1s 检查取消状态），避免 QEventLoop 信号残留
-            # 导致的 loop.exec_() 提前退出。不设总超时 -- worker 执行多久就等多久，
-            # 只在用户主动取消时才中断。
+            # 使用 worker.wait() 分片等待（每 1s 检查取消状态）。
+            # ⚠️ 关键：worker 完成后，不依赖 Qt 信号来重置 _is_streaming。
+            # Qt 信号处理顺序不确定（_on_worker_finished 可能在 loop.quit 之后才执行，
+            # 导致 _is_streaming 没有被重置）。直接调用 executor 的内部方法强制重置。
             worker = self._conversation_executor.get_current_worker()
             if worker:
                 while worker.isRunning() and not self._is_cancelled:
-                    worker.wait(1000)  # 每秒醒来检查一次取消状态
-                # 处理排队信号（_on_worker_finished → 重置 _is_streaming；adapter.on_finished → 设置响应）
-                QCoreApplication.processEvents()
+                    worker.wait(1000)
                 if self._is_cancelled and worker.isRunning():
                     logger.info(f"[AutoLoop] 用户取消，中断 worker")
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)
-                    QCoreApplication.processEvents()
+                # 强制重置 _is_streaming —— 绕过不可靠的 Qt 信号处理顺序
+                self._conversation_executor._on_worker_finished(worker)
+                # 处理 adapter 和其他回调（on_finished, on_messages_updated 等）
+                QCoreApplication.processEvents()
                 logger.info(f"[AutoLoop] after wait: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
             else:
                 self._adapter.wait_for_completion(timeout=300)
@@ -587,12 +589,12 @@ class AutoLoopWorker(QThread):
             if worker:
                 while worker.isRunning() and not self._is_cancelled:
                     worker.wait(1000)
-                QCoreApplication.processEvents()
                 if self._is_cancelled and worker.isRunning():
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)
-                    QCoreApplication.processEvents()
+                self._conversation_executor._on_worker_finished(worker)
+                QCoreApplication.processEvents()
         except Exception as e:
             self.log_signal.emit(f"⚠️ 强制更新失败: {e}")
             return False
