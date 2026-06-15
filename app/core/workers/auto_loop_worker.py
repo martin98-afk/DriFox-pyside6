@@ -276,10 +276,11 @@ class AutoLoopWorker(QThread):
 
             # ===== 接力文档强制更新检查 =====
             # 在所有阶段处理之前统一检查，避免模型"作弊"（如输出了 PLANNING_COMPLETE 但没写笔记）
-            if not self._check_relay_doc_updated(iteration):
+            # 注意：归档阶段跳过接力文档检查，避免不必要的 LLM 对话干扰归档流程
+            if not self._engine.is_archiving_phase() and not self._check_relay_doc_updated(iteration):
                 self.log_signal.emit(
                     f"⚠️【强制】接力文档未更新！iteration={iteration} "
-                    f"phase={'planning' if self._engine.is_planning_phase() else ('executing' if self._engine.is_executing_phase() else 'archiving')}"
+                    f"phase={'planning' if self._engine.is_planning_phase() else 'executing'}"
                 )
                 # 注入强制更新提示，重新对话
                 force_messages = self._build_messages(task_prompt, iteration, force_update=True)
@@ -692,26 +693,43 @@ class AutoLoopWorker(QThread):
         # 解析当前步骤
         current_step, max_verified, total_steps = self._engine.parse_current_and_next_step(notes)
 
+        # 判断是否所有步骤都已验证完成
+        all_done = self._engine.all_steps_verified()
+
         if total_steps > 0:
-            display_step = current_step if (self._engine.current_step == 0 or self._engine.current_step <= max_verified) else self._engine.current_step
-            self._engine.set_step_progress(display_step, total_steps)
-
-            # 检测当前步骤是否已完成
-            step_completed = self._check_step_completed(response, notes, self._engine.current_step)
-
-            if step_completed:
-                self._last_step = self._engine.current_step
-                self.log_signal.emit(f"✓ 步骤 {self._engine.current_step}/{total_steps} 完成")
-                self._engine.advance_to_step(self._engine.current_step + 1)
-                self.log_signal.emit(f"📋 执行步骤 {self._engine.current_step}/{total_steps}: {self._get_next_step_preview(notes, self._engine.current_step)}")
+            if all_done:
+                # 所有步骤已验证完成，不再检查步骤推进，直接等待完成信号
+                self._engine.set_step_progress(total_steps, total_steps)
+                self.log_signal.emit(f"✅ 所有 {total_steps} 个步骤已验证完成，等待 MISSION_COMPLETE 信号")
             else:
-                if "验证失败" in response or "failed" in response.lower():
-                    self.log_signal.emit("⚠️ 检测到验证失败，模型应修复后重试")
+                display_step = current_step if (self._engine.current_step == 0 or self._engine.current_step <= max_verified) else self._engine.current_step
+                # 防止 display_step 超过 total_steps
+                display_step = min(display_step, total_steps + 1)
+                self._engine.set_step_progress(display_step, total_steps)
+
+                # 检测当前步骤是否已完成
+                step_completed = self._check_step_completed(response, notes, self._engine.current_step)
+
+                if step_completed:
+                    self._last_step = self._engine.current_step
+                    self.log_signal.emit(f"✓ 步骤 {self._engine.current_step}/{total_steps} 完成")
+                    self._engine.advance_to_step(self._engine.current_step + 1)
+                    next_preview = self._get_next_step_preview(notes, self._engine.current_step)
+                    self.log_signal.emit(f"📋 执行步骤 {self._engine.current_step}/{total_steps}: {next_preview}")
+                else:
+                    if "验证失败" in response or "failed" in response.lower():
+                        self.log_signal.emit("⚠️ 检测到验证失败，模型应修复后重试")
 
         # 检查完成信号 → 触发归档阶段
         if self._engine.check_completion(response):
             self._enter_archiving_phase()
             return True  # 让主循环的下一轮进入归档处理
+
+        # 兜底保护：如果所有步骤已验证但模型迟迟不输出完成信号，
+        # 强制进入归档（避免无限循环）
+        if all_done and self._engine.get_completion_count() > 0 and self._engine.get_completion_count() >= self._engine.config.completion_threshold:
+            self._enter_archiving_phase()
+            return True
 
         return False
 
@@ -720,8 +738,12 @@ class AutoLoopWorker(QThread):
 
         最多执行一轮，无论是否检测到 ARCHIVE_COMPLETE 都强制完成。
         """
-        # 将 latest/ 的内容复制到时间戳归档目录
-        self._archive_latest_to_timestamped()
+        # 将 latest/ 的内容复制到时间戳归档目录（异常不阻断退出流程）
+        try:
+            self._archive_latest_to_timestamped()
+        except Exception as e:
+            logger.warning(f"[AutoLoop] Archive copy failed: {e}")
+            self.log_signal.emit(f"⚠️ 归档复制失败: {e}")
 
         if self._engine.check_archive_complete(response):
             self.log_signal.emit("✅ 归档完成！")
