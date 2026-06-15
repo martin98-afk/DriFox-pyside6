@@ -76,6 +76,11 @@ def main():
 
     # ── 平台特定 ──
     if platform.system() == "Darwin":
+        # macOS 关键修复：禁用沙盒解决 Mach Port IPC 权限问题
+        # bootstrap_look_up org.chromium.Chromium.MachPortRendezvousServer 失败导致崩溃
+        for flag in ("--no-sandbox", "--disable-gpu-sandbox"):
+            if flag not in _flags:
+                _flags += f" {flag}"
         if "--in-process-gpu" not in _flags:
             _flags += " --in-process-gpu"
 
