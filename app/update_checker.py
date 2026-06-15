@@ -9,6 +9,7 @@ import weakref
 from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtWidgets import QWidget, QApplication, QProgressDialog, QMessageBox
 from PySide6.QtGui import QDesktopServices
+from loguru import logger
 
 from app.utils.config import Settings
 from app.utils.fluent_shim import InfoBar, InfoBarPosition
@@ -89,6 +90,7 @@ class UpdateChecker(QWidget):
             return
 
         if not force:
+            from loguru import logger
             if UpdateChecker._check_in_progress:
                 logger.debug("[UpdateChecker] 检查进行中，跳过重复触发")
                 return

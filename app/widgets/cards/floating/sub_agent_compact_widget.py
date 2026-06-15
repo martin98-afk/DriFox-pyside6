@@ -168,7 +168,6 @@ class _AgentTaskRow(QFrame):
         """工具调用次数 +1"""
         self._tool_count += 1
         self.tool_count_label.setText(f"🔧{self._tool_count}")
-        logger.debug(f"[AgentTaskRow] tool_count incremented to {self._tool_count} for task {self.task_id[:8]}")
 
     def update_elapsed(self):
         """更新已用时间显示（每秒由父组件定时器驱动）"""
