@@ -536,6 +536,13 @@ class AutoLoopWorker(QThread):
                 timeout_timer.stop()
                 # 🛡️ 诊断日志：追踪 loop.exec_() 退出时的状态
                 logger.info(f"[AutoLoop] loop.exec_() returned: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
+                # 🛡️ 关键修复：loop.exec_() 可能因 worker.finished 信号提前退出（信号到达时主线程被
+                # 阻塞在后续代码中，导致 _on_worker_finished 槽函数永远得不到执行机会）。
+                # 用 worker.wait() 强制等线程真正结束，确保 _on_worker_finished 有机会运行并重置 _is_streaming。
+                # 注意：wait() 在 loop.exec_() 正常退出（worker.finished 已触发）时会立即返回；
+                # 仅在超时场景（loop.exec_() 被 timeout 退出）时才会真正等待。
+                worker.wait(10000)  # 最多等 10 秒（远超正常完成时间）
+                logger.info(f"[AutoLoop] after wait: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
             else:
                 self._adapter.wait_for_completion(timeout=300)
 
@@ -591,13 +598,14 @@ class AutoLoopWorker(QThread):
                 loop = QEventLoop()
                 worker.finished.connect(loop.quit)
                 # 🛡️ 超时保护：60 秒后强制退出 QEventLoop
-                # ⚠️ 不移除 isRunning() 快速退出，参见 _execute_llm_conversation 注释
                 timeout_timer = QTimer()
                 timeout_timer.setSingleShot(True)
                 timeout_timer.timeout.connect(loop.quit)
                 timeout_timer.start(60000)
                 loop.exec_()
                 timeout_timer.stop()
+                # 🛡️ 同 _execute_llm_conversation：等 worker 线程真正结束，确保 _on_worker_finished 运行
+                worker.wait(10000)
         except Exception as e:
             self.log_signal.emit(f"⚠️ 强制更新失败: {e}")
             return False

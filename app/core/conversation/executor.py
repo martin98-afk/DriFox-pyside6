@@ -140,7 +140,7 @@ class ConversationExecutor:
             worker: 触发回调的 worker 实例。用于身份检查，
                     防止旧 worker 的 finished 信号擦除新 worker（竞态条件 RC1）。
         """
-        logger.debug(f"[ConversationExecutor] _on_worker_finished called: worker={type(worker).__name__}, current_worker={type(self._current_worker).__name__ if self._current_worker else None}, is_match={worker is self._current_worker}")
+        logger.info(f"[ConversationExecutor] _on_worker_finished called: worker={type(worker).__name__}, current_worker={type(self._current_worker).__name__ if self._current_worker else None}, is_match={worker is self._current_worker}")
         if worker is not self._current_worker:
             # 旧 worker 的 finished 信号，忽略（新 worker 已创建）
             return
