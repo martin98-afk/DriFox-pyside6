@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 
-from PySide6.QtCore import QThread, Signal, QEventLoop, QTimer
+from PySide6.QtCore import QThread, Signal, QCoreApplication
 from loguru import logger
 
 from app.core.engines.auto_loop import (
@@ -516,32 +516,22 @@ class AutoLoopWorker(QThread):
                 self.log_signal.emit("⚠️ Worker 启动失败，重试...")
                 return None
 
-            # 使用 QEventLoop 等待 Worker 完成
-            # ⚠️ 注意：不能通过 worker.isRunning() 判断是否提前退出 loop：
-            # QThread.start() 是异步的，刚返回时 isRunning() 可能为 False，
-            # 导致 loop.exec_() 立即返回而 worker 仍在后台运行，进而 _is_streaming
-            # 无法被及时重置，后续所有 execute() 调用都会返回 "Already streaming"。
-            # 60 秒超时已足够兜底，无需额外快速退出。
+            # 等待 Worker 完成（使用 QThread.wait() + processEvents，避免 QEventLoop 信号残留）
+            # 原因：QEventLoop.exec_() 在多轮迭代间存在旧 worker.finished 信号污染新 loop 的问题，
+            # 导致 loop 提前退出（~0ms），_on_worker_finished 永远得不到执行机会，_is_streaming 卡在 True。
+            # 改用 worker.wait() 阻塞等待线程真正结束，再用 processEvents() 处理排队的信号槽，
+            # 确保 _on_worker_finished 和 adapter.on_finished 在下一轮 execute() 前运行完。
             worker = self._conversation_executor.get_current_worker()
             if worker:
-                loop = QEventLoop()
-                worker.finished.connect(loop.quit)
-                # 🛡️ 超时保护：60 秒后强制退出 QEventLoop，防止 worker 卡死时
-                # QEventLoop.exec_() 永不返回，进而触发外部的 worker.terminate() 崩溃。
-                timeout_timer = QTimer()
-                timeout_timer.setSingleShot(True)
-                timeout_timer.timeout.connect(loop.quit)
-                timeout_timer.start(60000)
-                loop.exec_()
-                timeout_timer.stop()
-                # 🛡️ 诊断日志：追踪 loop.exec_() 退出时的状态
-                logger.info(f"[AutoLoop] loop.exec_() returned: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
-                # 🛡️ 关键修复：loop.exec_() 可能因 worker.finished 信号提前退出（信号到达时主线程被
-                # 阻塞在后续代码中，导致 _on_worker_finished 槽函数永远得不到执行机会）。
-                # 用 worker.wait() 强制等线程真正结束，确保 _on_worker_finished 有机会运行并重置 _is_streaming。
-                # 注意：wait() 在 loop.exec_() 正常退出（worker.finished 已触发）时会立即返回；
-                # 仅在超时场景（loop.exec_() 被 timeout 退出）时才会真正等待。
-                worker.wait(10000)  # 最多等 10 秒（远超正常完成时间）
+                finished = worker.wait(60000)  # 阻塞等待线程结束，最多 60 秒
+                # 处理排队信号（_on_worker_finished → 重置 _is_streaming；adapter.on_finished → 设置响应）
+                QCoreApplication.processEvents()
+                if not finished:
+                    logger.warning(f"[AutoLoop] Worker did not finish within 60s, forcing cleanup: isRunning={worker.isRunning()}")
+                    worker.cancel()
+                    worker.requestInterruption()
+                    worker.wait(3000)
+                    QCoreApplication.processEvents()
                 logger.info(f"[AutoLoop] after wait: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
             else:
                 self._adapter.wait_for_completion(timeout=300)
@@ -595,17 +585,14 @@ class AutoLoopWorker(QThread):
                 return False
             worker = self._conversation_executor.get_current_worker()
             if worker:
-                loop = QEventLoop()
-                worker.finished.connect(loop.quit)
-                # 🛡️ 超时保护：60 秒后强制退出 QEventLoop
-                timeout_timer = QTimer()
-                timeout_timer.setSingleShot(True)
-                timeout_timer.timeout.connect(loop.quit)
-                timeout_timer.start(60000)
-                loop.exec_()
-                timeout_timer.stop()
-                # 🛡️ 同 _execute_llm_conversation：等 worker 线程真正结束，确保 _on_worker_finished 运行
-                worker.wait(10000)
+                finished = worker.wait(60000)
+                QCoreApplication.processEvents()
+                if not finished:
+                    logger.warning(f"[AutoLoop] Force update worker did not finish within 60s")
+                    worker.cancel()
+                    worker.requestInterruption()
+                    worker.wait(3000)
+                    QCoreApplication.processEvents()
         except Exception as e:
             self.log_signal.emit(f"⚠️ 强制更新失败: {e}")
             return False
