@@ -982,13 +982,15 @@ DriFox/
 
 ## 许可证
 
-MIT License
+LGPL 3.0 License
+
+详见 [`LICENSE.LGPL-3.0`](./LICENSE.LGPL-3.0) / [`LGPL_COMPLIANCE.md`](./LGPL_COMPLIANCE.md) / [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
 
 ---
 
 ## 致谢
 
-- [PyQt-Fluent-Widgets](https://github.com/zhiyiYo/PyQt-Fluent-Widgets) – UI 库
+- [PySide6 / Qt 6](https://doc.qt.io/qtforpython-6/) – GUI 框架（LGPL 3.0）
 - [Loguru](https://github.com/Delgan/loguru) – 日志
 - [OpenAI Python Client](https://github.com/openai/openai-python) – API 客户端
 
