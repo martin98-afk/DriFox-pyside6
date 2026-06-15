@@ -56,14 +56,14 @@
 ## 快速开始
 
 ### 环境要求
-- Python 3.8+
-- PyQt5 >= 5.15.0
+- Python 3.10+
+- PySide6 >= 6.8.0
 
 ### 安装
 
 ```bash
-git clone https://github.com/martin98-afk/DriFox.git
-cd DriFox
+git clone https://github.com/martin98-afk/DriFox-pyside6.git
+cd DriFox-pyside6
 
 # 创建虚拟环境
 python -m venv .venv
