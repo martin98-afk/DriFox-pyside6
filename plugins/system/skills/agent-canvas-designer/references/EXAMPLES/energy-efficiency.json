@@ -1,0 +1,147 @@
+{
+  "version": "2.0",
+  "flow": "custom",
+  "meta": {
+    "title": "工业设备能效分析与优化建议",
+    "description": "实时监控设备运行数据，结合历史能耗分析，生成能效优化建议报告并发送给运维人员"
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "start",
+      "label": "开始",
+      "x": 80,
+      "y": 240,
+      "config": {}
+    },
+    {
+      "id": "n2",
+      "type": "llm",
+      "label": "需求解析",
+      "x": 320,
+      "y": 225,
+      "config": {
+        "title": "需求解析",
+        "model": "gpt-4",
+        "system_prompt": "你是工业能效分析专家。理解能效分析任务的需求，确定分析参数。\n\n需要输出：\n1. device_type: 设备类型（如：空压机、注塑机、锅炉、电机等）\n2. time_range: 分析时间范围（如：最近24小时、最近7天、最近30天）\n3. baseline: 能效基准值（如：kWh/吨、kWh/件）\n4. alert_threshold: 告警阈值（能效偏离基准的百分比）\n\n规则：\n1. 设备类型要具体，便于查询对应数据\n2. 时间范围影响数据采样精度\n3. 只输出JSON，不要额外文字",
+        "user_prompt": "用户输入：{{sys.query}}\n\n如果用户未指定设备类型，默认分析所有主要耗能设备。\n请解析出具体的分析参数。"
+      }
+    },
+    {
+      "id": "n3",
+      "type": "api-request",
+      "label": "获取实时数据",
+      "x": 560,
+      "y": 160,
+      "config": {
+        "title": "获取设备实时运行数据",
+        "method": "POST",
+        "url": "https://energy-api.example.com/v1/devices/realtime",
+        "headers": "{\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer {{env.ENERGY_API_KEY}}\"}",
+        "body": "{\n  \"device_type\": \"{{n2.output.device_type}}\",\n  \"fields\": [\"power\", \"load\", \"temperature\", \"running_hours\", \"output\"]\n}",
+        "response_path": "data.devices"
+      }
+    },
+    {
+      "id": "n4",
+      "type": "api-request",
+      "label": "获取历史数据",
+      "x": 560,
+      "y": 290,
+      "config": {
+        "title": "获取历史能耗数据",
+        "method": "POST",
+        "url": "https://energy-api.example.com/v1/devices/history",
+        "headers": "{\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer {{env.ENERGY_API_KEY}}\"}",
+        "body": "{\n  \"device_type\": \"{{n2.output.device_type}}\",\n  \"time_range\": \"{{n2.output.time_range}}\",\n  \"metrics\": [\"energy_consumption\", \"production_output\", \"operating_hours\"]\n}",
+        "response_path": "data.history"
+      }
+    },
+    {
+      "id": "n5",
+      "type": "code",
+      "label": "数据处理",
+      "x": 800,
+      "y": 225,
+      "config": {
+        "title": "能效指标计算",
+        "inputs": "realtime_data: list\nhistorical_data: list\nbaseline: string\ntime_range: string",
+        "outputs": "efficiency_metrics: dict\nalert_devices: list\ncomparison_data: dict",
+        "code": "def main(realtime_data, historical_data, baseline, time_range):\n    import json\n    \n    # 计算实时能效指标\n    efficiency_metrics = {\n        'time_range': time_range,\n        'baseline': baseline,\n        'devices': []\n    }\n    \n    alert_devices = []\n    comparison_data = {\n        'historical_avg': 0,\n        'current_avg': 0,\n        'trend': 'stable'\n    }\n    \n    # 计算历史平均值\n    if historical_data:\n        total_energy = sum(d.get('energy_consumption', 0) for d in historical_data)\n        total_output = sum(d.get('production_output', 1) for d in historical_data)\n        comparison_data['historical_avg'] = round(total_energy / total_output, 4) if total_output > 0 else 0\n    \n    # 计算当前设备能效\n    for device in realtime_data:\n        power = device.get('power', 0)\n        output = device.get('output', 1)\n        running_hours = device.get('running_hours', 1)\n        \n        # 计算单位产出能耗\n        energy_per_unit = power * running_hours / max(output, 1)\n        \n        # 与基准对比\n        deviation = ((energy_per_unit - comparison_data['historical_avg']) / comparison_data['historical_avg'] * 100) if comparison_data['historical_avg'] > 0 else 0\n        \n        device_metrics = {\n            'device_id': device.get('device_id'),\n            'device_name': device.get('device_name'),\n            'power_kw': power,\n            'running_hours': running_hours,\n            'output': output,\n            'energy_per_unit': round(energy_per_unit, 4),\n            'deviation_percent': round(deviation, 2),\n            'status': 'normal' if abs(deviation) < 15 else 'warning' if abs(deviation) < 30 else 'critical'\n        }\n        \n        efficiency_metrics['devices'].append(device_metrics)\n        \n        # 标记异常设备\n        if deviation > 15:\n            alert_devices.append({\n                'device_id': device.get('device_id'),\n                'device_name': device.get('device_name'),\n                'deviation': round(deviation, 2),\n                'cause': '能效偏离过大' if deviation > 0 else '能效优秀'\n            })\n    \n    # 计算当前平均值\n    if efficiency_metrics['devices']:\n        comparison_data['current_avg'] = sum(d['energy_per_unit'] for d in efficiency_metrics['devices']) / len(efficiency_metrics['devices'])\n        comparison_data['trend'] = 'improving' if comparison_data['current_avg'] < comparison_data['historical_avg'] else 'declining'\n    \n    return {\n        'efficiency_metrics': efficiency_metrics,\n        'alert_devices': alert_devices,\n        'comparison_data': comparison_data\n    }"
+      }
+    },
+    {
+      "id": "n6",
+      "type": "llm",
+      "label": "问题分析",
+      "x": 1040,
+      "y": 225,
+      "config": {
+        "title": "能效问题分析",
+        "model": "gpt-4",
+        "system_prompt": "你是工业能效诊断专家。基于能效数据分析设备运行问题，生成优化建议。\n\n需要输出：\n1. problem_summary: 问题概述（简述发现的主要能效问题）\n2. root_cause: 根本原因分析（从负载、运行参数、设备老化等方面分析）\n3. optimization_suggestions: 优化建议列表（3-5条，每条包含：问题、建议措施、预期效果）\n4. priority: 优先级（high/medium/low）\n\n规则：\n1. 建议要具体可执行，如调整负载率、优化运行时间、更换零部件等\n2. 每条建议要有量化预期效果\n3. 只输出JSON，不要额外文字",
+        "user_prompt": "能效指标数据：{{n5.output.efficiency_metrics}}\n异常设备列表：{{n5.output.alert_devices}}\n历史对比：{{n5.output.comparison_data}}\n\n请分析能效问题并给出优化建议。"
+      }
+    },
+    {
+      "id": "n7",
+      "type": "code",
+      "label": "报告生成",
+      "x": 1280,
+      "y": 225,
+      "config": {
+        "title": "生成分析报告",
+        "inputs": "efficiency_metrics: dict\nalert_devices: list\ncomparison_data: dict\noptimization: dict",
+        "outputs": "report_content: dict\nreport_markdown: string",
+        "code": "def main(efficiency_metrics, alert_devices, comparison_data, optimization):\n    import json\n    \n    # 生成报告数据\n    report_content = {\n        'title': '工业设备能效分析报告',\n        'time_range': efficiency_metrics['time_range'],\n        'baseline': efficiency_metrics['baseline'],\n        'summary': {\n            'total_devices': len(efficiency_metrics['devices']),\n            'alert_count': len(alert_devices),\n            'historical_avg': comparison_data['historical_avg'],\n            'current_avg': comparison_data['current_avg'],\n            'trend': comparison_data['trend']\n        },\n        'device_details': efficiency_metrics['devices'],\n        'alert_devices': alert_devices,\n        'optimization': optimization,\n        'generated_at': '{{sys.timestamp}}'\n    }\n    \n    # 生成 Markdown 格式报告\n    device_list = '\\n'.join([f\"- {d['device_name']}: {d['energy_per_unit']} {efficiency_metrics['baseline']} (偏差: {d['deviation_percent']}%)\" for d in efficiency_metrics['devices']])\n    alert_list = '\\n'.join([f\"- **{a['device_name']}**: 偏差 {a['deviation']}%，{a['cause']}\" for a in alert_devices])\n    suggestions = '\\n'.join([f\"{i+1}. **{s['problem']}**\\n   建议：{s['suggestion']}\\n   预期：{s['expected_effect']}\" for i, s in enumerate(optimization.get('optimization_suggestions', []))])\n    \n    report_markdown = f\"\"\"# 📊 工业设备能效分析报告\n\n**分析周期**: {efficiency_metrics['time_range']}\n**生成时间**: {{sys.timestamp}}\n\n## 📈 能效概览\n\n| 指标 | 数值 |\n|------|------|\n| 监测设备数 | {len(efficiency_metrics['devices'])} |\n| 异常设备数 | {len(alert_devices)} |\n| 历史平均能效 | {comparison_data['historical_avg']} {efficiency_metrics['baseline']} |\n| 当前平均能效 | {comparison_data['current_avg']} {efficiency_metrics['baseline']} |\n| 能效趋势 | {'📈 改善中' if comparison_data['trend'] == 'improving' else '📉 恶化中' if comparison_data['trend'] == 'declining' else '➡️ 稳定'} |\n\n## 🔍 设备能效详情\n\n{device_list}\n\n## ⚠️ 异常设备告警\n\n{alert_list if alert_list else '暂无异常设备'}\n\n## 💡 优化建议\n\n{suggestions if suggestions else '所有设备运行正常'}\n\n---\n*本报告由智能体能效分析系统自动生成*\n\"\"\"\n    \n    return {\n        'report_content': report_content,\n        'report_markdown': report_markdown\n    }"
+      }
+    },
+    {
+      "id": "n8",
+      "type": "api-request",
+      "label": "发送通知",
+      "x": 1520,
+      "y": 160,
+      "config": {
+        "title": "发送报告给运维人员",
+        "method": "POST",
+        "url": "https://notification.example.com/v1/send",
+        "headers": "{\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer {{env.NOTIFICATION_API_KEY}}\"}",
+        "body": "{\n  \"type\": \"email\",\n  \"to\": \"ops-team@example.com\",\n  \"subject\": \"【能效分析报告】{{sys.today}} 工业设备能效月度分析\",\n  \"content\": {{n7.output.report_markdown}}\n}",
+        "response_path": "result"
+      }
+    },
+    {
+      "id": "n9",
+      "type": "reply",
+      "label": "输出报告",
+      "x": 1520,
+      "y": 290,
+      "config": {
+        "reply_type": "直接回复",
+        "content": "{{n7.output.report_markdown}}\n\n📬 报告已发送至运维团队邮箱"
+      }
+    },
+    {
+      "id": "n10",
+      "type": "end",
+      "label": "结束",
+      "x": 1760,
+      "y": 240,
+      "config": {}
+    }
+  ],
+  "connections": [
+    {"sourceId": "n1", "targetId": "n2"},
+    {"sourceId": "n2", "targetId": "n3"},
+    {"sourceId": "n2", "targetId": "n4"},
+    {"sourceId": "n3", "targetId": "n5"},
+    {"sourceId": "n4", "targetId": "n5"},
+    {"sourceId": "n5", "targetId": "n6"},
+    {"sourceId": "n6", "targetId": "n7"},
+    {"sourceId": "n7", "targetId": "n8"},
+    {"sourceId": "n7", "targetId": "n9"},
+    {"sourceId": "n8", "targetId": "n10"},
+    {"sourceId": "n9", "targetId": "n10"}
+  ]
+}

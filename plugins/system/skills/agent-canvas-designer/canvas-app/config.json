@@ -1,0 +1,285 @@
+{
+  "version": "2.0",
+  "flow": "custom",
+  "meta": {
+    "title": "煤机设备辅助建模智能体",
+    "description": ""
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "start",
+      "label": "建模入口",
+      "x": 80,
+      "y": 300,
+      "validated": false,
+      "config": {}
+    },
+    {
+      "id": "n2",
+      "type": "param-extractor",
+      "label": "解析建模请求",
+      "x": 240,
+      "y": 300,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "input_text": "{{sys.query}}",
+        "param_schema": "{\n  \"device_no\": \"string - 设备编号，必填\",\n  \"model_type\": \"string - 建模类型：new(新建)或optimize(优化)，必填\",\n  \"target_model_no\": \"string - 目标模型编号，optimize时必填\",\n  \"equipment_category\": \"string - 设备类别，如刮板机/风机等，可选\"\n}",
+        "output_var": "params"
+      }
+    },
+    {
+      "id": "n3",
+      "type": "classifier",
+      "label": "建模类型判断",
+      "x": 420,
+      "y": 300,
+      "validated": false,
+      "config": {
+        "input_source": "{{n2.params.model_type}}",
+        "categories": "new → 新建模型流程\noptimize → 优化已有模型流程",
+        "model": "gpt-4o-mini"
+      }
+    },
+    {
+      "id": "n10",
+      "type": "llm",
+      "label": "设备信息获取",
+      "x": 620,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是设备信息查询助手。负责根据设备编号获取设备基础信息。\n\n需要输出：\n1. device_info：dict — 设备基本信息，包含名称、类型、行业等\n2. mechanism_tree：dict — 设备类型机理模型树结构\n3. query_status：string — 查询状态，「成功」或「失败:原因」\n\n规则：\n1. 调用设备基础信息接口V-01获取设备详情\n2. 调用设备类型机理模型树接口V-03获取机理树\n3. 如设备不存在或查询失败，返回失败原因\n4. 只输出JSON，不要额外文字",
+        "user_prompt": "根据设备编号 {{n2.params.device_no}} 获取设备基础信息和机理模型树。\n\n输入：\n- 设备编号：{{n2.params.device_no}}\n- 设备类别：{{n2.params.equipment_category}}\n\n输出要求：\n1. device_info：设备名称、类型、机组型号等\n2. mechanism_tree：设备类型节点结构\n3. query_status：查询是否成功",
+        "output_var": "device_result"
+      }
+    },
+    {
+      "id": "n11",
+      "type": "llm",
+      "label": "故障模式识别",
+      "x": 820,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是故障模式分析专家。负责基于FMEA方法论识别设备关键失效模式。\n\n需要输出：\n1. failure_modes：list — 故障模式列表，每项包含mode_name/fail_level/trouble_id\n2. fmea_analysis：list — FMEA分析，每项包含S/O/D评分和RPN值\n3. priority_modes：list — 高优先级故障模式（RPN≥20）\n\n规则：\n1. 调用故障机理模型列表接口V-04获取该设备的所有故障机理\n2. 调用机理等级定义接口V-06获取每个机理的详细等级信息\n3. 根据故障记录和维修历史评估频度(O)\n4. 严重度(S)参考FMEA标准定义\n5. 探测度(D)基于已有监测能力评估\n6. 只输出JSON，不要额外文字\n\nFMEA评分标准：\n- 严重度S：1-10级，10为最严重\n- 频度O：1-10级，10为最频繁\n- 探测度D：1-10级，10为最难探测\n- RPN = S × O × D，RPN≥20为高风险",
+        "user_prompt": "基于设备 {{n10.device_result.device_info.eqlevelNam}} 的机理树，分析关键失效模式。\n\n输入：\n- 设备信息：{{n10.device_result}}\n- 机理树：{{n10.device_result.mechanism_tree}}\n\n输出要求：\n1. failure_modes：故障模式列表\n2. fmea_analysis：FMEA分析结果\n3. priority_modes：高优先级故障模式",
+        "output_var": "failure_analysis"
+      }
+    },
+    {
+      "id": "n12",
+      "type": "llm",
+      "label": "特征参数推荐",
+      "x": 1020,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是特征参数工程专家。负责建立失效模式-特征参数映射关系，推荐建模所需的关键测点参数。\n\n需要输出：\n1. param_mapping：list — 失效模式与特征参数的映射关系\n2. recommended_params：list — 推荐的特征参数，每项包含param_name/type/description/calculation\n3. tag_suggestions：list — 建议绑定的测点Tag\n\n规则：\n1. 分析每个故障模式的物理机理\n2. 时域特征：RMS（均方根值）、峰值、峭度(Kurtosis)\n3. 频域特征：故障特征频率幅值、FFT变换后的频谱分析\n4. 趋势特征：参数随时间的变化率、劣化速率\n5. 无量纲指标：波形指标、脉冲指标\n6. 参考特征频率库和信号处理函数定义\n7. 只输出JSON，不要额外文字",
+        "user_prompt": "为设备 {{n10.device_result.device_info.eqlevelNam}} 的故障模式推荐特征参数。\n\n输入：\n- 故障模式：{{n11.failure_analysis.failure_modes}}\n- FMEA分析：{{n11.failure_analysis.fmea_analysis}}\n- 设备类型：{{n10.device_result.mechanism_tree}}\n\n输出要求：\n1. param_mapping：失效模式-特征参数映射\n2. recommended_params：推荐参数列表\n3. tag_suggestions：测点建议",
+        "output_var": "param_recommendation"
+      }
+    },
+    {
+      "id": "n13",
+      "type": "llm",
+      "label": "数据质量评估",
+      "x": 1220,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是数据质量分析师。负责对测点数据进行四维度质量评估，确保模型输入数据的准确性和可靠性。\n\n需要输出：\n1. quality_report：dict — 每个测点的质量评估结果\n2. quality_scores：dict — 各维度评分（有效性/稳定性/关联性/时效性）\n3. valid_tags：list — 通过质量检查的测点列表\n4. invalid_tags：list — 不合格的测点列表及原因\n\n规则：\n1. 有效性：检查数据是否可正常使用，识别卡死（值不变）、超量程、缺失等异常\n2. 稳定性：检查稳态波动是否合理，检测异常跳变、违反物理规律的数据\n3. 关联性：与同类设备趋势对比，识别偏离大趋势的异常点\n4. 时效性：检查数据更新频率，检测严重滞后或中断情况\n5. 为每个测点标注质量标签（有效/无效/可疑）\n6. 只输出JSON，不要额外文字",
+        "user_prompt": "对推荐的特征参数进行数据质量评估。\n\n输入：\n- 推荐参数：{{n12.param_recommendation.recommended_params}}\n- Tag建议：{{n12.param_recommendation.tag_suggestions}}\n- 设备编号：{{n2.params.device_no}}\n\n输出要求：\n1. quality_report：质量评估报告\n2. quality_scores：各维度评分\n3. valid_tags：有效测点\n4. invalid_tags：无效测点及原因",
+        "output_var": "quality_assessment"
+      }
+    },
+    {
+      "id": "n14",
+      "type": "llm",
+      "label": "报警阈值设定",
+      "x": 1420,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是报警策略专家。负责基于历史数据和机理模型，实现多维度智能预警和自适应阈值设定。\n\n需要输出：\n1. threshold_config：list — 每个参数的建议阈值配置\n2. baseline_stats：dict — 健康期基线统计（均值/标准差/分位值）\n3. alarm_levels：list — 报警等级定义（注意/警告/危险）\n\n规则：\n1. 多维度识别判断逻辑：\n   - 波动性分析：识别短期窗口异常增大\n   - 劣化趋势分析：关注中长期变化趋势斜率\n   - 关联逻辑分析：分析多参数组合关系\n2. 基于历史基线数据建立设备「正常状态」标准画像\n3. 初始报警阈值和危险阈值的推荐\n4. 说明阈值设定的依据和逻辑\n5. 只输出JSON，不要额外文字",
+        "user_prompt": "为通过质量评估的特征参数设定报警阈值。\n\n输入：\n- 有效测点：{{n13.quality_assessment.valid_tags}}\n- 质量报告：{{n13.quality_assessment.quality_report}}\n- 设备编号：{{n2.params.device_no}}\n\n输出要求：\n1. threshold_config：阈值配置\n2. baseline_stats：基线统计\n3. alarm_levels：报警等级",
+        "output_var": "threshold_config"
+      }
+    },
+    {
+      "id": "n15",
+      "type": "llm",
+      "label": "模型规则生成",
+      "x": 1620,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是模型规则工程师。负责将故障模式、特征参数和领域知识转换为符合画布规范的模型判断逻辑JSON。\n\n需要输出：\n1. logic_description：string — 专家风格的逻辑说明\n2. canvas_json：dict — 符合画布规范的JSON结构\n3. rule_count：int — 生成的规则数量\n\n规则：\n1. 基于故障模式生成判断逻辑\n2. 结合领域知识进行规则匹配\n3. 支持时域分析(波动性、劣化趋势)、关联逻辑分析等判断维度\n4. 输出符合画布规范的模型结构（节点+连线）\n5. 只输出JSON，不要额外文字\n\n画布JSON结构示例：\n```json\n{\n  \"version\": \"2.0\",\n  \"flow\": \"custom\",\n  \"nodes\": [\n    {\"id\": \"start\", \"type\": \"start\", \"x\": 80, \"y\": 300},\n    {\"id\": \"llm1\", \"type\": \"llm\", \"x\": 240, \"y\": 300}\n  ],\n  \"connections\": [\n    {\"sourceId\": \"start\", \"targetId\": \"llm1\"}\n  ]\n}\n```",
+        "user_prompt": "将分析结果转换为符合画布规范的模型JSON。\n\n输入：\n- 故障模式：{{n11.failure_analysis.priority_modes}}\n- 推荐参数：{{n12.param_recommendation.recommended_params}}\n- 阈值配置：{{n14.threshold_config.threshold_config}}\n- 设备信息：{{n10.device_result.device_info}}\n\n输出要求：\n1. logic_description：逻辑说明\n2. canvas_json：画布JSON结构\n3. rule_count：规则数量",
+        "output_var": "model_generation"
+      }
+    },
+    {
+      "id": "n20",
+      "type": "llm",
+      "label": "模型列表获取",
+      "x": 620,
+      "y": 420,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是模型管理助手。负责获取设备的已有模型列表，供用户选择需要优化的模型。\n\n需要输出：\n1. model_list：list — 模型列表，每项包含model_id/name/type/status/version\n2. query_status：string — 查询状态\n\n规则：\n1. 调用模型列表接口获取该设备关联的所有模型\n2. 返回模型的ID、名称、类型、状态、版本号\n3. 如无模型，返回空列表\n4. 只输出JSON，不要额外文字",
+        "user_prompt": "获取设备 {{n2.params.device_no}} 的已有模型列表。\n\n输入：\n- 设备编号：{{n2.params.device_no}}\n- 目标模型：{{n2.params.target_model_no}}\n\n输出要求：\n1. model_list：模型列表\n2. query_status：查询状态",
+        "output_var": "model_list_result"
+      }
+    },
+    {
+      "id": "n21",
+      "type": "llm",
+      "label": "模型详情获取",
+      "x": 820,
+      "y": 420,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是模型诊断专家。负责获取模型详情并进行诊断分析。\n\n需要输出：\n1. model_detail：dict — 模型完整详情（画布JSON结构、参数配置）\n2. diagnosis_result：dict — 诊断结果\n3. issues：list — 发现的问题列表\n\n规则：\n1. 调用模型详情接口获取模型的画布JSON结构\n2. 检查模型的完整性和合理性\n3. 识别模型中的潜在问题（如参数缺失、逻辑矛盾）\n4. 评估模型的适用性和优化空间\n5. 只输出JSON，不要额外文字",
+        "user_prompt": "获取并诊断模型详情。\n\n输入：\n- 模型编号：{{n2.params.target_model_no}}\n- 模型列表：{{n20.model_list_result.model_list}}\n\n输出要求：\n1. model_detail：模型详情\n2. diagnosis_result：诊断结果\n3. issues：发现的问题",
+        "output_var": "model_diagnosis"
+      }
+    },
+    {
+      "id": "n22",
+      "type": "llm",
+      "label": "知识增强",
+      "x": 1020,
+      "y": 420,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是领域知识专家。负责在领域知识库中查找与模型相关的信息，补充完善模型。\n\n需要输出：\n1. related_knowledge：list — 与模型相关的领域知识\n2. fault_cases：list — 相关的故障案例\n3. enhancement_suggestions：list — 知识增强建议\n\n规则：\n1. 基于模型关联的故障模式搜索领域知识\n2. 查找相关的故障案例和解决方案\n3. 补充完善模型的现象、原因、措施\n4. 丰富模型的判断维度和依据\n5. 只输出JSON，不要额外文字",
+        "user_prompt": "基于模型诊断结果进行知识增强。\n\n输入：\n- 模型详情：{{n21.model_diagnosis.model_detail}}\n- 诊断结果：{{n21.model_diagnosis.diagnosis_result}}\n- 设备信息：{{n20.model_list_result}}\n\n输出要求：\n1. related_knowledge：相关知识\n2. fault_cases：故障案例\n3. enhancement_suggestions：增强建议",
+        "output_var": "knowledge_augment"
+      }
+    },
+    {
+      "id": "n23",
+      "type": "llm",
+      "label": "优化建议生成",
+      "x": 1220,
+      "y": 420,
+      "validated": false,
+      "config": {
+        "model": "gpt-4o-mini",
+        "system_prompt": "你是模型优化专家。负责基于诊断结果和知识增强，生成模型优化建议和新版本的画布JSON。\n\n需要输出：\n1. optimization_suggestions：list — 优化建议列表\n2. updated_canvas_json：dict — 优化后的画布JSON\n3. comparison：dict — 新旧版本对比\n\n规则：\n1. 根据诊断问题和知识增强建议生成优化方案\n2. 生成新版本的画布JSON\n3. 对比新旧版本的差异\n4. 支持版本管理和回溯\n5. 只输出JSON，不要额外文字",
+        "user_prompt": "生成模型优化建议和更新版本。\n\n输入：\n- 诊断结果：{{n21.model_diagnosis.diagnosis_result}}\n- 问题列表：{{n21.model_diagnosis.issues}}\n- 知识增强：{{n22.knowledge_augment}}\n\n输出要求：\n1. optimization_suggestions：优化建议\n2. updated_canvas_json：更新后的画布JSON\n3. comparison：新旧对比",
+        "output_var": "optimization_result"
+      }
+    },
+    {
+      "id": "n30",
+      "type": "reply",
+      "label": "输出新建模型",
+      "x": 1820,
+      "y": 180,
+      "validated": false,
+      "config": {
+        "reply_type": "json",
+        "content": "{\n  \"success\": true,\n  \"model_type\": \"new\",\n  \"device_info\": {{n10.device_result.device_info}},\n  \"failure_analysis\": {{n11.failure_analysis}},\n  \"param_recommendation\": {{n12.param_recommendation}},\n  \"quality_assessment\": {{n13.quality_assessment}},\n  \"threshold_config\": {{n14.threshold_config}},\n  \"model_json\": {{n15.model_generation.canvas_json}}\n}"
+      }
+    },
+    {
+      "id": "n31",
+      "type": "reply",
+      "label": "输出优化模型",
+      "x": 1420,
+      "y": 420,
+      "validated": false,
+      "config": {
+        "reply_type": "json",
+        "content": "{\n  \"success\": true,\n  \"model_type\": \"optimize\",\n  \"original_model\": {{n21.model_diagnosis.model_detail}},\n  \"diagnosis_result\": {{n21.model_diagnosis.diagnosis_result}},\n  \"knowledge_augment\": {{n22.knowledge_augment}},\n  \"optimization_result\": {{n23.optimization_result}}\n}"
+      }
+    },
+    {
+      "id": "n99",
+      "type": "end",
+      "label": "流程结束",
+      "x": 2000,
+      "y": 300,
+      "validated": false,
+      "config": {}
+    }
+  ],
+  "connections": [
+    {
+      "sourceId": "n1",
+      "targetId": "n2"
+    },
+    {
+      "sourceId": "n2",
+      "targetId": "n3"
+    },
+    {
+      "sourceId": "n3",
+      "targetId": "n10"
+    },
+    {
+      "sourceId": "n3",
+      "targetId": "n20"
+    },
+    {
+      "sourceId": "n10",
+      "targetId": "n11"
+    },
+    {
+      "sourceId": "n11",
+      "targetId": "n12"
+    },
+    {
+      "sourceId": "n12",
+      "targetId": "n13"
+    },
+    {
+      "sourceId": "n13",
+      "targetId": "n14"
+    },
+    {
+      "sourceId": "n14",
+      "targetId": "n15"
+    },
+    {
+      "sourceId": "n15",
+      "targetId": "n30"
+    },
+    {
+      "sourceId": "n30",
+      "targetId": "n99"
+    },
+    {
+      "sourceId": "n20",
+      "targetId": "n21"
+    },
+    {
+      "sourceId": "n21",
+      "targetId": "n22"
+    },
+    {
+      "sourceId": "n22",
+      "targetId": "n23"
+    },
+    {
+      "sourceId": "n23",
+      "targetId": "n31"
+    },
+    {
+      "sourceId": "n31",
+      "targetId": "n99"
+    }
+  ]
+}

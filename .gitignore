@@ -1,0 +1,77 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+develop-eggs/
+downloads/
+eggs/
+parts/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ===== 测试与覆盖率 =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.pyre/
+
+# ===== 打包与构建 =====
+# (dist/ 是 Inno Setup 安装包资源目录，应当入库；如需排除请改 dist_exclude/)
+dist_exclude/
+*.spec.bak
+
+# ===== 编辑器 / IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 日志与临时 =====
+*.log
+*.log.*
+*.tmp
+*.bak
+*.swp
+.cache/
+.tmp/
+
+# ===== 环境变量 / 凭据 =====
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+
+# ===== 项目特有 =====
+# 本地配置
+config.local.yaml
+config.local.json
+# 临时下载/构建产物
+*.spec
+*.spec.bak

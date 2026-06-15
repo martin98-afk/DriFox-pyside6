@@ -1,0 +1,709 @@
+# -*- coding: utf-8 -*-
+"""
+大模型设置卡片 - 垂直列表布局，高度不够滚动
+现已迁移到 SystemCardFrame 基类，获得统一头部布局和固定边框
+"""
+
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtGui import QFont, QColor
+from PySide6.QtWidgets import (
+    QFontComboBox,
+)
+from loguru import logger
+from app.utils.fluent_shim import (
+    StrongBodyLabel,
+    SwitchSettingCard,
+    OptionsSettingCard,
+    FluentIcon, SettingCard, PrimaryPushButton, ComboBox, )
+
+from app.utils.config import Settings
+from app.utils.design_tokens import (
+    ButtonStyles,
+    ComboBoxStyles,
+    FONT_SIZE_OPTIONS,
+    Colors,
+)
+from app.utils.design_tokens import get_ui_font_size, apply_font_size_to_widget
+from app.utils.startup_manager import set_auto_start
+from app.utils.theme_manager import theme_manager
+from app.utils.utils import get_icon, get_unified_font, get_font_family_css
+from app.widgets.cards.settings.gateway_setting_card import GatewaySettingCard
+from app.widgets.cards.settings.base_settings_card import BaseSettingsCard
+from app.widgets.cards.settings.list_setting_card import SkillListSettingCard
+from app.widgets.cards.settings.mcp_setting_card import MCPListSettingCard
+from app.widgets.cards.settings.provider_setting_card import ProviderListSettingCard
+from app.widgets.cards.settings.system_card_frame import SystemCardFrame
+
+
+class NoWheelFontComboBox(QFontComboBox):
+    """禁用滚轮切换的字体下拉框"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelComboBox(ComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class RefreshableThemeComboBox(ComboBox):
+    """主题下拉框 - 热重载信号驱动，自动刷新列表"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._themes_changed = False
+        # 注册热重载回调：后端检测到主题文件变更后会触发
+        from app.utils.theme_manager import theme_manager
+        theme_manager.on_reload(self._mark_themes_changed)
+
+    def destroy(self, destroyWindow=True, destroySubWindows=True):
+        from app.utils.theme_manager import theme_manager
+        theme_manager.remove_reload_callback(self._mark_themes_changed)
+        super().destroy(destroyWindow, destroySubWindows)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+    def _mark_themes_changed(self):
+        """热重载回调：标记主题已变更，下次打开时刷新列表"""
+        self._themes_changed = True
+
+    def _refresh_items(self):
+        """从当前 theme_manager 重建下拉列表项（不重复 reload）"""
+        from app.utils.theme_manager import theme_manager
+        themes = theme_manager.list_themes()
+        new_options = {tid: {"label": name} for tid, name in themes.items()}
+        card = self.parent()
+        if not card or not hasattr(card, 'config_item'):
+            p = self.parent()
+            while p and not hasattr(p, 'config_item'):
+                p = p.parent()
+            card = p
+        if card and hasattr(card, 'config_item'):
+            current_key = card.config_item.value
+            card.options = new_options
+            card.value_by_label = {data["label"]: key for key, data in new_options.items()}
+            card.label_by_value = {key: data["label"] for key, data in new_options.items()}
+            if current_key not in card.label_by_value:
+                current_key = list(new_options.keys())[0]
+            self.currentTextChanged.disconnect(card._on_changed)
+            self.clear()
+            self.addItems([data["label"] for data in new_options.values()])
+            self.setCurrentText(card.label_by_value.get(current_key, ""))
+            self.currentTextChanged.connect(card._on_changed)
+        self._themes_changed = False
+
+    def _toggleComboMenu(self):
+        """打开下拉前检查是否需要刷新"""
+        try:
+            if self._themes_changed:
+                self._refresh_items()
+        except Exception as e:
+            logger.warning(f"[ThemeComboBox] refresh error: {e}")
+        super()._toggleComboMenu()
+
+
+class ManualUpdateCard(SettingCard):
+    def __init__(self, title, content, parent_widget, parent=None):
+        super().__init__(FluentIcon.SYNC, title, content, parent)
+        self.parent_widget = parent_widget
+
+        self.updateBtn = PrimaryPushButton("检查更新", self)
+        self.updateBtn.setFixedWidth(100)
+        self.updateBtn.setStyleSheet(ButtonStyles.primary_action())
+        self.updateBtn.clicked.connect(self._on_check_update)
+        self.hBoxLayout.addWidget(self.updateBtn, 0, Qt.AlignRight)
+
+    def _on_check_update(self):
+        from app.update_checker import UpdateChecker
+
+        self.updateBtn.setText("检查中...")
+        self.updateBtn.setEnabled(False)
+
+        checker = UpdateChecker(self.parent_widget)
+        checker.finished.connect(self._on_check_finished)
+        checker.finished.connect(self._on_check_finished_final)
+        checker.error.connect(self._on_error)
+        # 手动按钮：跳过 session 节流，用户主动行为应始终生效
+        checker.check_update(force=True)
+
+    def _on_check_finished(self, latest_release):
+        pass
+
+    def _on_check_finished_final(self, latest_release):
+        self.updateBtn.setText("检查更新")
+        self.updateBtn.setEnabled(True)
+
+    def _on_error(self, msg):
+        self.updateBtn.setText("检查更新")
+        self.updateBtn.setEnabled(True)
+        logger.error(msg)
+
+    def _on_error(self, msg):
+        try:
+            self.updateBtn.setText("检查更新")
+            self.updateBtn.setEnabled(True)
+            from app.utils.fluent_shim import InfoBar, InfoBarPosition
+            InfoBar.error(
+                title="检查更新失败",
+                content=msg,
+                position=InfoBarPosition.BOTTOM,
+                duration=3000,
+                parent=self.parent_widget,
+            ).show()
+        except Exception as e:
+            logger.error(f"_on_error error: {e}")
+
+
+class LLMSettingsCard(SystemCardFrame):
+    """大模型设置卡片 - 固定边框 + 垂直列表布局"""
+
+    _autostart_toggling = False  # 类级防重入标志
+    closed = Signal()
+    configChanged = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.set_icon("⚙️")
+        self.set_title_text("系统设置")
+        self.setFixedHeight(350)
+
+        self.cfg = Settings.get_instance()
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._perform_save)
+
+        # 存储各区域分隔标签的位置
+        self._section_anchors = {}
+
+        # 设置顶部 Tab 导航
+        self.setup_tabs([
+            ("llm", "大模型"),
+            ("common", "通用设置"),
+            ("appearance", "外观样式"),
+            ("update", "版本更新"),
+        ], default_tab="llm")
+        self.tabChanged.connect(self._on_tab_changed)
+
+        self._setup_content()
+        
+        # 初始化时应用配置中的字体大小和主题样式
+        # 注意：local_only=True，避免触发全局 dispatch_refresh() 导致所有窗口重绘
+        QTimer.singleShot(0, lambda: self._refresh_appearance_from_config(local_only=True))
+
+    def _make_sep_label(self, text: str) -> StrongBodyLabel:
+        """创建带主题色的分隔标签"""
+        Colors.refresh()
+        sep_label = StrongBodyLabel(text, self)
+        sep_label.setFont(get_unified_font(10, True))
+        sep_label.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; padding: 4px 0;"
+            f"{get_font_family_css()} font-weight: bold;"
+        )
+        return sep_label
+
+    def _setup_content(self):
+        content_layout = self.content_layout
+        content_layout.setContentsMargins(0, 4, 0, 4)
+        content_layout.setSpacing(6)
+
+        # ---- 大模型分隔标签 ----
+        self._sep_llm_label = self._make_sep_label("大模型")
+        self._section_anchors["llm"] = self._sep_llm_label
+        content_layout.addWidget(self._sep_llm_label)
+
+        self.llmProviderCard = ProviderListSettingCard(
+            icon=get_icon("大模型"),
+            configItem=self.cfg.llm_saved_providers,
+            defaultProviderItem=self.cfg.llm_selected_model,
+            title="已保存的服务商",
+            content="管理已配置的大模型服务商",
+            parent=self,
+            home=self,
+        )
+        content_layout.addWidget(self.llmProviderCard)
+
+        self.llmSkillsCard = SkillListSettingCard(
+            icon=get_icon("智能体"),
+            configItem=self.cfg.llm_enabled_skills,
+            title="启用技能",
+            content="选择要注入的技能",
+            parent=self,
+            home=self,
+        )
+        content_layout.addWidget(self.llmSkillsCard)
+
+        # Hooks 管理
+        from app.widgets.cards.settings.hook_setting_card import HookListSettingCard
+
+        hook_manager = getattr(self.parent(), 'backend', None)
+        if hook_manager:
+            hook_manager = hook_manager.hook_manager
+
+        self.hookListCard = HookListSettingCard(
+            icon=get_icon("hooks"),
+            title="Hooks 管理",
+            content="管理全局 Hooks",
+            parent=self,
+            home=self,
+            hook_manager=hook_manager,
+        )
+        content_layout.addWidget(self.hookListCard)
+
+        # MCP 服务器管理
+        self.mcpListCard = MCPListSettingCard(
+            icon=get_icon("MCP"),
+            title="MCP 服务器",
+            content="管理 MCP Server 连接",
+            parent=self,
+        )
+        content_layout.addWidget(self.mcpListCard)
+
+        # ---- 通用设置分隔标签 ----
+        self._sep_common_label = self._make_sep_label("通用设置")
+        self._section_anchors["common"] = self._sep_common_label
+        content_layout.addWidget(self._sep_common_label)
+
+        # Gateway 通讯平台接入
+        self.gatewayCard = GatewaySettingCard(
+            icon=get_icon("云通信"),
+            title="通讯平台接入",
+            content="接入企业微信/钉钉",
+            parent=self,
+            home=self,
+        )
+        content_layout.addWidget(self.gatewayCard)
+
+        # 开机自启
+        self.autoStartCard = SwitchSettingCard(
+            get_icon("开机自动启动"),
+            "开机自启",
+            "系统启动时自动运行 Drifox",
+            self.cfg.auto_start,
+            self,
+        )
+        self.autoStartCard.checkedChanged.connect(self._on_toggled)
+        content_layout.addWidget(self.autoStartCard)
+
+        # 智能体完成通知
+        self.llmNotifyCard = SwitchSettingCard(
+            get_icon("提示"),
+            "智能体完成通知",
+            "窗口不在前台时发送通知",
+            configItem=self.cfg.llm_notify_enabled,
+            parent=self,
+        )
+        content_layout.addWidget(self.llmNotifyCard)
+
+        # 通知提示音
+        self.llmSoundCard = OptionsSettingCard(
+            self.cfg.llm_notify_sound,
+            get_icon("提示"),
+            "通知提示音",
+            "选择提示音",
+            texts=["默认", "短提示音", "无"],
+            parent=self,
+        )
+        content_layout.addWidget(self.llmSoundCard)
+
+
+        # ---- 外观样式分隔标签 ----
+        self._sep_appearance_label = self._make_sep_label("外观样式")
+        self._section_anchors["appearance"] = self._sep_appearance_label
+        content_layout.addWidget(self._sep_appearance_label)
+
+        # 界面字号、主题风格
+        self._setup_appearance_cards()
+        content_layout.addWidget(self.uiFontSizeCard)
+        content_layout.addWidget(self.uiThemeStyleCard)
+
+        # 全局字体设置
+        self._setup_font_card()
+        content_layout.addWidget(self.llmFontCard)
+
+        # ---- 版本更新分隔标签 ----
+        self._sep_update_label = self._make_sep_label("版本更新")
+        self._section_anchors["update"] = self._sep_update_label
+        content_layout.addWidget(self._sep_update_label)
+
+        # 自动检查更新
+        self.autoUpdateCard = SwitchSettingCard(
+            get_icon("提示"),
+            "自动检查更新",
+            "启动时自动检测新版本",
+            configItem=self.cfg.auto_check_update,
+            parent=self,
+        )
+        content_layout.addWidget(self.autoUpdateCard)
+
+        self.manualUpdateCard = ManualUpdateCard(
+            "手动检查更新",
+            "点击按钮检查是否有新版本",
+            self.parent(),
+            self.parent(),
+        )
+        content_layout.addWidget(self.manualUpdateCard)
+
+        content_layout.addStretch(1)
+
+        # 连接信号
+        # 注意：只有真正影响外观或模型列表的变更才走 _on_config_changed（触发全量刷新）
+        # 技能、通知、提示音等不涉及外观的变更走轻量级保存路径
+        self.llmProviderCard.providerChanged.connect(self._on_provider_changed)
+        self.llmSkillsCard.skillsChanged.connect(self._on_skills_changed)
+        self.cfg.llm_notify_enabled.valueChanged.connect(self._on_settings_changed)
+        self.llmSoundCard.optionChanged.connect(self._on_settings_changed)
+        self.cfg.llm_font_family.valueChanged.connect(self._on_config_changed)
+        self.cfg.ui_font_size.valueChanged.connect(self._on_config_changed)
+        self.cfg.ui_theme_style.valueChanged.connect(self._on_config_changed)
+        self.cfg.llm_api_enabled.valueChanged.connect(self._on_llm_api_enabled_changed)
+        self.cfg.llm_api_port.valueChanged.connect(self._on_llm_api_port_changed)
+
+    def _on_tab_changed(self, tab_id: str):
+        """Tab 切换时滚动到对应区域"""
+        if tab_id in self._section_anchors:
+            anchor_widget = self._section_anchors[tab_id]
+            # 延迟滚动，等布局稳定后再执行
+            QTimer.singleShot(50, lambda: self._scroll_to_widget(anchor_widget))
+
+    def _scroll_to_widget(self, target_widget):
+        """滚动到目标控件位置"""
+        scroll_area = self.scroll_area
+        scroll_bar = scroll_area.verticalScrollBar()
+        # 直接设置滚动到目标位置（减去一点边距）
+        target_scroll = max(0, target_widget.y() - 10)
+        scroll_bar.setValue(target_scroll)
+
+    def _setup_appearance_cards(self):
+        class AppearanceComboCard(SettingCard):
+            def __init__(self, icon, title, content, cfg, config_item, options, parent=None, is_theme_card=False):
+                super().__init__(icon, title, content, parent)
+                self.cfg = cfg
+                self.config_item = config_item
+                self.options = options
+                self.is_theme_card = is_theme_card
+                self._parent = parent
+                self._build_lookup_tables()
+
+                if is_theme_card:
+                    self.comboBox = RefreshableThemeComboBox(self)
+                else:
+                    self.comboBox = NoWheelComboBox(self)
+                self.comboBox.setMaxVisibleItems(6)
+                self.comboBox.addItems([data["label"] for data in options.values()])
+                self.comboBox.setCurrentText(self.label_by_value.get(config_item.value, next(iter(self.value_by_label))))
+                self.comboBox.setMinimumWidth(130)
+                self.comboBox.currentTextChanged.connect(self._on_changed)
+
+                self.hBoxLayout.addWidget(self.comboBox)
+                self.hBoxLayout.addSpacing(16)
+
+            def _build_lookup_tables(self):
+                self.value_by_label = {data["label"]: key for key, data in self.options.items()}
+                self.label_by_value = {key: data["label"] for key, data in self.options.items()}
+
+            def _on_changed(self, label):
+                value = self.value_by_label.get(label)
+                if value:
+                    self.cfg.set(self.config_item, value, save=True)
+                    parent = self._parent
+                    if parent and hasattr(parent, "_on_config_changed"):
+                        parent._on_config_changed()
+
+        self.uiFontSizeCard = AppearanceComboCard(
+            get_icon("字体大小"),
+            "界面字号",
+            "统一调整界面与对话内容字号",
+            self.cfg,
+            self.cfg.ui_font_size,
+            FONT_SIZE_OPTIONS,
+            self,
+        )
+        self.uiThemeStyleCard = AppearanceComboCard(
+            get_icon("主题风格"),
+            "主题风格",
+            "选择一套深色界面卡片配色",
+            self.cfg,
+            self.cfg.ui_theme_style,
+            self._build_theme_options(),
+            self,
+            True,  # is_theme_card
+        )
+
+    def _build_theme_options(self) -> dict:
+        """从 ThemeManager 动态构建主题选项"""
+        from app.utils.config import update_theme_options
+        update_theme_options()
+        themes = theme_manager.list_themes()
+        return {tid: {"label": name} for tid, name in themes.items()}
+
+
+    def _setup_font_card(self):
+        """创建字体设置卡片"""
+        from app.utils.fluent_shim import SettingCard
+
+        class FontSettingCard(SettingCard):
+            def __init__(self, title, content, cfg, parent=None):
+                super().__init__(FluentIcon.FONT, title, content, parent)
+                self.cfg = cfg
+                self._parent = parent
+
+                self.fontCombo = NoWheelFontComboBox()
+                self.fontCombo.setFixedWidth(180)
+                self.fontCombo.setSizeAdjustPolicy(QFontComboBox.SizeAdjustPolicy.AdjustToContents)
+                self._apply_font_combo_style()
+                current_font = cfg.llm_font_family.value
+                self.fontCombo.setCurrentFont(QFont(current_font))
+                self.fontCombo.currentFontChanged.connect(self._on_font_changed)
+
+                self.hBoxLayout.addWidget(self.fontCombo)
+                self.hBoxLayout.addSpacing(16)
+
+            def _apply_font_combo_style(self):
+                self.fontCombo.setStyleSheet(ComboBoxStyles.dark_combo().replace("QComboBox", "QFontComboBox"))
+                self.fontCombo.view().setStyleSheet(ComboBoxStyles.dark_combo_dropdown())
+
+                view = self.fontCombo.view()
+                view.setTextElideMode(Qt.ElideRight)
+
+            def refresh_style(self):
+                """主题切换时重新应用字体下拉样式"""
+                super().refresh_style()
+                self._apply_font_combo_style()
+
+            def _on_font_changed(self, font):
+                self.cfg.set(self.cfg.llm_font_family, font.family(), save=True)
+                self.cfg.save()
+                if self._parent and hasattr(self._parent, "_on_config_changed"):
+                    self._parent._on_config_changed()
+
+        self.llmFontCard = FontSettingCard(
+            "全局字体",
+            "设置界面显示字体",
+            self.cfg,
+            self,
+        )
+
+    def _setup_port_card(self):
+        """创建端口设置卡片"""
+        from app.utils.fluent_shim import SettingCard, SpinBox
+        from app.utils.fluent_shim import FluentIcon
+
+        class PortSettingCard(SettingCard):
+            def __init__(self, title, content, cfg, parent=None):
+                super().__init__(FluentIcon.INFO, title, content, parent)
+                self.cfg = cfg
+
+                self.spinBox = SpinBox()
+                self.spinBox.setFixedWidth(100)
+                self.spinBox.setRange(1024, 65535)
+                self.spinBox.setValue(cfg.llm_api_port.value)
+                self.spinBox.valueChanged.connect(self._on_value_changed)
+
+                self.hBoxLayout.addWidget(self.spinBox)
+                self.hBoxLayout.addSpacing(16)
+
+            def _on_value_changed(self, value):
+                self.cfg.set(self.cfg.llm_api_port, value, save=True)
+                parent = self.parent()
+                while parent and not hasattr(parent, "llmApiEnabledCard"):
+                    parent = parent.parent()
+                if parent and hasattr(parent, "llmApiEnabledCard"):
+                    parent.llmApiEnabledCard.setContent(
+                        f"http://localhost:{value}/docs"
+                    )
+
+        self.llmApiPortCard = PortSettingCard(
+            "API 端口",
+            "设置 API 服务端口（1024-65535）",
+            self.cfg,
+            self,
+        )
+
+    def _on_close(self):
+        self.setVisible(False)
+        self.closed.emit()
+
+    def _on_skills_changed(self, enabled_skills):
+        """技能变更 — 仅保存，不需要刷新外观或模型列表"""
+        self._save_timer.start()
+
+    def _on_settings_changed(self, _value=None):
+        """非外观类设置变更（通知、提示音等）— 仅保存，不需要刷新外观"""
+        self._save_timer.start()
+
+    def _on_provider_changed(self):
+        """服务商变更（添加/删除/修改）— 只需重载模型配置，不需要刷新外观"""
+        self.configChanged.emit()
+        self._save_timer.start()
+
+    def _on_config_changed(self):
+        """外观/模型相关设置变更 — 需要全量刷新"""
+        self.configChanged.emit()
+        self._save_timer.start()
+        # 立即刷新字体大小和主题样式（不等待保存定时器）
+        QTimer.singleShot(0, lambda: self._refresh_appearance_from_config(local_only=True))
+
+    def _refresh_appearance_from_config(self, local_only: bool = False):
+        """根据当前配置刷新外观样式
+
+        Args:
+            local_only: True=仅刷新自身及子组件样式（初始化时使用）；
+                       False=同时触发全局 dispatch_refresh（用户更改配置时使用）
+        """
+        # 刷新字体大小
+        actual_size = get_ui_font_size()
+        apply_font_size_to_widget(self, actual_size)
+
+        # 刷新主题样式（QPalette + QSS）
+        from app.utils.fluent_shim import setTheme, Theme
+        setTheme(Theme.DARK)
+        Colors.refresh()
+        if not local_only:
+            # --- 关键修复：触发 ComboBox/EditableComboBox 的下拉 view 样式刷新 ---
+            # 仅在用户主动更改外观配置时触发全局 dispatch_refresh，
+            # 初始化时 (local_only=True) 跳过，避免新窗口创建时导致所有窗口重绘。
+            try:
+                from app.utils.theme_manager import theme_manager
+                theme_manager.apply_theme_style()
+            except Exception:
+                pass
+        if hasattr(self, "refresh_style"):
+            self.refresh_style()
+        
+        # 刷新所有子设置卡片的主题样式
+        for frame in self.findChildren(SystemCardFrame):
+            if hasattr(frame, "refresh_style"):
+                frame.refresh_style()
+        # 刷新 BaseSettingsCard 子卡片
+        for card in self.findChildren(BaseSettingsCard):
+            if hasattr(card, "refresh_style"):
+                card.refresh_style()
+        # 刷新 SettingCard 及其子类（含 ExpandSettingCard）的文字字号
+        from app.utils.fluent_shim import SettingCard
+        for card in self.findChildren(SettingCard):
+            if hasattr(card, "refresh_style"):
+                card.refresh_style()
+        # 刷新分隔标签
+        self._refresh_sep_labels()
+
+    def _refresh_sep_labels(self):
+        """刷新所有分隔标签的样式"""
+        Colors.refresh()
+        sep_labels = [
+            getattr(self, '_sep_llm_label', None),
+            getattr(self, '_sep_common_label', None),
+            getattr(self, '_sep_appearance_label', None),
+            getattr(self, '_sep_update_label', None),
+        ]
+        for label in sep_labels:
+            if label is not None:
+                label.setStyleSheet(
+                    f"color: {Colors.TEXT_MUTED}; padding: 4px 0;"
+                    f"{get_font_family_css()} font-weight: bold;"
+                )
+
+    def refresh_theme_options(self):
+        """热更新后刷新主题下拉列表（外部由 _on_plugin_hot_reload 调用）"""
+        if hasattr(self, 'uiThemeStyleCard') and hasattr(self.uiThemeStyleCard, 'comboBox'):
+            try:
+                combo = self.uiThemeStyleCard.comboBox
+                if hasattr(combo, '_refresh_items'):
+                    combo._refresh_items()
+                    logger.debug("[ThemeComboBox] 主题下拉已主动刷新")
+            except Exception as e:
+                logger.warning(f"[ThemeComboBox] 主动刷新失败: {e}")
+
+    def _perform_save(self):
+        try:
+            self.cfg.save_config()
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
+
+    def _on_toggled(self, enabled: bool):
+        """开机自启开关切换时：检查平台支持 + 更新注册表"""
+        # 防重入：防止信号递归/连锁导致多次写入
+        if LLMSettingsCard._autostart_toggling:
+            logger.info(f"[AutoStart] 防重入拦截: enabled={enabled}")
+            return
+        LLMSettingsCard._autostart_toggling = True
+        try:
+            if enabled:
+                # 开启前检查平台支持
+                import os
+                if os.name != "nt":
+                    self.autoStartCard.switchButton.setChecked(False)
+                    from app.utils.fluent_shim import InfoBar, InfoBarPosition
+                    InfoBar.error(
+                        title="开机自启",
+                        content="当前平台不支持开机自启配置。",
+                        position=InfoBarPosition.BOTTOM,
+                        duration=3000,
+                        parent=self,
+                    ).show()
+                    return
+
+            try:
+                set_auto_start(enabled)
+                # 确保配置持久化到 Settings 文件（.drifox/app.config）
+                self.cfg.save()
+            except Exception as exc:
+                # 失败时回退开关状态和 ConfigItem 值
+                # 注意：setChecked 可能触发 checkedChanged 信号导致重入，
+                # 防重入标志已在上层设置，防止递归
+                self.autoStartCard.switchButton.setChecked(not enabled)
+                self.cfg.set(self.cfg.auto_start, not enabled, save=True)
+                from app.utils.fluent_shim import InfoBar, InfoBarPosition
+                InfoBar.error(
+                    title="开机自启设置失败",
+                    content=str(exc),
+                    position=InfoBarPosition.BOTTOM,
+                    duration=3000,
+                    parent=self,
+                ).show()
+        finally:
+            LLMSettingsCard._autostart_toggling = False
+
+    def _on_llm_api_enabled_changed(self, enabled):
+        from app.gateway import (
+            stop_llm_api_service,
+            is_service_running,
+            get_llm_api_service,
+        )
+
+        if enabled:
+            if not is_service_running():
+                service = get_llm_api_service()
+                service.port = self.cfg.llm_api_port.value
+                service.start(background=True)
+        else:
+            if is_service_running():
+                stop_llm_api_service()
+        self._on_settings_changed()
+
+    def _on_llm_api_port_changed(self, port):
+        from app.gateway import (
+            stop_llm_api_service,
+            is_service_running,
+            get_llm_api_service,
+        )
+
+        if self.cfg.llm_api_enabled.value and is_service_running():
+            stop_llm_api_service()
+            service = get_llm_api_service()
+            service.port = port
+            service.start(background=True)
+        if hasattr(self, "llmApiEnabledCard"):
+            self.llmApiEnabledCard.setContent(f"http://localhost:{port}/docs")
+
+    def showEvent(self, event):
+        if hasattr(self, 'llmProviderCard'):
+            self.llmProviderCard._refresh_items()
+        super().showEvent(event)
+
+    def set_opacity(self, opacity: float):
+        """设置透明度（保留接口，暂不实现动态透明度）"""
+        pass
+

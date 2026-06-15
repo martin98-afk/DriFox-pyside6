@@ -1,0 +1,113 @@
+{
+  "version": "2.0",
+  "flow": "custom",
+  "meta": {
+    "title": "电商客服工单路由",
+    "description": "根据用户输入自动识别意图并分流处理"
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "start",
+      "label": "开始",
+      "x": 80,
+      "y": 240,
+      "config": {}
+    },
+    {
+      "id": "n2",
+      "type": "classifier",
+      "label": "意图分类",
+      "x": 320,
+      "y": 240,
+      "config": {
+        "input_source": "{{sys.query}}",
+        "categories": "退货换货 → 用户要求退货或换货\n商品咨询 → 用户询问商品信息/价格/库存\n物流查询 → 用户询问订单物流状态\n投诉建议 → 用户表达不满或提出改进建议\n其他 → 不属于以上类型",
+        "model": "gpt-4o-mini"
+      }
+    },
+    {
+      "id": "n3a",
+      "type": "llm",
+      "label": "退货换货处理",
+      "x": 560,
+      "y": 120,
+      "config": {
+        "title": "退货换货处理",
+        "model": "gpt-4",
+        "system_prompt": "你是电商退货换货处理专家。根据订单信息和用户诉求判断处理方案。\n\n需要输出：\n1. type: 处理类型（退货/换货/退差价）\n2. approval: 是否批准（true/false）\n3. reason: 审批理由\n4. refund_amount: 退款金额（如适用）\n5. next_steps: 下一步操作指引\n\n规则：\n1. 超过30天无特殊情况不批准\n2. VIP用户可酌情特批\n3. 只输出JSON",
+        "user_prompt": "用户请求：{{sys.query}}\n\n请分析并给出处理方案。"
+      }
+    },
+    {
+      "id": "n3b",
+      "type": "llm",
+      "label": "商品咨询回复",
+      "x": 560,
+      "y": 240,
+      "config": {
+        "title": "商品咨询",
+        "model": "gpt-4",
+        "system_prompt": "你是电商商品顾问。回答用户关于商品的咨询问题。\n\n需要输出：\n1. answer: 直接回答（100字以内）\n2. additional_info: 补充信息（如有）\n3. recommended: 推荐商品（如适用）\n\n规则：\n1. 不知道的明确说\"暂无该信息\"\n2. 只输出JSON",
+        "user_prompt": "用户问题：{{sys.query}}"
+      }
+    },
+    {
+      "id": "n3c",
+      "type": "llm",
+      "label": "物流查询",
+      "x": 560,
+      "y": 360,
+      "config": {
+        "title": "物流查询",
+        "model": "gpt-4",
+        "system_prompt": "你是物流客服。根据订单号查询物流状态并回复用户。\n\n需要输出：\n1. status: 物流状态（运输中/已签收/异常等）\n2. location: 最新位置\n3. estimated_time: 预计送达时间\n4. note: 备注（如有异常）\n\n规则：\n1. 查不到时说明\"订单信息有误\"\n2. 只输出JSON",
+        "user_prompt": "用户查询：{{sys.query}}"
+      }
+    },
+    {
+      "id": "n3d",
+      "type": "llm",
+      "label": "投诉处理",
+      "x": 560,
+      "y": 480,
+      "config": {
+        "title": "投诉处理",
+        "model": "gpt-4",
+        "system_prompt": "你是客户投诉处理专员。认真对待用户投诉并给出解决方案。\n\n需要输出：\n1. apology: 是否道歉（true/false）\n2. severity: 严重程度（高/中/低）\n3. solution: 解决方案\n4. compensation: 是否需要补偿（无/优惠券/退款）\n5. escalation: 是否需要升级处理（true/false）\n\n规则：\n1. 高严重程度必须 escalation=true\n2. 只输出JSON",
+        "user_prompt": "用户投诉：{{sys.query}}"
+      }
+    },
+    {
+      "id": "n4",
+      "type": "reply",
+      "label": "统一回复",
+      "x": 800,
+      "y": 240,
+      "config": {
+        "reply_type": "直接回复",
+        "content": "📋 您的请求已处理\n\n{{n3a.output.answer}}{{n3b.output.answer}}{{n3c.output.status}}{{n3d.output.solution}}\n\n如有其他问题请继续咨询！"
+      }
+    },
+    {
+      "id": "n5",
+      "type": "end",
+      "label": "结束",
+      "x": 1040,
+      "y": 240,
+      "config": {}
+    }
+  ],
+  "connections": [
+    {"sourceId": "n1", "targetId": "n2"},
+    {"sourceId": "n2", "targetId": "n3a"},
+    {"sourceId": "n2", "targetId": "n3b"},
+    {"sourceId": "n2", "targetId": "n3c"},
+    {"sourceId": "n2", "targetId": "n3d"},
+    {"sourceId": "n3a", "targetId": "n4"},
+    {"sourceId": "n3b", "targetId": "n4"},
+    {"sourceId": "n3c", "targetId": "n4"},
+    {"sourceId": "n3d", "targetId": "n4"},
+    {"sourceId": "n4", "targetId": "n5"}
+  ]
+}

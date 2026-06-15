@@ -1,0 +1,95 @@
+{
+  "version": "2.0",
+  "flow": "custom",
+  "meta": {
+    "title": "数据分析报告生成",
+    "description": "从数据源提取数据，生成可视化分析报告"
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "start",
+      "label": "开始",
+      "x": 80,
+      "y": 240,
+      "config": {}
+    },
+    {
+      "id": "n2",
+      "type": "llm",
+      "label": "需求解析",
+      "x": 320,
+      "y": 225,
+      "config": {
+        "title": "需求解析",
+        "model": "gpt-4",
+        "system_prompt": "你是数据分析需求分析师。理解用户的数据分析需求，确定分析维度。\n\n需要输出：\n1. metrics: 分析指标列表\n2. time_range: 分析时间范围\n3. dimensions: 拆分维度\n4. output_format: 输出格式（表格/图表/报告）\n\n规则：\n1. 指标要具体，如\"销售额\"而非\"数据\"\n2. 时间范围用相对表达如\"最近30天\"\n3. 只输出JSON",
+        "user_prompt": "用户需求：{{sys.query}}\n\n请解析出具体的分析指标和时间范围。"
+      }
+    },
+    {
+      "id": "n3",
+      "type": "ask-table",
+      "label": "数据查询",
+      "x": 560,
+      "y": 225,
+      "config": {
+        "table": "sales_records",
+        "db_type": "MySQL",
+        "question": "查询最近30天的销售数据，按产品类别汇总销售额和订单数"
+      }
+    },
+    {
+      "id": "n4",
+      "type": "code",
+      "label": "数据处理",
+      "x": 800,
+      "y": 225,
+      "config": {
+        "inputs": "raw_data: list\nanalysis_type: string",
+        "outputs": "processed_data: dict\nchart_config: dict",
+        "code": "def main(raw_data, analysis_type):\n    import json\n    \n    # 基础统计\n    total_amount = sum(d.get('amount', 0) for d in raw_data)\n    total_orders = len(raw_data)\n    avg_amount = total_amount / total_orders if total_orders > 0 else 0\n    \n    # 按类别汇总\n    by_category = {}\n    for d in raw_data:\n        cat = d.get('category', 'unknown')\n        if cat not in by_category:\n            by_category[cat] = {'amount': 0, 'count': 0}\n        by_category[cat]['amount'] += d.get('amount', 0)\n        by_category[cat]['count'] += 1\n    \n    # 排序\n    sorted_cats = sorted(by_category.items(), key=lambda x: x[1]['amount'], reverse=True)\n    \n    return {\n        'processed_data': {\n            'total_amount': round(total_amount, 2),\n            'total_orders': total_orders,\n            'avg_amount': round(avg_amount, 2),\n            'by_category': sorted_cats[:10]\n        },\n        'chart_config': {\n            'type': 'bar',\n            'data_key': 'by_category',\n            'labels': [c[0] for c in sorted_cats[:10]],\n            'values': [c[1]['amount'] for c in sorted_cats[:10]]\n        }\n    }"
+      }
+    },
+    {
+      "id": "n5",
+      "type": "llm",
+      "label": "报告生成",
+      "x": 1040,
+      "y": 225,
+      "config": {
+        "title": "分析报告生成",
+        "model": "gpt-4",
+        "system_prompt": "你是数据分析报告撰写专家。基于处理后的数据生成结构化报告。\n\n需要输出：\n1. summary: 数据概览（100字以内）\n2. key_findings: 主要发现（3-5条）\n3. trends: 趋势分析\n4. recommendations: 行动建议\n\n规则：\n1. 数值保留2位小数\n2. 发现要有数据支撑\n3. 只输出JSON",
+        "user_prompt": "处理后的数据：{{n4.output.processed_data}}\n图表配置：{{n4.output.chart_config}}\n\n请生成数据分析报告。"
+      }
+    },
+    {
+      "id": "n6",
+      "type": "reply",
+      "label": "输出报告",
+      "x": 1280,
+      "y": 225,
+      "config": {
+        "reply_type": "直接回复",
+        "content": "📊 数据分析报告\n\n**概览**\n- 总销售额：¥{{n4.output.processed_data.total_amount}}\n- 订单总数：{{n4.output.processed_data.total_orders}}\n- 平均客单价：¥{{n4.output.processed_data.avg_amount}}\n\n**主要发现**\n{{n5.output.key_findings}}\n\n**趋势分析**\n{{n5.output.trends}}\n\n**行动建议**\n{{n5.output.recommendations}}"
+      }
+    },
+    {
+      "id": "n7",
+      "type": "end",
+      "label": "结束",
+      "x": 1520,
+      "y": 240,
+      "config": {}
+    }
+  ],
+  "connections": [
+    {"sourceId": "n1", "targetId": "n2"},
+    {"sourceId": "n2", "targetId": "n3"},
+    {"sourceId": "n3", "targetId": "n4"},
+    {"sourceId": "n4", "targetId": "n5"},
+    {"sourceId": "n5", "targetId": "n6"},
+    {"sourceId": "n6", "targetId": "n7"}
+  ]
+}

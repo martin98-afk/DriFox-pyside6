@@ -1,0 +1,1305 @@
+# -*- coding: utf-8 -*-
+"""
+统一的设计系统 - Design Tokens 和样式常量
+所有 UI 组件应引用此模块以保持视觉一致性
+
+主题完全从 app/themes/ 目录读取，不硬编码主题数据
+"""
+
+from PySide6.QtCore import QSize
+
+from app.utils.theme_manager import theme_manager
+
+
+def _get_global_font() -> str:
+    """获取全局字体名称，用于样式表"""
+    try:
+        from app.utils.config import Settings
+
+        return Settings.get_instance().llm_font_family.value
+    except Exception:
+        try:
+            return Settings.get_instance().canvas_font_selected.value
+        except Exception:
+            return "Segoe UI"
+
+
+FONT_SIZE_OPTIONS = {
+    "small": {"label": "小", "delta": -1, "base": 13},
+    "medium": {"label": "中", "delta": 0, "base": 14},
+    "large": {"label": "大", "delta": 2, "base": 16},
+    "superlarge": {"label": "超大", "delta": 4, "base": 18},
+}
+
+
+def get_ui_font_size_key() -> str:
+    try:
+        from app.utils.config import Settings
+
+        key = Settings.get_instance().ui_font_size.value
+    except Exception:
+        key = "medium"
+    return key if key in FONT_SIZE_OPTIONS else "medium"
+
+
+def get_ui_font_size() -> int:
+    """获取当前配置的基础字体大小（未缩放）"""
+    return FONT_SIZE_OPTIONS[get_ui_font_size_key()]["base"]
+
+
+def scale_font_size(size: int) -> int:
+    return max(8, int(size) + FONT_SIZE_OPTIONS[get_ui_font_size_key()]["delta"])
+
+
+def font_size_css(size: int) -> str:
+    return f"font-size: {scale_font_size(size)}px;"
+
+
+def apply_font_size_to_widget(widget, base_size: int = 14):
+    """递归设置 widget 及其所有子控件的字体像素大小
+
+    Args:
+        widget: 要设置字体的 widget
+        base_size: 基础字体大小（会经过 scale_font_size 缩放）
+    """
+    from PySide6.QtWidgets import QWidget
+
+    scaled = scale_font_size(base_size)
+    font_family = _get_global_font()
+
+    for child in widget.findChildren(QWidget):
+        child_font = child.font()
+        child_font.setPixelSize(scaled)
+        child_font.setFamily(font_family)
+        child.setFont(child_font)
+
+
+def current_theme() -> dict:
+    """获取当前主题的扁平 colors 字典"""
+    return theme_manager.get_current_colors()
+
+
+def get_window_style() -> str:
+    """获取窗口渐变背景样式"""
+    window = theme_manager.get_theme_window(theme_manager.get_current_theme_id())
+    return f"""
+    #OpenAIChatToolWindow {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+            stop:0 {window.get("gradient_start", "rgba(10, 14, 22, 255)")},
+            stop:1 {window.get("gradient_end", "rgba(15, 20, 30, 255)")});
+    }}
+    """
+
+
+def get_capsule_style() -> str:
+    """获取胶囊样式"""
+    theme = current_theme()
+    return f"""
+        background: {theme["capsule_bg"]};
+        border: 1px solid {theme["capsule_border"]};
+        border-radius: 12px;
+    """
+
+
+# ============ 发光预设（glow presets）============
+# 每个预设一组 token，**只控制发光强度（ambient/primary/unfocused）**，
+# **不控制颜色** —— 颜色由主题 yaml 自己的 `input_focus_border` 决定。
+# 主题 yaml 中通过 `input_glow_preset: "breath"` 切换；不写则用类级默认值（保留原观感）。
+#
+# 设计原则：
+# - subtle  : 淡光，alpha 最低 + blur 最小，金属边缘的微弱反射
+# - breath  : 聚焦光 + 失焦态微光，焦点切换如"由弱到强"，奢华感来自持续呼吸
+# - platinum: 冷白金，去除暖色印象，最现代
+# - ember   : 四档中最亮（强度高），给习惯高调观感的用户
+#
+# 字段顺序：先填 INPUT_GLOW_AMBIENT_* 后填 UNFOCUSED_* —— 前者控制聚焦态光效强度，
+# 后者决定失焦态是否保留微光。颜色一律跟随主题的 `input_focus_border`。
+GLOW_PRESETS = {
+    "subtle": {
+        "input_glow_primary_alpha": 0,
+        "input_glow_primary_blur": 0,
+        "input_glow_ambient_alpha": 35,
+        "input_glow_ambient_blur": 18,
+        "input_glow_unfocused_ambient_alpha": 0,
+        "input_glow_unfocused_ambient_blur": 0,
+    },
+    "breath": {
+        "input_glow_primary_alpha": 0,
+        "input_glow_primary_blur": 0,
+        "input_glow_ambient_alpha": 65,
+        "input_glow_ambient_blur": 30,
+        "input_glow_unfocused_ambient_alpha": 38,
+        "input_glow_unfocused_ambient_blur": 30,
+    },
+    "platinum": {
+        "input_glow_primary_alpha": 0,
+        "input_glow_primary_blur": 0,
+        "input_glow_ambient_alpha": 55,
+        "input_glow_ambient_blur": 26,
+        "input_glow_unfocused_ambient_alpha": 0,
+        "input_glow_unfocused_ambient_blur": 0,
+    },
+    "ember": {
+        "input_glow_primary_alpha": 0,
+        "input_glow_primary_blur": 0,
+        "input_glow_ambient_alpha": 70,
+        "input_glow_ambient_blur": 30,
+        "input_glow_unfocused_ambient_alpha": 18,
+        "input_glow_unfocused_ambient_blur": 20,
+    },
+}
+
+
+# ============ 颜色系统 ============
+class Colors:
+    """颜色 Token - 动态从 ThemeManager 读取"""
+
+    # 默认值（fallback，用于主题未加载时）
+    CARD_BG = "rgba(33, 33, 38, {alpha})"
+    CARD_BG_SOLID = "rgba(33, 33, 38, 250)"
+    CONTENT_BG = "#2a2a2e"
+    BORDER = "#3d3d3d"
+    BORDER_ACCENT = "#f59e0b"
+    TEXT_PRIMARY = "#ffffff"
+    TEXT_SECONDARY = "rgba(255, 255, 255, 0.5)"
+    TEXT_SECONDARY_HOVER = "rgba(255, 255, 255, 0.8)"
+    TEXT_ACCENT = "#f59e0b"
+    TEXT_MUTED = "#888888"
+    TAB_ACTIVE_BG = "rgba(102, 198, 255, 0.3)"
+    TAB_INACTIVE = "rgba(255, 255, 255, 0.5)"
+    TAB_HOVER_BG = "rgba(255, 255, 255, 0.1)"
+    HOVER_BG = "rgba(255, 255, 255, 0.08)"
+    SELECTED_BG = "rgba(102, 198, 255, 0.35)"
+
+    # 组件级颜色
+    USER_CARD_BG = "rgba(27, 42, 67, 150)"
+    USER_CARD_ACCENT = "#9FC3FF"
+    USER_CARD_TEXT = "#F4F7FD"
+    USER_CARD_MUTED = "#B4C2D9"
+    ASSISTANT_CARD_BG = "rgba(45, 30, 20, 150)"
+    ASSISTANT_CARD_ACCENT = "#D35400"
+    ASSISTANT_CARD_TEXT = "#FFD4B8"
+    ASSISTANT_CARD_MUTED = "#8FA4C2"
+    AGENT_BTN_TEXT = "#8FA4C2"
+    AGENT_BTN_TEXT_ACTIVE = "#C9A85C"
+    AGENT_BTN_BG_ACTIVE = "rgba(201, 168, 92, 0.2)"
+    AGENT_BTN_SEPARATOR = "rgba(60, 75, 95, 150)"
+    INPUT_BG_START = "rgba(18, 24, 34, 150)"
+    INPUT_BG_END = "rgba(24, 31, 45, 150)"
+    INPUT_FOCUS_BG_START = "rgba(22, 29, 41, 220)"
+    INPUT_FOCUS_BG_END = "rgba(28, 36, 50, 220)"
+    INPUT_TEXT = "#F2F6FF"
+    INPUT_FOCUS_TEXT = "#FFFFFF"
+    INPUT_BORDER = "#2B3850"
+    INPUT_FOCUS_BORDER = "#C9A85C"
+    INPUT_PLACEHOLDER = "rgba(242, 246, 255, 0.4)"
+
+    # 聚焦发光 halo cascade — 各主题可单独微调 alpha / blur，
+    # 实现"主光 → 环境光晕"的个性化光效。
+    # 默认值取自 Shadows.GLOW_PRIMARY / GLOW_AMBIENT。
+    GLOW_PRIMARY_ALPHA = 195
+    GLOW_PRIMARY_BLUR = 26
+    GLOW_AMBIENT_ALPHA = 110
+    GLOW_AMBIENT_BLUR = 36
+
+    # 输入卡双层 halo：主光（紧致） + 环境光（弥散）
+    # 输入卡自带主光 + wrapper 带环境光，叠加形成"核心亮→柔光晕开"层次
+    INPUT_GLOW_PRIMARY_BLUR = 18
+    INPUT_GLOW_PRIMARY_ALPHA = 220
+    INPUT_GLOW_AMBIENT_BLUR = 42
+    INPUT_GLOW_AMBIENT_ALPHA = 80
+
+    # 失焦态发光（默认 0 = 失焦完全关闭；glow preset 如 breath 会改写）
+    # 失焦态保留微光能营造"持续呼吸"的奢华感，焦点切换不再是硬开关
+    INPUT_GLOW_UNFOCUSED_AMBIENT_BLUR = 0
+    INPUT_GLOW_UNFOCUSED_AMBIENT_ALPHA = 0
+
+    # 底部工具栏条（与输入卡片解耦的第二张卡，独立 token 以便主题分别调控）
+    TOOLBAR_STRIP_BG = "rgba(24, 31, 45, 150)"
+    TOOLBAR_STRIP_BORDER = "#2B3850"
+
+    # 实时卡片色
+    REALTIME_BORDER = "#4a90d9"
+    REALTIME_ACCENT = "#7dd3fc"
+    REALTIME_ACCENT_WARM = "#fbbf24"
+    REALTIME_SUCCESS = "#34d399"
+    REALTIME_ERROR = "#f87171"
+    REALTIME_BG = "rgba(18, 28, 48, 242)"
+    REALTIME_TEXT = "#f3f6fc"
+    REALTIME_TEXT_SECONDARY = "rgba(226, 235, 249, 0.7)"
+    REALTIME_TAG_BG = "rgba(125, 211, 252, 0.15)"
+    REALTIME_TAG_BORDER = "rgba(125, 211, 252, 0.3)"
+
+    # 系统卡片色
+    SYSTEM_BORDER = "#3d4a60"
+    SYSTEM_ACCENT = "#66c6ff"
+
+    # 发送按钮
+    SEND_BTN_START = "#C9A85C"
+    SEND_BTN_END = "#B8956A"
+    SEND_BTN_HOVER_START = "#D4B878"
+    SEND_BTN_HOVER_END = "#C9A060"
+    SEND_BTN_RADIUS = 17  # 按钮圆角半径
+
+    # 时间线
+    TIMELINE_NODE = "#5A5A5A"
+    TIMELINE_NODE_HOVER = "#6BA3FF"
+    TIMELINE_NODE_VISIBLE = "#00FF7F"
+    TIMELINE_NODE_SELECTED = "#FFA500"
+    TIMELINE_LINE = "#3A3A3A"
+    TIMELINE_LINE_PROGRESS = "#00FF7F"
+
+    # 上下文圆环
+    RING_NORMAL = "#5aa9ff"
+    RING_WARNING = "#f6c453"
+    RING_DANGER = "#ff6b6b"
+    RING_COMPACTED = "#9b59b6"
+
+    # 分支标签
+    BRANCH_LABEL_BG = "rgba(102, 198, 255, 0.15)"
+    BRANCH_LABEL_BORDER = "rgba(102, 198, 255, 0.3)"
+
+    # 窗口淡背景色
+    WINDOW_BG = "rgba(102, 198, 255, 0.04)"
+
+    # ── 全局 UI 基底 ──────────────────────────────────
+    TOOLBAR_BG = "rgba(255, 255, 255, 0.05)"
+    DIVIDER_COLOR = "rgba(255, 255, 255, 0.06)"
+    HOVER_BG_STRONG = "rgba(255, 255, 255, 0.10)"
+    SCROLLBAR_HANDLE_BG = "rgba(255, 255, 255, 0.28)"
+    SCROLLBAR_HANDLE_HOVER_BG = "rgba(255, 255, 255, 0.42)"
+    SCROLLBAR_ACCENT = "rgba(102, 198, 255, 0.50)"
+    SCROLLBAR_ACCENT_STRONG = "rgba(102, 198, 255, 0.70)"
+    SCROLLBAR_TRACK_BG = "rgba(255, 255, 255, 0.04)"
+    SCROLLBAR_TRACK_HOVER = "rgba(255, 255, 255, 0.08)"
+    CARD_PLACEHOLDER_TEXT = "#8FA4C2"
+
+    # ── 卡片级语义色 ──────────────────────────────────
+    BUTTON_TEXT_ON_ACCENT = "#1A1F2B"
+    STATUS_INFO = "#7FDBFF"
+    STATUS_DANGER_BG = "rgba(255, 80, 80, 0.8)"
+    STATUS_ARCHIVE_BG = "rgba(139, 92, 246, 0.8)"
+    CARD_BG_DIM = "rgba(255, 255, 255, 0.04)"
+    ARCHIVED_CARD_BG = "rgba(255, 180, 100, 0.08)"
+    ARCHIVED_CARD_BORDER = "rgba(255, 150, 80, 0.2)"
+
+    # ── 语法高亮色 ────────────────────────────────────
+    SYNTAX_STEP = "#4EC9B0"
+    SYNTAX_TOOL = "#DCDCAA"
+    SYNTAX_SUCCESS = "#6A9955"
+    SYNTAX_ERROR = "#F14C4C"
+    SYNTAX_RESULT = "#CE9178"
+
+    # ── 标签色 ────────────────────────────────────────
+    TAG_ACCENT = "#66c6ff"
+    TAG_ACCENT_TEXT = "#aae0ff"
+    TAG_PURPLE = "#b388ff"
+    TAG_PURPLE_TEXT = "#d1b3ff"
+    TAG_ORANGE = "#ffb366"
+    TAG_ORANGE_TEXT = "#ffc999"
+
+    # accent_warm 的 Colors 映射（主题已有该值，但 Colors 未暴露）
+    ACCENT_WARM = "#f59e0b"
+
+    # 语义色
+    SUCCESS = "#22c55e"
+    WARNING = "#f59e0b"
+    ERROR = "#ef4444"
+    INFO = "#3b82f6"
+
+    # 以下两个 attr 在 refresh() 中通过 theme.get() 设置，但类定义中缺少默认值
+    CAPSULE_BG = "rgba(27, 35, 50, 180)"
+    CAPSULE_BORDER = "rgba(43, 56, 80, 200)"
+
+    # ── 颜色映射表 ──────────────────────────────────────
+    # 约定：Colors 属性名 = YAML key 的 UPPER_CASE（下划线分割一致）
+    # 以下列出非标准映射（YAML key → 不同的 Colors 属性名）。
+    # 标准 1:1 映射由 refresh() 自动派生，无需在此声明。
+    _COLOR_ALIASES = {
+        "TEXT_ACCENT": "accent",                  # YAML "accent" → Colors.TEXT_ACCENT
+        "TAB_ACTIVE_BG": "selected_bg",            # YAML "selected_bg" → Colors.TAB_ACTIVE_BG
+        "TAB_HOVER_BG": "hover_bg",                # YAML "hover_bg" → Colors.TAB_HOVER_BG
+        "TEXT_SECONDARY_HOVER": "text_primary",    # YAML "text_primary" → Colors.TEXT_SECONDARY_HOVER
+    }
+
+    # Colors 属性名白名单 — 仅有这些属性经由主题 YAML 填充。
+    # 不在白名单内的属性（如 SUCCESS, WARNING, TAB_INACTIVE 等）始终保持类级默认值。
+    _THEME_SOURCED_ATTRS = None  # 懒加载，见 _get_theme_sourced_attrs()
+
+    # 主题 YAML 中不作为颜色值的顶层 key（跳过）
+    _SKIP_YAML_KEYS = frozenset({"name", "id", "window", "background", "input_glow_preset"})
+
+    @classmethod
+    def _get_theme_sourced_attrs(cls) -> frozenset:
+        """获取所有应该由主题 YAML 填充的 Colors 属性名"""
+        if cls._THEME_SOURCED_ATTRS is not None:
+            return cls._THEME_SOURCED_ATTRS
+
+        # 别名映射中的 attr
+        aliased = set(cls._COLOR_ALIASES.keys())
+        # 1:1 映射：从类属性中筛选出命名符合约定且不在跳过列表中的
+        direct = set()
+        for attr_name in dir(cls):
+            if attr_name.startswith("_"):
+                continue
+            if attr_name.isupper() and attr_name not in aliased:
+                yaml_key = attr_name.lower()
+                if yaml_key not in cls._SKIP_YAML_KEYS:
+                    direct.add(attr_name)
+        # 排除非颜色值的类属性
+        EXCLUDE = {"SUCCESS", "WARNING", "ERROR", "INFO", "TAB_INACTIVE"}
+        cls._THEME_SOURCED_ATTRS = frozenset((direct | aliased) - EXCLUDE)
+        return cls._THEME_SOURCED_ATTRS
+
+    @classmethod
+    def refresh(cls) -> None:
+        """从 ThemeManager 同步当前主题颜色到类属性"""
+        theme = current_theme()
+        if not theme:
+            return
+
+        # 1. 特殊处理：CARD_BG 需要 {alpha} 模板
+        if "card_bg" in theme:
+            cls.CARD_BG = (
+                theme["card_bg"].rsplit(",", 1)[0] + ", {alpha})"
+                if theme["card_bg"].startswith("rgba(")
+                else theme["card_bg"]
+            )
+
+        # 2. 1:1 映射：yaml_key → Colors.UPPER(yaml_key)
+        sourced = cls._get_theme_sourced_attrs()
+        for yaml_key, val in theme.items():
+            if yaml_key in cls._SKIP_YAML_KEYS:
+                continue
+            if yaml_key == "card_bg":
+                continue  # 已在上方处理
+            attr = yaml_key.upper()
+            if attr in sourced:
+                setattr(cls, attr, val)
+
+        # 3. 别名映射：yaml_key → 非标准 Colors 属性名
+        for attr, yaml_key in cls._COLOR_ALIASES.items():
+            if yaml_key in theme:
+                setattr(cls, attr, theme[yaml_key])
+
+        # 4. 发光预设（最后执行，会覆盖已设置的单个发光 token）
+        preset_name = theme.get("input_glow_preset")
+        if preset_name:
+            if not cls.apply_glow_preset(preset_name):
+                import warnings
+                warnings.warn(
+                    f"[design_tokens] Unknown input_glow_preset: {preset_name!r} "
+                    f"(valid: {sorted(GLOW_PRESETS.keys())}); falling back to class defaults."
+                )
+
+    @classmethod
+    def apply_glow_preset(cls, preset_name: str) -> bool:
+        """应用发光预设：**只覆盖发光强度 token，不覆盖 INPUT_FOCUS_BORDER**
+
+        INPUT_FOCUS_BORDER（颜色）由主题 yaml 自己负责，预设不介入。
+        这样主题可以自由组合"颜色 + 强度"，例如辐射绿 fallback + ember 强度。
+
+        Args:
+            preset_name: GLOW_PRESETS 的 key（subtle / breath / platinum / ember）
+
+        Returns:
+            True 应用成功；False 预设名无效（调用方应降级到类级默认值）
+        """
+        preset = GLOW_PRESETS.get(preset_name)
+        if preset is None:
+            return False
+        cls.INPUT_GLOW_PRIMARY_ALPHA = preset.get(
+            "input_glow_primary_alpha", cls.INPUT_GLOW_PRIMARY_ALPHA
+        )
+        cls.INPUT_GLOW_PRIMARY_BLUR = preset.get(
+            "input_glow_primary_blur", cls.INPUT_GLOW_PRIMARY_BLUR
+        )
+        cls.INPUT_GLOW_AMBIENT_ALPHA = preset.get(
+            "input_glow_ambient_alpha", cls.INPUT_GLOW_AMBIENT_ALPHA
+        )
+        cls.INPUT_GLOW_AMBIENT_BLUR = preset.get(
+            "input_glow_ambient_blur", cls.INPUT_GLOW_AMBIENT_BLUR
+        )
+        cls.INPUT_GLOW_UNFOCUSED_AMBIENT_ALPHA = preset.get(
+            "input_glow_unfocused_ambient_alpha",
+            cls.INPUT_GLOW_UNFOCUSED_AMBIENT_ALPHA,
+        )
+        cls.INPUT_GLOW_UNFOCUSED_AMBIENT_BLUR = preset.get(
+            "input_glow_unfocused_ambient_blur",
+            cls.INPUT_GLOW_UNFOCUSED_AMBIENT_BLUR,
+        )
+        return True
+
+
+# 初始化 Colors
+Colors.refresh()
+
+
+class BorderRadius:
+    """圆角 Token"""
+
+    SM = "4px"  # 小标签、小按钮
+    MD = "8px"  # 卡片、输入框
+    LG = "18px"  # 搜索框、输入区域
+
+
+# ============ 动效系统 ============
+class Animations:
+    """动画时间与缓动 Token — 克制使用，仅关键处动效"""
+
+    FAST_MS = 150  # 按钮按下/释放
+    NORMAL_MS = 200  # 卡片淡入、过渡
+    SLOW_MS = 300  # 展开/折叠
+
+    # 缓动曲线
+    EASE_OUT = "QEasingCurve::OutCubic"
+    EASE_IN_OUT = "QEasingCurve::InOutQuad"
+
+    # 位移量
+    FADE_SLIDE_Y = 8  # 淡入上滑像素数
+
+
+# ============ 阴影系统 ============
+class Shadows:
+    """阴影 Token — 通过 QGraphicsDropShadowEffect 实现"""
+
+    # 标准卡片阴影
+    CARD = {
+        "blur_radius": 12,
+        "offset_x": 0,
+        "offset_y": 4,
+        "color": "rgba(0, 0, 0, 0.25)",
+    }
+    # 浮动卡片阴影（更明显）
+    FLOATING = {
+        "blur_radius": 20,
+        "offset_x": 0,
+        "offset_y": 8,
+        "color": "rgba(0, 0, 0, 0.35)",
+    }
+    # ===== 聚焦发光（halo cascade — 主光 + 环境光晕双层 token）=====
+    # 焦点态时输入卡 + 工具栏一起发光，构成"发光胶囊"。
+    # 两者同色系（取自 Colors.INPUT_FOCUS_BORDER，主题感知），
+    # 通过 alpha / blur 的差异营造"主光 → 回声"的层次：
+    # 上紧下散、上亮下柔，不抢戏也不脱节。
+    #
+    # 注意：GLOW_* 系列不携带 color 字段 — 颜色由调用方从
+    # Colors.INPUT_FOCUS_BORDER 读取，alpha 由 token 显式声明。
+    # 这样主题切换时颜色自动跟随，无需维护两套 rgba 字面量。
+
+    # 聚焦主光源 — 输入卡等"活动"控件的辉光
+    # alpha 较高、blur 紧凑 → 收紧、聚焦，是胶囊的"光源"
+    GLOW_PRIMARY = {
+        "blur_radius": 26,
+        "offset_x": 0,
+        "offset_y": 0,
+        "alpha": 195,
+    }
+    # 聚焦环境光晕 — 工具栏等"次级"控件的余光
+    # alpha 较主光源低 ~44%、blur 较主光源宽 ~38%
+    # → 弥散、柔和，像主光"洒"过来的余晖
+    GLOW_AMBIENT = {
+        "blur_radius": 36,
+        "offset_x": 0,
+        "offset_y": 0,
+        "alpha": 110,
+    }
+    # 兼容旧名（历史别名，等价于 GLOW_PRIMARY）
+    GLOW = GLOW_PRIMARY
+
+    # 输入卡双层 halo 专用
+    INPUT_GLOW_PRIMARY = {
+        "blur_radius": 18,
+        "offset_x": 0,
+        "offset_y": 0,
+        "alpha": 220,
+    }
+    INPUT_GLOW_AMBIENT = {
+        "blur_radius": 42,
+        "offset_x": 0,
+        "offset_y": 0,
+        "alpha": 80,
+    }
+
+
+class BorderRadius:
+    """圆角 Token"""
+
+    SM = "4px"  # 小标签、小按钮
+    MD = "8px"  # 卡片、输入框
+    LG = "18px"  # 搜索框、输入区域
+
+
+# ============ 间距系统 ============
+class Spacing:
+    """间距 Token（单位：px）"""
+
+    XS = 4
+    SM = 8
+    MD = 12
+    LG = 16
+    XL = 20
+    XXL = 24
+
+
+# ============ 字体系统 ============
+class FontSizes:
+    """字体大小 Token"""
+
+    XS = "10px"
+    SM = "11px"  # 正文、标签
+    MD = "12px"  # 标题
+    LG = "14px"  # 大标题
+
+
+class FontWeights:
+    """字重 Token"""
+
+    NORMAL = ""
+    BOLD = "bold"
+
+
+# ============ 组件尺寸 ============
+class Sizes:
+    """组件尺寸 Token"""
+
+    ICON_SM = QSize(12, 12)
+    ICON_MD = QSize(16, 16)
+    ICON_LG = QSize(20, 20)
+
+    BUTTON_H_SM = 29  # 小按钮高度
+    BUTTON_H_MD = 36  # 中按钮高度
+
+    CARD_MIN_H = 53  # 列表项最小高度
+
+    # ToolButton 统一规格
+    TOOL_BUTTON_SZ = QSize(28, 28)
+    TOOL_ICON_SZ = QSize(14, 14)
+
+    # SwitchButton 统一规格
+    SWITCH_WIDTH = 50
+
+
+# ============ CSS 模板 ============
+class CardStyles:
+    """卡片样式模板"""
+
+    @staticmethod
+    def card(alpha: int = 250) -> str:
+        """标准卡片样式"""
+        Colors.refresh()
+        return f"""
+            CardWidget, SimpleCardWidget {{
+                background-color: {Colors.CARD_BG.format(alpha=alpha)};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+            }}
+        """
+
+    @staticmethod
+    def card_content() -> str:
+        """卡片内容区样式"""
+        Colors.refresh()
+        return f"""
+            background-color: {Colors.CONTENT_BG};
+            border-radius: 6px;
+        """
+
+    @staticmethod
+    def scroll_area() -> str:
+        """滚动区域样式 — Discord 风格，轨道可见、把手圆润、品牌色 hover"""
+        Colors.refresh()
+        return f"""
+            QScrollArea {{
+                border: none;
+                background: transparent;
+            }}
+            QScrollArea > QWidget > QWidget {{
+                background: transparent;
+            }}
+            /* ── 垂直滚动条 ── */
+            QScrollBar:vertical {{
+                background: {Colors.SCROLLBAR_TRACK_BG};
+                width: 8px;
+                margin: 2px 0 2px 1px;
+                border-radius: 4px;
+            }}
+            QScrollBar:vertical:hover {{
+                background: {Colors.SCROLLBAR_TRACK_HOVER};
+            }}
+            QScrollBar::handle:vertical {{
+                background: {Colors.SCROLLBAR_HANDLE_BG};
+                border-radius: 4px;
+                min-height: 30px;
+                margin: 0 1px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {Colors.SCROLLBAR_ACCENT};
+            }}
+            QScrollBar::handle:vertical:pressed {{
+                background: {Colors.SCROLLBAR_ACCENT_STRONG};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: none;
+            }}
+            /* ── 水平滚动条 ── */
+            QScrollBar:horizontal {{
+                background: {Colors.SCROLLBAR_TRACK_BG};
+                height: 8px;
+                margin: 1px 2px 0 2px;
+                border-radius: 4px;
+            }}
+            QScrollBar:horizontal:hover {{
+                background: {Colors.SCROLLBAR_TRACK_HOVER};
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {Colors.SCROLLBAR_HANDLE_BG};
+                border-radius: 4px;
+                min-width: 30px;
+                margin: 1px 0;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: {Colors.SCROLLBAR_ACCENT};
+            }}
+            QScrollBar::handle:horizontal:pressed {{
+                background: {Colors.SCROLLBAR_ACCENT_STRONG};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}
+        """
+
+    @staticmethod
+    def edit_card_style() -> str:
+        """统一表单输入框样式（供 mcp/hook/provider_edit/gateway 等设置卡片复用）"""
+        Colors.refresh()
+        from app.utils.utils import get_font_family_css
+        from app.utils.design_tokens import font_size_css
+
+        return f"""
+        QWidget {{
+            background: transparent;
+        }}
+        QLineEdit {{
+            background-color: {Colors.CONTENT_BG};
+            color: {Colors.TEXT_PRIMARY};
+            border: 1px solid {Colors.BORDER};
+            border-radius: 4px;
+            padding: 4px 8px;
+            {get_font_family_css()}
+            {font_size_css(12)}
+        }}
+        QLineEdit:focus {{
+            border-color: {Colors.INPUT_FOCUS_BORDER};
+        }}
+        QLineEdit::placeholder {{
+            color: {Colors.INPUT_PLACEHOLDER};
+        }}
+        QPlainTextEdit {{
+            background-color: {Colors.CONTENT_BG};
+            color: {Colors.TEXT_PRIMARY};
+            border: 1px solid {Colors.BORDER};
+            border-radius: 4px;
+            padding: 4px 8px;
+            {get_font_family_css()}
+            {font_size_css(12)}
+        }}
+        QPlainTextEdit:focus {{
+            border-color: {Colors.INPUT_FOCUS_BORDER};
+        }}
+        """
+
+    @staticmethod
+    def title_icon(emoji: str = "⚙️") -> str:
+        """标题图标样式（返回 emoji）"""
+        return emoji
+
+    @staticmethod
+    def title_label() -> str:
+        """标题文字样式"""
+        Colors.refresh()
+        return f"color: {Colors.TEXT_ACCENT};"
+
+    @staticmethod
+    def close_button() -> str:
+        """关闭按钮样式"""
+        return "color: #888888; cursor: pointer; padding: 4px;"
+
+
+class TabStyles:
+    """标签样式模板"""
+
+    @staticmethod
+    def active() -> str:
+        Colors.refresh()
+        return f"""
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                {font_size_css(11)}
+                font-weight: bold;
+                padding: 3px 8px;
+                border-radius: 4px;
+                background-color: {Colors.TAB_ACTIVE_BG};
+                font-family: '{_get_global_font()}';
+            }}
+        """
+
+    @staticmethod
+    def inactive() -> str:
+        Colors.refresh()
+        return f"""
+            QLabel {{
+                color: {Colors.TEXT_SECONDARY};
+                {font_size_css(11)}
+                padding: 3px 8px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-family: '{_get_global_font()}';
+            }}
+            QLabel:hover {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.TAB_HOVER_BG};
+            }}
+        """
+
+
+class ItemStyles:
+    """列表项样式模板"""
+
+    @staticmethod
+    def radio_button() -> str:
+        """单选按钮样式"""
+        return """
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border: 2px solid #8e8e8e;
+                background-color: transparent;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid #0078d4;
+                background-color: #0078d4;
+            }
+        """
+
+    @staticmethod
+    def tag() -> str:
+        """标签样式"""
+        return """
+            color: #fff; 
+            font-weight: bold; 
+            background-color: rgba(102, 198, 255, 0.35); 
+            border-radius: 4px; 
+            padding: 2px 8px;
+        """
+
+
+class ButtonStyles:
+    """按钮统一样式模板"""
+
+    @staticmethod
+    def tool_button() -> str:
+        """ToolButton 透明背景样式"""
+        return "background-color: transparent; border-radius: 4px;"
+
+    @staticmethod
+    def primary_action() -> str:
+        """主操作按钮样式（用于 ManualUpdateCard 等）"""
+        return f"""
+            PrimaryPushButton {{
+                background-color: #0078d4;
+                color: #ffffff;
+                border: none;
+                border-radius: 5px;
+                padding: 5px 16px;
+                {font_size_css(13)}
+                font-weight: bold;
+            }}
+            PrimaryPushButton:hover {{
+                background-color: {Colors.BORDER_ACCENT};
+            }}
+            PrimaryPushButton:pressed {{
+                background-color: {Colors.SELECTED_BG};
+            }}
+            PrimaryPushButton:disabled {{
+                background-color: #444;
+                color: #888;
+            }}
+        """
+
+
+class SwitchStyles:
+    """开关统一样式模板"""
+
+    @staticmethod
+    def configure(switch) -> None:
+        """统一配置 SwitchButton：无文字标签 + 固定宽度"""
+        switch.setOnText("")
+        switch.setOffText("")
+        switch.setFixedWidth(Sizes.SWITCH_WIDTH)
+
+
+class ComboBoxStyles:
+    """下拉框统一样式模板 — 暗色精工工业风
+
+    关键修复：
+    - 箭头用 SVG 图标（展开.svg），不再用 PySide6 中渲染异常的 CSS 三角
+    - drop-down 用 subcontrol-origin: margin 统一高度，消除阶梯错位
+    - 移除 drop-down 左边框，整组件视觉统一
+    - 强化 hover/selected 视觉反馈：深色背景下使用更高 opacity 的悬停色
+    """
+
+    @staticmethod
+    def dark_combo() -> str:
+        """统一风格下拉框样式
+
+        设计要点：
+        - 下拉框本体通过 stylesheet 控制（边框、背景、文字、箭头）—— 这些在 Fusion 中可靠
+        - 下拉列表项（QAbstractItemView）的 hover/selected 交由 Fusion 原生 palette 渲染，
+          不在 stylesheet 中使用不可靠的 ::item:hover / ::item:selected 伪状态。
+          Fusion 会自动以 Highlight 色减淡显示 hover，以全色显示选中。
+        """
+        Colors.refresh()
+        return f"""
+            QComboBox {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.CONTENT_BG};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 5px 32px 5px 12px;
+                min-height: 28px;
+                {font_size_css(12)}
+                {get_font_family_css()}
+            }}
+            QComboBox:hover {{
+                border: 1px solid {Colors.TEXT_SECONDARY};
+                background-color: rgba(255, 255, 255, 0.12);
+            }}
+            QComboBox:pressed {{
+                border: 1px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: rgba(255, 255, 255, 0.16);
+            }}
+            QComboBox:focus {{
+                border: 2px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+            QComboBox:on {{
+                border: 2px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: margin;
+                subcontrol-position: center right;
+                width: 26px;
+                border: none;
+                border-top-right-radius: 7px;
+                border-bottom-right-radius: 7px;
+                background: transparent;
+            }}
+            QComboBox::drop-down:hover {{
+                background-color: rgba(255, 255, 255, 0.18);
+            }}
+            QComboBox::down-arrow {{
+                image: url(:/icons/展开.svg);
+                width: 10px;
+                height: 10px;
+            }}
+            QComboBox QAbstractItemView {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.CONTENT_BG};
+                border: 2px solid {Colors.BORDER};
+                border-radius: 10px;
+                padding: 6px;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                min-height: 28px;
+                border-radius: 5px;
+            }}
+        """
+
+    @staticmethod
+    def dark_combo_dropdown() -> str:
+        """下拉弹出列表独立样式 — 仅容器样式，item 渲染交给 Fusion palette"""
+        Colors.refresh()
+        return f"""
+            QAbstractItemView {{
+                color: {Colors.TEXT_PRIMARY};
+                background-color: {Colors.CONTENT_BG};
+                border: 2px solid {Colors.BORDER};
+                border-radius: 10px;
+                padding: 6px;
+                outline: none;
+            }}
+            QAbstractItemView::item {{
+                padding: 8px 12px;
+                min-height: 28px;
+                border-radius: 5px;
+            }}
+        """
+
+
+# ── 统一输入框样式（LineEdit / PasswordLineEdit / TextEdit）─────────────
+class InputStyles:
+    """输入框统一样式模板 — 暗色精工工业风
+
+    所有输入类控件共享同一视觉基线：
+    - 深炭基底 + 冷灰边框 + 暖金聚焦态
+    - 统一 8px 圆角、8px-12px 内边距、32px 最小高度
+    - focus 时暖金边框发光
+    """
+
+    @staticmethod
+    def line_edit() -> str:
+        """标准单行/密码输入框样式"""
+        Colors.refresh()
+        return f"""
+            QLineEdit {{
+                background-color: {Colors.CONTENT_BG};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 8px 12px;
+                min-height: 28px;
+                {font_size_css(12)}
+                {get_font_family_css()}
+                selection-background-color: {Colors.TEXT_ACCENT};
+                selection-color: {Colors.BUTTON_TEXT_ON_ACCENT};
+            }}
+            QLineEdit:hover {{
+                border: 1px solid {Colors.TEXT_SECONDARY};
+                background-color: {Colors.HOVER_BG};
+            }}
+            QLineEdit:focus {{
+                border: 2px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+            QLineEdit:disabled {{
+                background-color: {Colors.CARD_BG_DIM};
+                color: {Colors.TEXT_MUTED};
+                border: 1px solid {Colors.DIVIDER_COLOR};
+            }}
+            QLineEdit::placeholder {{
+                color: {Colors.INPUT_PLACEHOLDER};
+            }}
+        """
+
+    @staticmethod
+    def text_edit() -> str:
+        """多行文本编辑框样式（QPlainTextEdit，保留兼容）"""
+        Colors.refresh()
+        return f"""
+            QPlainTextEdit {{
+                background-color: {Colors.CONTENT_BG};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 8px 12px;
+                {font_size_css(12)}
+                {get_font_family_css()}
+                selection-background-color: {Colors.TEXT_ACCENT};
+                selection-color: {Colors.BUTTON_TEXT_ON_ACCENT};
+            }}
+            QPlainTextEdit:hover {{
+                border: 1px solid {Colors.TEXT_SECONDARY};
+            }}
+            QPlainTextEdit:focus {{
+                border: 1px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+        """
+
+    @staticmethod
+    def text_edit_textedit() -> str:
+        """多行文本编辑框样式（QTextEdit，与 qfluentwidgets 原版一致）"""
+        Colors.refresh()
+        return f"""
+            QTextEdit {{
+                background-color: {Colors.CONTENT_BG};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 8px;
+                padding: 8px 12px;
+                {font_size_css(12)}
+                {get_font_family_css()}
+                selection-background-color: {Colors.TEXT_ACCENT};
+                selection-color: {Colors.BUTTON_TEXT_ON_ACCENT};
+            }}
+            QTextEdit:hover {{
+                border: 1px solid {Colors.TEXT_SECONDARY};
+            }}
+            QTextEdit:focus {{
+                border: 1px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+            QTextEdit QScrollBar:vertical {{
+                background: rgba(255,255,255,0.04);
+                width: 8px;
+                margin: 2px 0;
+            }}
+            QTextEdit QScrollBar::handle:vertical {{
+                background: rgba(255,255,255,0.28);
+                border-radius: 4px;
+                min-height: 28px;
+                margin: 0 1px;
+            }}
+            QTextEdit QScrollBar::handle:vertical:hover {{
+                background: rgba(102,198,255,0.50);
+            }}
+            QTextEdit QScrollBar::handle:vertical:pressed {{
+                background: rgba(102,198,255,0.70);
+            }}
+            QTextEdit QScrollBar::add-line, QTextEdit QScrollBar::sub-line {{
+                height: 0;
+                width: 0;
+            }}
+            QTextEdit QScrollBar:horizontal {{
+                background: rgba(255,255,255,0.04);
+                height: 8px;
+                margin: 0 2px;
+            }}
+            QTextEdit QScrollBar::handle:horizontal {{
+                background: rgba(255,255,255,0.28);
+                border-radius: 4px;
+                min-width: 28px;
+                margin: 1px 0;
+            }}
+            QTextEdit QScrollBar::handle:horizontal:hover {{
+                background: rgba(102,198,255,0.50);
+            }}
+            QTextEdit QScrollBar::handle:horizontal:pressed {{
+                background: rgba(102,198,255,0.70);
+            }}
+        """
+
+
+# ── 统一数字调整框样式（SpinBox）────────────────────────────────
+class SpinBoxStyles:
+    """数字选择框统一样式模板
+
+    继承输入框基线 + 自定义上下按钮。
+    按钮区域透明、箭头用 CSS 三角、hover 时暖金高亮。
+    """
+
+    @staticmethod
+    def spin_box() -> str:
+        Colors.refresh()
+        return f"""
+            QSpinBox, QDoubleSpinBox {{
+                background-color: {Colors.CONTENT_BG};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                padding: 4px 28px 4px 10px;
+                min-height: 24px;
+                max-height: 28px;
+                {font_size_css(12)}
+                {get_font_family_css()}
+                selection-background-color: {Colors.TEXT_ACCENT};
+                selection-color: {Colors.BUTTON_TEXT_ON_ACCENT};
+            }}
+            QSpinBox:hover, QDoubleSpinBox:hover {{
+                border: 1px solid {Colors.TEXT_SECONDARY};
+                background-color: {Colors.HOVER_BG};
+            }}
+            QSpinBox:focus, QDoubleSpinBox:focus {{
+                border: 1px solid {Colors.INPUT_FOCUS_BORDER};
+                background-color: {Colors.INPUT_FOCUS_BG_START};
+            }}
+            QSpinBox::up-button, QDoubleSpinBox::up-button {{
+                subcontrol-origin: margin;
+                subcontrol-position: top right;
+                width: 22px;
+                height: 13px;
+                border: none;
+                border-top-right-radius: 5px;
+                background: transparent;
+            }}
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover {{
+                background-color: {Colors.HOVER_BG};
+            }}
+            QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed {{
+                background-color: {Colors.SELECTED_BG};
+            }}
+            QSpinBox::down-button, QDoubleSpinBox::down-button {{
+                subcontrol-origin: margin;
+                subcontrol-position: bottom right;
+                width: 22px;
+                height: 13px;
+                border: none;
+                border-bottom-right-radius: 5px;
+                background: transparent;
+            }}
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+                background-color: {Colors.HOVER_BG};
+            }}
+            QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{
+                background-color: {Colors.SELECTED_BG};
+            }}
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+                image: url(:/icons/折叠.svg);
+                width: 8px;
+                height: 8px;
+            }}
+            QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{
+                image: url(:/icons/折叠.svg);
+            }}
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+                image: url(:/icons/展开.svg);
+                width: 8px;
+                height: 8px;
+            }}
+            QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+                image: url(:/icons/展开.svg);
+            }}
+            QSpinBox:disabled, QDoubleSpinBox:disabled {{
+                background-color: {Colors.CARD_BG_DIM};
+                color: {Colors.TEXT_MUTED};
+                border: 1px solid {Colors.DIVIDER_COLOR};
+            }}
+        """
+
+
+# ── 统一滑动条样式（Slider）────────────────────────────────────
+class SliderStyles:
+    """滑动条统一样式模板
+
+    - 轨道：4px 高、圆角、冷灰底 + 暖金已走区域
+    - 手柄：16px 圆、暖金填充 + hover 发光
+    """
+
+    @staticmethod
+    def slider() -> str:
+        Colors.refresh()
+        return f"""
+            QSlider::groove:horizontal {{
+                background: {Colors.BORDER};
+                height: 4px;
+                border-radius: 2px;
+            }}
+            QSlider::groove:horizontal:disabled {{
+                background: {Colors.DIVIDER_COLOR};
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {Colors.INPUT_FOCUS_BORDER};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {Colors.INPUT_FOCUS_BORDER};
+                width: 17px;
+                height: 17px;
+                margin: -6px 0;
+                border-radius: 9px;
+                border: 2px solid {Colors.INPUT_FOCUS_BORDER};
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: {Colors.TEXT_ACCENT};
+                border: 3px solid {Colors.INPUT_FOCUS_BORDER};
+            }}
+            QSlider::handle:horizontal:pressed {{
+                background: {Colors.TEXT_ACCENT};
+                border: 3px solid {Colors.TEXT_ACCENT};
+            }}
+            QSlider::groove:vertical {{
+                background: {Colors.BORDER};
+                width: 4px;
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:vertical {{
+                background: {Colors.INPUT_FOCUS_BORDER};
+                border-radius: 2px;
+            }}
+            QSlider::handle:vertical {{
+                background: {Colors.INPUT_FOCUS_BORDER};
+                width: 17px;
+                height: 17px;
+                margin: 0 -6px;
+                border-radius: 9px;
+                border: 2px solid {Colors.INPUT_FOCUS_BORDER};
+            }}
+            QSlider::handle:vertical:hover {{
+                background: {Colors.TEXT_ACCENT};
+                border: 3px solid {Colors.INPUT_FOCUS_BORDER};
+            }}
+            QSlider::handle:vertical:pressed {{
+                background: {Colors.TEXT_ACCENT};
+                border: 3px solid {Colors.TEXT_ACCENT};
+            }}
+        """
+
+
+# ============ 便捷函数 ============
+def get_card_style(alpha: int = 250) -> str:
+    """获取卡片样式字符串"""
+    return CardStyles.card(alpha)
+
+
+def get_scroll_style() -> str:
+    """获取滚动区域样式字符串"""
+    return CardStyles.scroll_area()
+
+
+def get_content_bg_style() -> str:
+    """获取内容区背景样式"""
+    return f"""
+        background-color: {Colors.CONTENT_BG};
+        border-radius: 6px;
+    """
+
+
+def fade_in_widget(widget, duration: int = Animations.NORMAL_MS):
+    """为 widget 添加淡入动画（透明度 0→1），简洁克制"""
+    from PySide6.QtWidgets import QGraphicsOpacityEffect
+    from PySide6.QtCore import QPropertyAnimation
+
+    effect = QGraphicsOpacityEffect(widget)
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.start()
+    # 保持引用防止被回收
+    widget._fade_anim = anim
+
+
+def apply_card_shadow(widget, shadow_type: str = "card"):
+    """为 widget 添加预设阴影效果
+
+    Args:
+        widget: 目标控件
+        shadow_type: "card" | "floating" | "glow" | "glow_primary" | "glow_ambient"
+            - "card"/"floating": 静态 drop shadow（深色 + offset）
+            - "glow*": 聚焦发光 halo，颜色取自 Colors.INPUT_FOCUS_BORDER（主题感知），
+              alpha / blur_radius 来自对应 token
+    """
+    from PySide6.QtWidgets import QGraphicsDropShadowEffect
+    from PySide6.QtGui import QColor
+
+    config = getattr(Shadows, shadow_type.upper(), Shadows.CARD)
+    effect = QGraphicsDropShadowEffect(widget)
+    effect.setBlurRadius(config["blur_radius"])
+    effect.setOffset(config["offset_x"], config["offset_y"])
+
+    if shadow_type.lower().startswith("glow"):
+        # GLOW_* 系列：颜色跟随主题，alpha 来自 token
+        Colors.refresh()
+        glow = QColor(Colors.INPUT_FOCUS_BORDER)
+        glow.setAlpha(config.get("alpha", 170))
+        effect.setColor(glow)
+    else:
+        # CARD / FLOATING：颜色直接来自 token 的 color 字段
+        effect.setColor(QColor(config["color"]))
+    widget.setGraphicsEffect(effect)
+
+
+# 从 utils 导入字体家族 CSS 函数供复用
+from app.utils.utils import get_font_family_css
