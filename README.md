@@ -8,11 +8,11 @@
 
 <div align="center">
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![License](https://img.shields.io/github/license/martin98-afk/DriFox)
-![Stars](https://img.shields.io/github/stars/martin98-afk/DriFox)
-![Downloads](https://img.shields.io/github/downloads/martin98-afk/DriFox/total)
-![Last Commit](https://img.shields.io/github/last-commit/martin98-afk/DriFox)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![License](https://img.shields.io/github/license/martin98-afk/DriFox-pyside6)
+![Stars](https://img.shields.io/github/stars/martin98-afk/DriFox-pyside6)
+![Downloads](https://img.shields.io/github/downloads/martin98-afk/DriFox-pyside6/total)
+![Last Commit](https://img.shields.io/github/last-commit/martin98-afk/DriFox-pyside6)
 
 </div>
 
@@ -857,9 +857,8 @@ DriFox/
 
 | 技术 | 用途 |
 |------|------|
-| PyQt5 | GUI 框架 |
-| PyQt-Fluent-Widgets | Fluent Design 组件库 |
-| PyQtWebEngine | HTML/Markdown/ECharts/图片渲染 |
+| PySide6 | GUI 框架（Qt 6 官方 Python 绑定，LGPL 3.0） |
+| Qt WebEngine | HTML/Markdown/ECharts/图片渲染（PySide6 自带） |
 | ECharts 5 | 交互式图表（消息卡片 + DAG 图） |
 | Loguru | 日志系统 |
 | SQLite | 会话与记忆持久化 |
@@ -998,10 +997,10 @@ LGPL 3.0 License
 
 ## Star History
 
-<a href="https://www.star-history.com/#martin98-afk/DriFox&type=date&legend=top-left">
+<a href="https://www.star-history.com/#martin98-afk/DriFox-pyside6&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=martin98-afk/DriFox&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=martin98-afk/DriFox&type=date&theme=dark&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=martin98-afk/DriFox&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=martin98-afk/DriFox-pyside6&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=martin98-afk/DriFox-pyside6&type=date&theme=dark&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=martin98-afk/DriFox-pyside6&type=date&legend=top-left" />
  </picture>
 </a>
