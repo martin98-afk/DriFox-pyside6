@@ -76,8 +76,13 @@ def main():
 
     # ── 平台特定 ──
     if platform.system() == "Darwin":
-        if "--in-process-gpu" not in _flags:
-            _flags += " --in-process-gpu"
+        # macOS 关键修复
+        # 1) QTWEBENGINE_DISABLE_SANDBOX=1 比 --no-sandbox 更可靠，在 Chromium 更早阶段禁用沙盒
+        # 2) 避免 --in-process-gpu，它在 macOS 上可能触发子进程 IPC 崩溃
+        _os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+        for flag in ("--disable-gpu",):
+            if flag not in _flags:
+                _flags += f" {flag}"
 
     # ── 通用优化 ──
     # 注：PyQt5 时期为绕过 cdn.jsdelivr.net 旧 TLS 兼容问题加了
@@ -102,10 +107,6 @@ def main():
         _flags += " --num-raster-threads=2"
 
     _os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _flags.strip()
-
-    # ========== 导入可能触发 WebEngine 的模块（在 QApplication 创建之前）==========
-    # 提前导入，确保在 app 创建之前触发
-    from PySide6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
 
     from app.utils.utils import get_app_data_dir
     # 迁移旧版本数据（打包版从安装目录迁到用户 home 目录）
@@ -134,7 +135,11 @@ def main():
             filter=lambda r: "[MEM]" in r["message"],
         )
 
-    # 创建应用
+    # ========== 创建 QApplication ==========
+    # 注意：所有 PySide6.QtWebEngine 相关导入必须在 QApplication 创建之后
+    # 在 macOS 上，提前导入 QWebEngineView 会触发 Chromium 子进程初始化
+    # 但没有合法的 Qt 事件循环上下文，导致 segfault
+    from PySide6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("Drifox")

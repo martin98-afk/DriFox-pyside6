@@ -75,3 +75,5 @@ config.local.json
 # 临时下载/构建产物
 *.spec
 *.spec.bak
+
+.drifox/*
