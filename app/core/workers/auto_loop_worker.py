@@ -534,6 +534,8 @@ class AutoLoopWorker(QThread):
                 timeout_timer.start(60000)
                 loop.exec_()
                 timeout_timer.stop()
+                # 🛡️ 诊断日志：追踪 loop.exec_() 退出时的状态
+                logger.info(f"[AutoLoop] loop.exec_() returned: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
             else:
                 self._adapter.wait_for_completion(timeout=300)
 
