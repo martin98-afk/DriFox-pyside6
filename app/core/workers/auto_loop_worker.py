@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Callable
 
-from PySide6.QtCore import QThread, Signal, QCoreApplication
+from PySide6.QtCore import QThread, Signal, QCoreApplication, QEventLoop, QTimer
 from loguru import logger
 
 from app.core.engines.auto_loop import (
@@ -517,22 +517,34 @@ class AutoLoopWorker(QThread):
                 return None
 
             # 等待 Worker 完成
-            # 使用 worker.wait() 分片等待（每 1s 检查取消状态）。
-            # ⚠️ 关键：worker 完成后，不依赖 Qt 信号来重置 _is_streaming。
-            # Qt 信号处理顺序不确定（_on_worker_finished 可能在 loop.quit 之后才执行，
-            # 导致 _is_streaming 没有被重置）。直接调用 executor 的内部方法强制重置。
+            # 分两阶段：
+            # 1. QEventLoop：处理跨线程信号（log_signal/log_update 等实时日志），
+            #    等 worker.finished 或 60s 超时。
+            # 2. 兜底：如果 worker 未结束，while + QCoreApplication.processEvents()
+            #    持续处理信号直到 worker 完成。最后强制调用 _on_worker_finished
+            #    确保 _is_streaming 被重置（防御信号处理顺序问题）。
             worker = self._conversation_executor.get_current_worker()
             if worker:
+                # 阶段 1：QEventLoop 等待 worker 完成（同时处理实时日志信号）
+                loop = QEventLoop()
+                worker.finished.connect(loop.quit)
+                timeout_timer = QTimer()
+                timeout_timer.setSingleShot(True)
+                timeout_timer.timeout.connect(loop.quit)
+                timeout_timer.start(60000)
+                loop.exec_()
+                timeout_timer.stop()
+                # 阶段 2：兜底等 worker 彻底结束 + 持续处理信号
                 while worker.isRunning() and not self._is_cancelled:
                     worker.wait(1000)
+                    QCoreApplication.processEvents()
                 if self._is_cancelled and worker.isRunning():
                     logger.info(f"[AutoLoop] 用户取消，中断 worker")
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)
-                # 强制重置 _is_streaming —— 绕过不可靠的 Qt 信号处理顺序
+                # 强制重置 _is_streaming（防御信号处理顺序导致 _on_worker_finished 未被调用）
                 self._conversation_executor._on_worker_finished(worker)
-                # 处理 adapter 和其他回调（on_finished, on_messages_updated 等）
                 QCoreApplication.processEvents()
                 logger.info(f"[AutoLoop] after wait: worker.isRunning()={worker.isRunning() if worker else 'N/A'}, _is_streaming={self._conversation_executor._is_streaming}")
             else:
@@ -587,8 +599,17 @@ class AutoLoopWorker(QThread):
                 return False
             worker = self._conversation_executor.get_current_worker()
             if worker:
+                loop = QEventLoop()
+                worker.finished.connect(loop.quit)
+                timeout_timer = QTimer()
+                timeout_timer.setSingleShot(True)
+                timeout_timer.timeout.connect(loop.quit)
+                timeout_timer.start(60000)
+                loop.exec_()
+                timeout_timer.stop()
                 while worker.isRunning() and not self._is_cancelled:
                     worker.wait(1000)
+                    QCoreApplication.processEvents()
                 if self._is_cancelled and worker.isRunning():
                     worker.cancel()
                     worker.requestInterruption()
