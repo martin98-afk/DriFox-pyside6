@@ -355,6 +355,21 @@ class ChatBackend(QObject):
 
         # 10. 初始化 MCP 连接
         self._init_mcp_connections()
+
+        # 11. 初始化 LSP 管理器（仅首次，多窗口共享单例）
+        try:
+            from app.core.lsp.lsp_manager import LspManager
+            lsp_mgr = LspManager.get_instance()
+            lsp_configs = pm.get_lsp_configs()
+            workdir = os.getcwd()
+            if self._tool_executor and getattr(self._tool_executor, '_workdir', None):
+                workdir = str(self._tool_executor._workdir)
+            lsp_mgr.initialize(workdir, lsp_configs)
+            logger.info(f"[ChatBackend] LspManager 初始化完成，"
+                       f"已注册 {len(lsp_mgr._clients)} 个 LSP 服务器")
+            lsp_mgr.start_all_background()
+        except Exception as e:
+            logger.error(f"[ChatBackend] LspManager 初始化失败: {e}")
         
         self._initialized = True
         logger.info("[ChatBackend] 初始化完成")

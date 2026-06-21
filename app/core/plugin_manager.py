@@ -611,6 +611,76 @@ class PluginManager:
         return configs
 
     # ============================================================
+    # LSP 配置
+    # ============================================================
+
+    def get_lsp_configs(self) -> List[dict]:
+        """获取所有插件的 .lsp.json LSP 配置
+
+        扫描已启用插件 + 额外扫描没有 manifest 但有 .lsp.json 的目录。
+
+        Returns:
+            [{"plugin": "pyright-lsp", "config": {"pyright": {...}}}, ...]
+        """
+        configs: List[dict] = []
+
+        # 1. 已启用插件的 .lsp.json
+        for plugin in self._iter_enabled_plugins():
+            lsp_file = plugin.path / ".lsp.json"
+            if lsp_file.exists():
+                try:
+                    import json
+                    with open(lsp_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    configs.append({"plugin": plugin.name, "config": data})
+                except Exception as e:
+                    logger.warning(f"[PluginManager] 解析 {lsp_file} 失败: {e}")
+
+        # 2. 额外扫描：用户插件目录下没有 manifest 但有 .lsp.json 的目录
+        system_plugins_dir = Path(__file__).parent.parent.parent / "plugins"
+        for item in sorted(system_plugins_dir.iterdir()):
+            if not item.is_dir():
+                continue
+            name = item.name
+            if self.has_plugin(name):
+                continue  # 已在步骤 1 中处理
+            lsp_file = item / ".lsp.json"
+            if not lsp_file.exists():
+                continue
+            try:
+                import json
+                with open(lsp_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                configs.append({"plugin": name, "config": data})
+            except Exception as e:
+                logger.warning(f"[PluginManager] 解析 {lsp_file} 失败: {e}")
+
+        return configs
+
+    def get_plugin_lsp_config(self, plugin_name: str) -> Optional[dict]:
+        """获取指定插件的 .lsp.json LSP 配置
+
+        只读取该插件的 .lsp.json，不遍历其他插件目录。
+
+        Returns:
+            {"plugin": name, "config": {...}} 或 None（无 .lsp.json 或读取失败）
+        """
+        plugin = self.get_plugin(plugin_name)
+        if not plugin:
+            return None
+        lsp_file = plugin.path / ".lsp.json"
+        if not lsp_file.exists():
+            return None
+        try:
+            import json
+            with open(lsp_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"plugin": plugin_name, "config": data}
+        except Exception as e:
+            logger.warning(f"[PluginManager] 解析 {lsp_file} 失败: {e}")
+            return None
+
+    # ============================================================
     # 内部辅助
     # ============================================================
 

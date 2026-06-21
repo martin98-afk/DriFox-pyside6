@@ -135,6 +135,8 @@ from app.widgets.cards.settings.project_selector_card import (
 from app.widgets.cards.settings.provider_edit_card import ProviderEditCard
 from app.widgets.cards.settings.provider_setting_card import ProviderIconWidget
 from app.widgets.cards.settings.system_card_frame import SystemCardFrame
+from app.widgets.cards.settings.tool_control_card import ToolControlCardFrame
+from app.core.tool_permission_controller import ToolPermissionController
 from app.widgets.coding_plan_ring import (
     CodingPlanRing,
 )
