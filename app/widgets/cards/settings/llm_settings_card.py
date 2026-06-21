@@ -167,7 +167,8 @@ class LLMSettingsCard(SystemCardFrame):
         super().__init__(parent)
         self.set_icon("⚙️")
         self.set_title_text("系统设置")
-        self.setFixedHeight(350)
+        # 高度由 SystemCardFrame.sizeHint() 根据 _height_mode 控制（默认 'proportional' 按窗口 85%）
+        # 不要用 setFixedHeight 覆盖，否则 proportional 比例模式失效
 
         self.cfg = Settings.get_instance()
         self._save_timer = QTimer(self)
