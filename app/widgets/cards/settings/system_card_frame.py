@@ -25,9 +25,32 @@ class SystemCardFrame(QFrame):
     closed = Signal()
     tabChanged = Signal(str)
 
+    # 高度模式：'proportional' = 随窗口缩放（默认），'content' = 按内容自适应
+    _height_mode: str = 'proportional'
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._height_mode = SystemCardFrame._height_mode
         self._build_base_ui()
+
+    def set_height_mode(self, mode: str):
+        """设置高度模式
+
+        'proportional': sizeHint 返回窗口高度的 85%（默认，适合有 ScrollArea 的卡片）
+        'content':      sizeHint 返回内容自然高度（适合编辑器/配置表单等需完整展示的卡片）
+        """
+        if mode not in ('proportional', 'content'):
+            return
+        self._height_mode = mode
+        self.updateGeometry()
+
+    def sizeHint(self):
+        s = super().sizeHint()
+        if self._height_mode == 'proportional':
+            parent = self.parent()
+            if parent:
+                return s.expandedTo(parent.size() * 0.85)
+        return s
 
     # ── UI 构建 ──────────────────────────────────────────
 
