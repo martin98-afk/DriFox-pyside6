@@ -8,7 +8,7 @@ SystemCardFrame — QFrame 基类 + 标准头部布局 + 固定边框
 - ScrollArea 内容区
 """
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QEvent, QSize
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame, QLineEdit, QSizePolicy,
 )
@@ -45,12 +45,23 @@ class SystemCardFrame(QFrame):
         self.updateGeometry()
 
     def sizeHint(self):
-        s = super().sizeHint()
-        if self._height_mode == 'proportional':
-            parent = self.parent()
-            if parent:
-                return s.expandedTo(parent.size() * 0.85)
-        return s
+        """根据高度模式返回卡片期望高度
+
+        'proportional': 窗口高度的 85%（默认）
+        'content':      内容自然高度（super().sizeHint()）
+
+        CardContainer._do_expand() 读取此值进行展开动画。
+        """
+        base = super().sizeHint()
+        # content 模式：直接返回内容自然高度
+        if self._height_mode == 'content':
+            return base
+        # proportional 模式：按窗口比例缩放
+        win = self.window()
+        if win and win.height() > 0:
+            target_h = max(self.minimumHeight(), int(win.height() * 0.85))
+            return QSize(max(base.width(), 200), target_h)
+        return base
 
     # ── UI 构建 ──────────────────────────────────────────
 
@@ -456,6 +467,20 @@ class SystemCardFrame(QFrame):
 
     def hide(self):
         self.setVisible(False)
+
+    def showEvent(self, event):
+        """显示时安装窗口 resize 事件过滤器，窗口缩放时通知容器重新展开"""
+        super().showEvent(event)
+        win = self.window()
+        if win:
+            win.installEventFilter(self)
+            self.updateGeometry()
+
+    def eventFilter(self, obj, event):
+        """监听窗口 resize，触发 updateGeometry → CardContainer 重算高度"""
+        if obj is self.window() and event.type() == QEvent.Resize:
+            self.updateGeometry()
+        return super().eventFilter(obj, event)
 
     def set_opacity(self, opacity: float):
         pass
