@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton, QSizePolicy,
 )
-from qfluentwidgets import SwitchButton, ComboBox
+from app.utils.fluent_shim import SwitchButton, ComboBox
 
 from app.tools.tool_classifier import (
     DANGEROUS_TOOLS, SAFE_TOOLS, get_default_toggles,

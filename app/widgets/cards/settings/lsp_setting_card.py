@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from loguru import logger
-from qfluentwidgets import (
+from app.utils.fluent_shim import (
     CardWidget,
     Dialog,
     ExpandSettingCard,
