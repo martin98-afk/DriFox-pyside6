@@ -262,6 +262,16 @@ class LLMSettingsCard(SystemCardFrame):
         )
         content_layout.addWidget(self.mcpListCard)
 
+        # ── LSP 语言服务器（紧跟 MCP） ──
+        from app.widgets.cards.settings.lsp_setting_card import LspListSettingCard
+        self.lspListCard = LspListSettingCard(
+            icon=get_icon("LSP"),
+            title="LSP 语言服务器",
+            content="已注册的 LSP 语言服务器及其运行状态",
+            parent=self,
+        )
+        content_layout.addWidget(self.lspListCard)
+
         # ---- 通用设置分隔标签 ----
         self._sep_common_label = self._make_sep_label("通用设置")
         self._section_anchors["common"] = self._sep_common_label
