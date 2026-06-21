@@ -1,9 +1,9 @@
 [project]
 name = "drifox"
-version = "0.2.6"
+version = "0.2.8"
 description = "DriFox - AI Chat Desktop Application"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = {text = "LGPL-3.0-or-later"}
 authors = [
     {name = "98-afk", email = "98-afk@drifox.com"}
@@ -15,10 +15,7 @@ classifiers = [
     "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Communications :: Chat",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -47,6 +44,11 @@ dependencies = [
     "mcp>=1.0.0",
     # 插件热更新
     "watchfiles>=1.0.0",
+    # LSP 集成 (Language Server Protocol)
+    "pygls>=2.0.0",
+    "lsprotocol",
+    # aiohttp (gateway + LSP)
+    "aiohttp>=3.9.0",
 ]
 
 # 可选依赖 - Gateway 通讯平台
@@ -82,6 +84,16 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+# UV 依赖组（与 optional-dependencies 一致）
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
 
 # uv 多平台依赖解析配置
 # 声明项目需要支持的目标平台，确保 uv lock 生成的锁文件兼容所有平台
