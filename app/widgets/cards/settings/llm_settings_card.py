@@ -268,7 +268,6 @@ class LLMSettingsCard(SystemCardFrame):
             icon=get_icon("LSP"),
             title="LSP 语言服务器",
             content="已注册的 LSP 语言服务器及其运行状态",
-            parent=self,
         )
         content_layout.addWidget(self.lspListCard)
 
