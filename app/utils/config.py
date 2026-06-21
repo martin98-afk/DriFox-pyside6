@@ -510,6 +510,21 @@ class Settings(QConfig):
     gateway_slack_bot_token = ConfigItem("Gateway", "Slack/BotToken", "")
     gateway_slack_app_token = ConfigItem("Gateway", "Slack/AppToken", "")
 
+    # ========== Gitee 图床配置 ==========
+    gitee_enabled = ConfigItem("Gitee", "Enabled", True, BoolValidator())
+    gitee_token = ConfigItem("Gitee", "Token", "a5dcb6e2e7776143b7a7e7685a1f33a3")
+    gitee_owner = ConfigItem("Gitee", "Owner", "dingmama123141")
+    gitee_repo = ConfigItem("Gitee", "Repo", "canvas-mind-components")
+    gitee_path = ConfigItem("Gitee", "Path", "drifox")
+    gitee_branch = ConfigItem("Gitee", "Branch", "master")
+
+    # ========== LSP 配置 ==========
+    lsp_auto_diagnose = ConfigItem("LSP", "AutoDiagnose", False, BoolValidator())
+
+    # ========== 工具开关控制 ==========
+    tool_toggles = ConfigItem("Tools", "Toggles", {})
+    tool_off_behavior = ConfigItem("Tools", "OffBehavior", "deny")
+
 
 def update_theme_options():
     """从 ThemeManager 动态更新主题选项验证器"""

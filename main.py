@@ -193,11 +193,11 @@ def main():
     # 避免在已运行的情况下重复创建窗口
     from app.core.single_instance import SingleInstanceGuard
     _guard = SingleInstanceGuard("Drifox")
-    if not _guard.try_lock():
-        # 已有实例在运行 → 通知其显示窗口，然后本实例退出
-        _guard.request_show_window()
-        _guard.cleanup()
-        return
+    # if not _guard.try_lock():
+    #     # 已有实例在运行 → 通知其显示窗口，然后本实例退出
+    #     _guard.request_show_window()
+    #     _guard.cleanup()
+    #     return
 
     # 设置主题
     from app.utils.fluent_shim import Theme, setTheme
