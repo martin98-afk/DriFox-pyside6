@@ -7648,7 +7648,7 @@ class OpenAIChatToolWindow(ToolWindow):
         if round_index < 0 or round_index >= len(round_ranges):
             logger.warning(f"[DELETE] Invalid round_index: {round_index}")
             # [DEBUG-diagnose-welcome] 记录无效 round_index
-            logger.info(f"[DEBUG-diagnose-welcome] _delete_user_round: INVALID round_index, will return without showing welcome")
+            logger.info("[DEBUG-diagnose-welcome] _delete_user_round: INVALID round_index, will return without showing welcome")
             # 仍显示撤销卡片（缓存已设置）
             if self._undo_delete_cache:
                 self._card_manager.show_card("undo_delete", self._window_id)
@@ -7659,7 +7659,7 @@ class OpenAIChatToolWindow(ToolWindow):
         )
         if not success:
             # [DEBUG-diagnose-welcome] 记录 truncate 失败
-            logger.info(f"[DEBUG-diagnose-welcome] _delete_user_round: truncate_and_remove_round FAILED")
+            logger.info("[DEBUG-diagnose-welcome] _delete_user_round: truncate_and_remove_round FAILED")
             return
 
         log_deletion_stats(round_index, len(widgets_to_remove), old_count, new_count)
@@ -8102,7 +8102,7 @@ class OpenAIChatToolWindow(ToolWindow):
                 )
 
         if round_index < 0 or round_index >= len(round_ranges):
-            logger.warning(f"[card-diff] cannot determine valid round_index")
+            logger.warning("[card-diff] cannot determine valid round_index")
             return
 
         session_id = session.session_id

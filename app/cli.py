@@ -659,7 +659,7 @@ def _run_providers(args):
             print(f"        URL:  {url}")
             print(f"        Key:  {key_status}")
             if cid == selected:
-                print(f"        (\033[32m当前选中\033[0m)")
+                print("        (\033[32m当前选中\033[0m)")
             print()
 
         print(f"共 {len(saved)} 个服务商配置")

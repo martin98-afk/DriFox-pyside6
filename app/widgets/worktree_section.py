@@ -236,7 +236,7 @@ class _WorktreeRow(QWidget):
         # 左侧竖线（加粗到 3px，配合更大圆点）
         bar = QFrame(self)
         bar.setFixedWidth(3)
-        bar.setStyleSheet(f"background-color: rgba(255,255,255,0.15);")
+        bar.setStyleSheet("background-color: rgba(255,255,255,0.15);")
         layout.addWidget(bar)
 
         # 圆点（加大到 8x8，配合加粗的线）
@@ -452,7 +452,7 @@ class _AddWorktreeRow(QWidget):
         # 竖线（加粗到 3px，配合圆点尺寸）
         bar = QFrame(self)
         bar.setFixedWidth(3)
-        bar.setStyleSheet(f"background-color: rgba(255,255,255,0.15);")
+        bar.setStyleSheet("background-color: rgba(255,255,255,0.15);")
         layout.addWidget(bar)
 
         add_label = QLabel("＋ 新建 worktree", self)

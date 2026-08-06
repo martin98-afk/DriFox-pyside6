@@ -73,6 +73,7 @@ class HookType(Enum):
     COMMAND = "command"
     HTTP = "http"
     PYTHON = "python"
+    PROMPT = "prompt"
 
 
 class HookDecision(Enum):
@@ -1597,11 +1598,11 @@ class HookManager:
                         self._cwd_resolve_cache[cache_key] = (resolved_cwd, time.monotonic())
                         return resolved_cwd
                 
-                logger.debug(f"[HookManager] Script file not found in any search dir")
+                logger.debug("[HookManager] Script file not found in any search dir")
                 self._cwd_resolve_cache[cache_key] = (None, time.monotonic())
                 return None
         
-        logger.debug(f"[HookManager] No script in command, returning None for cwd")
+        logger.debug("[HookManager] No script in command, returning None for cwd")
         self._cwd_resolve_cache[cache_key] = (None, time.monotonic())
         return None
     

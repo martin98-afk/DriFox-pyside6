@@ -2375,7 +2375,7 @@ class OpenAIChatWorker(QThread):
 
                 if is_tool_call_order_error and attempt < max_retries - 1:
                     # 自动修复 tool result 顺序问题
-                    logger.warning(f"[API] 检测到 tool call result 顺序错误 (2013)，尝试自动修复...")
+                    logger.warning("[API] 检测到 tool call result 顺序错误 (2013)，尝试自动修复...")
                     fixed_messages, was_fixed = self._fix_tool_result_order(req_kwargs["messages"])
 
                     if was_fixed:
@@ -2392,13 +2392,13 @@ class OpenAIChatWorker(QThread):
                         logger.warning(f"[API] 已修复消息顺序，已同步源头，重试 (attempt {attempt + 1}/{max_retries})")
                         continue
                     else:
-                        logger.error(f"[API] 无法自动修复 tool call result 顺序问题 - 可能需要查看上面的消息结构")
+                        logger.error("[API] 无法自动修复 tool call result 顺序问题 - 可能需要查看上面的消息结构")
 
                 # 检测 Missing required arguments 错误（工具参数丢失）
                 is_missing_args_error = "Missing required arguments" in error_str or "missing a required argument" in error_str.lower()
 
                 if is_missing_args_error and attempt < max_retries - 1:
-                    logger.warning(f"[API] 检测到工具参数丢失错误，尝试从历史消息中恢复...")
+                    logger.warning("[API] 检测到工具参数丢失错误，尝试从历史消息中恢复...")
 
                     # 尝试从历史消息中恢复 tool_calls 的参数
                     fixed_messages = self._try_recover_tool_arguments(req_kwargs["messages"])
@@ -2412,7 +2412,7 @@ class OpenAIChatWorker(QThread):
                         logger.warning(f"[API] 已恢复工具参数，已更新缓存，重试 (attempt {attempt + 1}/{max_retries})")
                         continue
                     else:
-                        logger.warning(f"[API] 无法恢复工具参数，保持现有消息")
+                        logger.warning("[API] 无法恢复工具参数，保持现有消息")
 
                 # 其他 BadRequestError 继续抛出
                 if hasattr(e, "response") and e.response is not None:
@@ -3475,13 +3475,13 @@ class OpenAIChatWorker(QThread):
         ):
             self._emit_with_callback(
                 "error_occurred", self.error_occurred,
-                f"[连接中断] 服务器在响应中途关闭了连接，可能是服务器过载或网络不稳定。请稍后重试。"
+                "[连接中断] 服务器在响应中途关闭了连接，可能是服务器过载或网络不稳定。请稍后重试。"
             )
             return
         if "ProtocolError" in error_msg or "RemoteProtocolError" in error_msg:
             self._emit_with_callback(
                 "error_occurred", self.error_occurred,
-                f"[连接错误] 网络协议错误，可能是服务器关闭了连接。请稍后重试。"
+                "[连接错误] 网络协议错误，可能是服务器关闭了连接。请稍后重试。"
             )
             return
 
@@ -3536,7 +3536,7 @@ class OpenAIChatWorker(QThread):
             elif "insufficient_quota" in error_msg:
                 self._emit_with_callback(
                     "error_occurred", self.error_occurred,
-                    f"[配额不足] API配额已用完，请检查账户余额或更换API Key。"
+                    "[配额不足] API配额已用完，请检查账户余额或更换API Key。"
                 )
             else:
                 self._emit_with_callback("error_occurred", self.error_occurred, f"[API错误] {error_msg}")
@@ -3548,11 +3548,11 @@ class OpenAIChatWorker(QThread):
         elif "max_tokens" in error_msg.lower() or "context length" in error_msg.lower():
             self._emit_with_callback(
                 "error_occurred", self.error_occurred,
-                f"[错误] 模型上下文或最大Token超出限制，请减少输入长度或调低 max_tokens"
+                "[错误] 模型上下文或最大Token超出限制，请减少输入长度或调低 max_tokens"
             )
         elif "authentication" in error_msg.lower() or "api key" in error_msg.lower():
             self._emit_with_callback("error_occurred", self.error_occurred,
-                                     f"[认证错误] API Key无效或已过期，请检查配置。")
+                                     "[认证错误] API Key无效或已过期，请检查配置。")
         else:
             self._emit_with_callback("error_occurred", self.error_occurred, f"[未知错误] {error_msg}")
 

@@ -354,7 +354,7 @@ class ChatBackend(QObject):
         def on_hook_finished(event_name: str, output: str, success: bool):
             # 检查 UI 是否仍然有效，防止窗口关闭后 hook 回调访问已销毁的 UI
             if not getattr(self, '_ui_valid', True):
-                logger.debug(f"[HookManager] Hook callback skipped: UI already closed")
+                logger.debug("[HookManager] Hook callback skipped: UI already closed")
                 return
             
             logger.info(f"[HookManager] Hook callback: event={event_name}, success={success}，output={output[:100]}...")
@@ -782,7 +782,7 @@ class ChatBackend(QObject):
 
         def _watch_loop():
             """后台线程: 监听插件目录文件变更，识别所属插件后请求主线程增量重载"""
-            logger.debug(f"[ChatBackend] watchfiles 监听线程已启动")
+            logger.debug("[ChatBackend] watchfiles 监听线程已启动")
             try:
                 for changes in watch(
                     *watch_paths,

@@ -423,7 +423,7 @@ class AutoLoopWorker(QThread):
         if count > 0:
             self.log_signal.emit(f"📦 归档已保存至 {archive_dir}（共 {count} 个文件）")
         else:
-            self.log_signal.emit(f"📦 归档目录为空，跳过复制")
+            self.log_signal.emit("📦 归档目录为空，跳过复制")
 
     def _do_fallback_archive(self) -> bool:
         """执行兜底归档（max_iterations 耗尽时）
@@ -540,7 +540,7 @@ class AutoLoopWorker(QThread):
                     worker.wait(1000)
                     QCoreApplication.processEvents()
                 if self._is_cancelled and worker.isRunning():
-                    logger.info(f"[AutoLoop] 用户取消，中断 worker")
+                    logger.info("[AutoLoop] 用户取消，中断 worker")
                     worker.cancel()
                     worker.requestInterruption()
                     worker.wait(3000)

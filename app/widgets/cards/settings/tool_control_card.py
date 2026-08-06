@@ -158,7 +158,7 @@ class ToolControlCardContent(QWidget):
             logger.info(f"[ToolCard] _rebuild: agent={agent}, toggles_enabled={sum(1 for v in toggles.values() if v)}/{len(toggles)}")
         else:
             toggles = {}
-            logger.info(f"[ToolCard] _rebuild: controller=None!")
+            logger.info("[ToolCard] _rebuild: controller=None!")
 
         all_tools = set(DANGEROUS_TOOLS) | set(SAFE_TOOLS)
         defaults = get_default_toggles(list(all_tools))

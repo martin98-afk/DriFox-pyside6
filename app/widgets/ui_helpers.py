@@ -210,7 +210,7 @@ def export_messages_to_markdown(messages: list, timestamp: str = None) -> str:
     if timestamp is None:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    lines = [f"# 对话记录\n\n", f"导出时间: {timestamp}\n\n"]
+    lines = ["# 对话记录\n\n", f"导出时间: {timestamp}\n\n"]
     
     for msg in messages:
         role = msg.get("role")

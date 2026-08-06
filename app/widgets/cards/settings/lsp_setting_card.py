@@ -336,7 +336,7 @@ class LspListSettingCard(ExpandSettingCard):
 
             InfoBar.success(
                 title=f"正在安装 {server_name}",
-                content=f"已在终端中打开安装进程。完成后请点击「刷新」按钮。",
+                content="已在终端中打开安装进程。完成后请点击「刷新」按钮。",
                 orient=Qt.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP,

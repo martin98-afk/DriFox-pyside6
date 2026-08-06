@@ -724,7 +724,7 @@ class MCPListSettingCard(ExpandSettingCard):
             else:
                 logger.warning(f"[MCP] '{name}' 热连接失败")
                 InfoBar.error(
-                    title=f"MCP 连接失败",
+                    title="MCP 连接失败",
                     content=f"'{name}' 连接失败，请检查配置是否正确",
                     parent=self.window(),
                     duration=5000,

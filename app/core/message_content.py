@@ -544,7 +544,7 @@ def content_to_markdown(content: Any) -> str:
                 f"result: {result_escaped}",
             ]
             if diff_raw:
-                tool_lines.append(f"diff:")
+                tool_lines.append("diff:")
                 tool_lines.append(diff_escaped)
             tool_lines.append(f"success: {success}")
             # 保留 tool_call_id 用于差异对比功能
@@ -552,7 +552,7 @@ def content_to_markdown(content: Any) -> str:
                 tool_lines.append(f"tool_call_id: {tool_call_id}")
             # echarts 图表：嵌入 tool 块内部，由 _render_tool_block_content 渲染
             if echarts_raw:
-                tool_lines.append(f"echarts:")
+                tool_lines.append("echarts:")
                 tool_lines.append(echarts_raw)
             tool_lines.append("</tool>")
             parts.append("\n".join(tool_lines))

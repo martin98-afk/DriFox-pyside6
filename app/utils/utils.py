@@ -163,9 +163,9 @@ def migrate_app_data_if_needed():
     if old_db.exists() and new_db.exists():
         logger.info(f"[迁移] sessions.db: {old_db.stat().st_size} → {new_db.stat().st_size} bytes")
     elif new_db.exists():
-        logger.info(f"[迁移] sessions.db 复制完成")
+        logger.info("[迁移] sessions.db 复制完成")
     else:
-        logger.warning(f"[迁移] sessions.db 未找到，数据可能是空的")
+        logger.warning("[迁移] sessions.db 未找到，数据可能是空的")
 
 
 def get_pinyin_search_keys(text):

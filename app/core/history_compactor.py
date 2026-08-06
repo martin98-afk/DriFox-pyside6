@@ -1339,7 +1339,7 @@ class HistoryCompactor:
             "3. 不要只重复用户原始提问。\n"
             "4. 删除寒暄、重复探索、低价值调试细节。\n"
             "5. 如果信息不足，不要编造。\n\n"
-            f"【待压缩对话】\n" + "\n".join(transcript_lines)
+            "【待压缩对话】\n" + "\n".join(transcript_lines)
         )
 
         prompt = "\n".join(prompt_parts)

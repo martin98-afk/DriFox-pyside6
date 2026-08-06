@@ -74,6 +74,49 @@ class PluginInfo:
         """插件包含的组件声明"""
         return self.manifest.get("components", {})
 
+
+    @property
+    def icon_config(self) -> Optional[dict]:
+        """返回 {"light": Path, "dark": Path} 或 None
+
+        从 manifest 的 "icon" 字段解析插件图标路径。
+        支持三种形式：
+        1. 字符串 "icon.svg" → 同一文件用于深浅主题
+        2. 字典 {"light": "a.svg", "dark": "b.svg"} → 分别指定
+        3. 无 "icon" 字段 → 检查插件根目录 icon.svg 兜底（文件需实际存在）
+        """
+        raw = self.manifest.get("icon")
+        if not raw:
+            default = self.path / "icon.svg"
+            if default.exists():
+                return {"light": default, "dark": default}
+            return None
+        if isinstance(raw, str):
+            p = self.path / raw
+            if p.exists():
+                return {"light": p, "dark": p}
+            return None
+        if isinstance(raw, dict):
+            result: dict = {}
+            for theme in ("light", "dark"):
+                path_str = raw.get(theme)
+                if path_str:
+                    p = (self.path / path_str).resolve()
+                    if p.exists():
+                        result[theme] = p
+            # 单主题补齐：只有一个主题时补齐另一个
+            if "light" not in result and "dark" in result:
+                result["light"] = result["dark"]
+            if "dark" not in result and "light" in result:
+                result["dark"] = result["light"]
+            return result if result else None
+
+
+# ============================================================
+# 插件管理器（单例）
+# ============================================================
+
+
     def has_component(self, name: str) -> bool:
         """检查插件是否声明了某组件"""
         return self.components.get(name, False)
@@ -780,6 +823,50 @@ class PluginManager:
                 logger.error(f"[PluginManager] Failed to load MCP config from {mcp_file}: {e}")
 
         return list(servers.values())
+
+
+
+    @staticmethod
+    def _expand_mcp_vars(value: "Any", plugin_root: Path) -> "Any":
+        """递归展开 MCP 配置中的变量占位符。
+
+        ${CLAUDE_PLUGIN_ROOT} → plugin_root
+        ${CLAUDE_PLUGIN_DATA} → plugin_root / "data"
+        """
+        if isinstance(value, str):
+            root_str = plugin_root.as_posix()
+            data_str = (plugin_root / "data").as_posix()
+            # 归一化反斜杠，兼容 Windows 用户手动编辑的路径
+            normalized = value.replace("\\", "/")
+            # 先替换长的（DATA 包含 ROOT 路径前缀），避免 `${CLAUDE_PLUGIN_ROOT}/data` 被部分替换
+            return normalized.replace("${CLAUDE_PLUGIN_DATA}", data_str).replace("${CLAUDE_PLUGIN_ROOT}", root_str)
+        if isinstance(value, dict):
+            return {k: PluginManager._expand_mcp_vars(v, plugin_root) for k, v in value.items()}
+        if isinstance(value, list):
+            return [PluginManager._expand_mcp_vars(v, plugin_root) for v in value]
+        return value
+
+
+    @staticmethod
+    def _unexpand_mcp_vars(value: "Any", plugin_root: Path) -> "Any":
+        """递归逆展开：将运行时绝对路径还原为变量占位符。
+
+        plugin_root / "data" → ${CLAUDE_PLUGIN_DATA}
+        plugin_root → ${CLAUDE_PLUGIN_ROOT}
+        """
+        if isinstance(value, str):
+            root_str = plugin_root.as_posix()
+            data_str = (plugin_root / "data").as_posix()
+            # 归一化反斜杠，确保 Windows 用户手动编辑的路径也能匹配
+            normalized = value.replace("\\", "/")
+            # 先替换长的（data），再替换短的（root），避免部分匹配
+            result = normalized.replace(data_str, "${CLAUDE_PLUGIN_DATA}")
+            return result.replace(root_str, "${CLAUDE_PLUGIN_ROOT}")
+        if isinstance(value, dict):
+            return {k: PluginManager._unexpand_mcp_vars(v, plugin_root) for k, v in value.items()}
+        if isinstance(value, list):
+            return [PluginManager._unexpand_mcp_vars(v, plugin_root) for v in value]
+        return value
 
     def _build_mcp_entry(self, name: str, cfg: dict, source_file: Path) -> dict:
         """构建统一格式的 MCP 服务器条目"""

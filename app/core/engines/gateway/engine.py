@@ -384,7 +384,7 @@ class GatewayEngine(QObject, BaseEngine):
             self.switch_to_session(candidates[0].session_id)
             return f"✅ 已切换到会话: **{candidates[0].name}**"
         elif len(candidates) > 1:
-            lines = [f"找到多个匹配:\n"]
+            lines = ["找到多个匹配:\n"]
             for s in candidates:
                 lines.append(f"- `{s.session_id[:12]}...` **{s.name}**")
             return "\n".join(lines)

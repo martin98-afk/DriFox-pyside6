@@ -235,7 +235,7 @@ class ToolExecutor:
                 logger.info(f"[FileRecorder] 已备份: {full_path} -> {backup_path}")
             else:
                 # 文件不存在（如新建文件 write_file），跳过记录是正常的
-                logger.debug(f"[ToolExecutor] 文件操作记录返回 None")
+                logger.debug("[ToolExecutor] 文件操作记录返回 None")
         except Exception as e:
             # 记录失败不阻塞工具执行
             logger.warning(f"[ToolExecutor] 记录文件操作失败: {e}")
@@ -628,7 +628,7 @@ class ToolExecutor:
         """
         # 检查 ToolExecutor 是否仍然有效（API 模式下 UI 可能已关闭）
         if not self.is_valid():
-            logger.warning(f"[ToolExecutor] ToolExecutor is invalid (UI may be closed)")
+            logger.warning("[ToolExecutor] ToolExecutor is invalid (UI may be closed)")
             return ToolResult(False, error="UI has been closed, tool execution unavailable")
 
         # 🛡️ 防御性补全 mcp__ 前缀：LLM 偶尔可能漏掉前缀
@@ -876,7 +876,7 @@ class ToolExecutor:
         # 在 UI 关闭场景下，即使方法开头检查通过，
         # lambda 执行期间 UI 可能被关闭，导致 BuiltinTools 访问崩溃
         if not self.is_valid():
-            logger.warning(f"[ToolExecutor] ToolExecutor became invalid during hook phase")
+            logger.warning("[ToolExecutor] ToolExecutor became invalid during hook phase")
             return ToolResult(False, error="UI has been closed, tool execution unavailable")
 
         executor = tool_map.get(tool_name)
@@ -924,7 +924,7 @@ class ToolExecutor:
         try:
             mcp_manager = self._builtin_tools._mcp_manager
         except AttributeError:
-            logger.error(f"[ToolExecutor] _mcp_manager not accessible")
+            logger.error("[ToolExecutor] _mcp_manager not accessible")
             return ToolResult(False, error="MCP 管理器不可用")
 
         if not mcp_manager.is_connected:
@@ -934,7 +934,7 @@ class ToolExecutor:
             result = mcp_manager.call_tool_sync(tool_name, args)
         except TimeoutError as e:
             logger.error(f"[ToolExecutor] MCP tool '{tool_name}' timeout: {e}")
-            err_result = ToolResult(False, error=f"MCP 工具调用超时，请稍后重试")
+            err_result = ToolResult(False, error="MCP 工具调用超时，请稍后重试")
             self._trigger_post_tool_use(tool_name, args, err_result)
             return err_result
         except Exception as e:

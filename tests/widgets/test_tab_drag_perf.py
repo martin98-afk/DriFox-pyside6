@@ -67,7 +67,7 @@ def test_move_event_timing(qtbot):
     max_interval = max(intervals)
     over_33ms = sum(1 for iv in intervals if iv > 33)
 
-    print(f"\n=== TabManagerWindow 拖拽性能诊断 ===")
+    print("\n=== TabManagerWindow 拖拽性能诊断 ===")
     print(f"moveEvent 次数: {len(timestamps)}")
     print(f"平均间隔: {avg_interval:.1f}ms")
     print(f"最大间隔: {max_interval:.1f}ms")

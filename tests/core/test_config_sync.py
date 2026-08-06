@@ -629,7 +629,7 @@ class TestInitialSync:
         fake_cfg.gitee_user_token.value = "stale_token"
         fake_cfg.gitee_user_owner.value = "test_user"
         fake_cfg.gitee_user_refresh_token.value = "stale_rt"
-        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
+        fake_cfg.gitee_token_expires_at.value = 0.0
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -698,7 +698,7 @@ class TestInitialSync:
         fake_cfg.gitee_user_token.value = "stale_token"
         fake_cfg.gitee_user_owner.value = "test_user"
         fake_cfg.gitee_user_refresh_token.value = "stale_rt"
-        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
+        fake_cfg.gitee_token_expires_at.value = 0.0
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -712,7 +712,8 @@ class TestInitialSync:
         # 网络异常语义不变：发出"网络异常"，不得误报"已失效"、不得清绑
         assert any(ok is False and "网络异常" in msg for ok, msg in msgs), f"未发出网络异常提示: {msgs}"
         assert not any("已失效" in msg for ok, msg in msgs)
-        assert not fake_cfg.gitee_bound.value, "网络异常不得清绑"
+        # 网络异常不得清绑：value 应保持 True（初始 True），原断言写反，修复
+        assert fake_cfg.gitee_bound.value, "网络异常不得清绑"
 
 
 # =============================================================================

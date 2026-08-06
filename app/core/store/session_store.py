@@ -681,17 +681,17 @@ class SessionStore:
         try:
             # 删除会话（直接 SQL，不经过 repo 层）
             self._execute(
-                f'DELETE FROM sessions WHERE project = ?',
+                'DELETE FROM sessions WHERE project = ?',
                 (project_name,)
             )
             # 删除关键文档
             self._execute(
-                f'DELETE FROM key_documents WHERE project = ?',
+                'DELETE FROM key_documents WHERE project = ?',
                 (project_name,)
             )
             # 删除旧版项目笔记
             self._execute(
-                f'DELETE FROM project_notes WHERE project = ?',
+                'DELETE FROM project_notes WHERE project = ?',
                 (project_name,)
             )
             logger.info(f"[SessionStore] 已强制清理项目 {project_name} 的所有关联数据")
