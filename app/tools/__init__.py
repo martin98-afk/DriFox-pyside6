@@ -30,8 +30,6 @@ from app.tools.result import ToolResult
 from app.tools.task_tools import TaskTools
 from app.tools.terminal_tools import TerminalTools
 from app.tools.web_tools import WebTools
-from app.core.lsp.lsp_tools import LspToolsIntegration
-from app.core.lsp.lsp_manager import LspManager
 
 
 class BuiltinTools(QObject):
@@ -97,6 +95,11 @@ class BuiltinTools(QObject):
         self._tools["automation"] = AutomationTools(self)
 
         # LSP 工具集成
+        # 延迟导入：避免 app.tools → app.core.lsp.lsp_tools → app.core 顶层循环导入
+        # （app.core.agent 反向依赖 app.tools.get_builtin_tools_schema）
+        from app.core.lsp.lsp_tools import LspToolsIntegration
+        from app.core.lsp.lsp_manager import LspManager
+
         self._lsp_tools = LspToolsIntegration(LspManager.get_instance(), owner=self)
         self._tools["lsp"] = self._lsp_tools
 

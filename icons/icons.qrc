@@ -1,14 +1,26 @@
 <!DOCTYPE RCC>
 <RCC version="1.0">
 <qresource prefix="/icons">
+    <file>Alignment.svg</file>
     <file>Anthropic.svg</file>
+    <file>Book.svg</file>
+    <file>Broom.svg</file>
+    <file>Chat.svg</file>
     <file>Document.svg</file>
     <file>Edit.svg</file>
+    <file>Heart.svg</file>
+    <file>History.svg</file>
+    <file>Link.svg</file>
     <file>MCP.svg</file>
+    <file>Message.svg</file>
     <file>MiniMax.svg</file>
     <file>Ollama.svg</file>
+    <file>Return.svg</file>
     <file>Save.svg</file>
+    <file>Share.svg</file>
+    <file>ShoppingCart.svg</file>
     <file>Telegram.svg</file>
+    <file>Zoom.svg</file>
     <file>add.svg</file>
     <file>baidu.svg</file>
     <file>close.svg</file>

@@ -296,24 +296,28 @@ def main():
             window.showNormal()
 
     def _show_popup():
-        # ToolPopupDialog 构造（包含 QSettings 读取、布局构建）
-        # 注：TrayManager 已由 ToolPopupDialog 延迟初始化，不再在此处创建
-        from app.tool_popup import ToolPopupDialog
-        popup = ToolPopupDialog(chat_window, None)
-        popup.setWindowTitle("Drifox")
+        from app.utils.config import Settings
 
-        # 跳过历史会话恢复
+        # 多窗口模式已暂时下线：无论配置如何，一律以 Tab 管理器模式启动。
+        # 配置项 enable_tab_manager 与 ToolPopupDialog 路径暂保留，便于未来回退。
+        settings = Settings.get_instance()
+        if not settings.enable_tab_manager.value:
+            settings.enable_tab_manager.value = True
+            settings.save()
+            logger.info("检测到多窗口模式配置，已强制修正为 Tab 管理器模式")
+
+        # 跳过历史会话恢复（在 add_window 前设置）
         chat_window._skip_restore_history = True
 
-        # 连接单实例信号：当其他实例启动时，激活本窗口
-        _guard.show_requested.connect(lambda: _activate_window(popup))
+        # ── Tab 模式 ──
+        from app.widgets.tab_manager_window import TabManagerWindow, _apply_window_topmost
 
-        # 在 show() 之前恢复几何位置，避免窗口先出现在默认位置再跳转导致闪烁
-        popup._restore_geometry()
-        popup._geometry_restored = True
-
-        popup.show()
-        logger.info("LLM Chatter 启动成功")
+        tm = TabManagerWindow.create_instance()
+        tm.add_window(chat_window)
+        _guard.show_requested.connect(lambda: _activate_window(tm))
+        tm.show()
+        _apply_window_topmost(tm)
+        logger.info("DriFox 以 Tab 管理器模式启动")
 
     # 应用退出时清理单实例资源（共享内存 + IPC 服务器）
     app.aboutToQuit.connect(_guard.cleanup)

@@ -40,6 +40,8 @@ dependencies = [
     # 桌面自动化 (pynput + mss 组合)
     "pynput>=1.7.6",
     "mss>=9.0.1",
+    # 全局热键 (tray_manager)
+    "keyboard>=0.13.5",
     # MCP (Model Context Protocol)
     "mcp>=1.0.0",
     # 插件热更新
@@ -47,6 +49,8 @@ dependencies = [
     # LSP 集成 (Language Server Protocol)
     "pygls>=2.0.0",
     "lsprotocol",
+    # CodeGraph 代码智能工具
+    "codegraph-py[all]>=1.4.0",
     # aiohttp (gateway + LSP)
     "aiohttp>=3.9.0",
 ]
@@ -66,6 +70,8 @@ dev = [
     "pyinstaller>=6.16.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-qt>=4.4.0",
+    "pympler>=1.1",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
@@ -73,6 +79,43 @@ dev = [
 # 全部依赖
 all = [
     "drifox[gateway,dev]",
+]
+
+# ruff 配置
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F"]  # 基本语法、未定义名称
+# 当前代码库遗留问题较多，临时全部 E/F 规则 ignore，后续在专门 PR 中清理
+# (F821 大多为误报：from __future__ import annotations + 条件导入 + 闭包变量)
+ignore = [
+    "E501",  # 行长检查已由 formatter 处理
+    "E402",  # 模块导入不在文件顶部
+    "E701",  # 单行多语句（冒号）
+    "E702",  # 单行多语句（分号）
+    "E731",  # lambda 赋值
+    "E741",  # 模糊变量名（如 l、I、O）
+    "F401",  # 未使用 import
+    "F403",  # import * 后使用未定义本地变量
+    "F405",  # import * 后使用未定义本地变量
+    "F811",  # 重新定义时未使用
+    "F821",  # 未定义名称（误报：条件导入/闭包变量，详见 commit 注释）
+    "F841",  # 未使用变量
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# pytest 配置
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+markers = [
+    "perf: 性能基准测试（测量响应时间）",
+    "stress: 压力测试（连续调用验证稳定性）",
 ]
 
 # 构建系统配置
@@ -88,8 +131,11 @@ include = ["app*"]
 # UV 依赖组（与 optional-dependencies 一致）
 [dependency-groups]
 dev = [
+    "pyinstaller>=6.16.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-qt>=4.4.0",
+    "pympler>=1.1",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",

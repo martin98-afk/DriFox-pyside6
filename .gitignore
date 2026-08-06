@@ -77,3 +77,22 @@ config.local.json
 *.spec.bak
 
 .drifox/*
+# ── Auto-appended by format_memory_context hook ──
+
+# Python 生态
+*.pyc
+dist/
+.mypy_cache/
+.ruff_cache/
+
+# 系统文件
+$RECYCLE.BIN/
+
+# IDE/编辑器
+*.swn
+.project
+.pycpath
+
+# ===== 临时调试脚本（开发期并行产物）=====
+/_*.py
+/_*.txt

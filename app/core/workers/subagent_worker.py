@@ -287,6 +287,10 @@ class SubAgentExecutor(QThread):
                 self.agent_name, is_subagent_call=self.is_subagent_call
             )
             tools = self.agent_manager.get_agent_tools_schema(self.agent_name, is_subagent_call=self.is_subagent_call)
+            # TODO(团队链路): 源版此处传 builtin_tools=self.tool_executor._builtin_tools，
+            # 让 is_in_team 检查使用正确窗口的 team_window_id（多窗口隔离）。
+            # pyside6 版 agent.py get_agent_tools_schema 暂不支持 builtin_tools 参数
+            # （当前用 AgentManager 单例 _builtin_tools），待 agent.py 扩展后接入。
 
             # 基于 context budget 构建主智能体历史上下文注入（返回消息对象列表）
             inherited_messages = []
@@ -707,6 +711,303 @@ class SubAgentExecutor(QThread):
 
         return results
 
+
+
+
+    # ===== P2 补齐（从原项目同步）=====
+
+    def _ask_permission(self, tool_name: str, arguments: dict, timeout: float = 30.0) -> bool:
+        """ask 行为：emit 信号桥接主线程弹窗，等待用户决策（超时按拒绝）。
+
+        主线程连接 permission_requested 后弹窗 → respond_permission(allow)
+        → 本方法返回结果。用户 30s 无响应按拒绝处理（不阻塞子智能体任务）。
+        """
+        self._permission_event.clear()
+        self._permission_allow = False
+        self._permission_answered = False
+        try:
+            self.permission_requested.emit(self.task_id, tool_name, arguments)
+        except Exception as e:
+            logger.warning(f"[SubAgent] permission_requested emit failed: {e}")
+            return False
+        self._permission_event.wait(timeout)
+        return self._permission_allow
+
+
+    def _build_hook_context(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """构造 hook context：基础字段（current_role/agent_name/task_id/workdir）+ 调用方扩展"""
+        ctx: Dict[str, Any] = {
+            "agent_name": self.agent_name,
+            "current_role": "subagent",  # 关键：让 hook 知道当前是子智能体
+            "is_subagent_call": self.is_subagent_call,
+            "task_id": self.task_id,
+            "task_description": self.task_description,
+        }
+        # project_root：用于 read_project_notes 等需要 workdir 的 hook
+        try:
+            if self.tool_executor and hasattr(self.tool_executor, "get_workdir"):
+                ctx["project_root"] = self.tool_executor.get_workdir() or ""
+        except Exception:
+            pass
+        if extra:
+            ctx.update(extra)
+        return ctx
+
+
+    def _check_ui_tool_permission(self, tool_name: str) -> str:
+        """UI 工具权限检查（T24 执行层唯一控制点）— 返回 "allow" / "deny" / "ask"。
+
+        优先级（对齐产品指示）：
+        a) UI controller toggles：用户显式关闭的工具（toggles False）→ UI 为准
+           （behavior=deny → deny；ask → 弹窗询问），覆盖模板 allow
+        b) UI 开启/默认（toggles True）→ 模板 PermissionResolver 判定：
+           模板 deny → 执行层拦截（返回 deny，schema 已静态化不再移除）
+           模板 allow/ask → 执行（子智能体无模板 ask 弹窗机制，视为允许）
+        c) 团队工具无条件放行
+
+        check_name 归一化（mcp__server__tool → tool）；无 controller（API 模式）
+        回退 Settings.tool_toggles。
+        """
+        if tool_name in ("team_send_message", "team_list_members"):
+            return "allow"
+        check_name = tool_name
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__", 2)
+            check_name = parts[2] if len(parts) > 2 else tool_name
+
+        controller = None
+        backend = getattr(self.tool_executor, "_backend", None) if self.tool_executor else None
+        if backend is not None:
+            controller = getattr(backend, "tool_permission_controller", None)
+
+        if controller is not None:
+            toggles = controller.get_toggles()
+            behavior = controller.get_behavior()
+        else:
+            from app.utils.config import Settings
+
+            settings = Settings.get_instance()
+            toggles = dict(settings.tool_toggles.value)
+            behavior = settings.tool_off_behavior.value
+
+        is_enabled = toggles.get(check_name, True)
+        if not is_enabled:
+            return behavior  # UI 关闭 → deny 或 ask（UI 为准，覆盖模板）
+
+        # ★ T28：UI 显式开启（用户调整过该工具）→ UI 为准，放行（覆盖模板 deny）
+        if controller is not None and controller.is_user_modified(check_name):
+            return "allow"
+
+        # 未调整（默认开启）→ 模板 PermissionResolver（模板 deny 执行层拦截）
+        try:
+            agent = self.agent_manager.get_agent(self.agent_name) if self.agent_manager else None
+            if agent is not None:
+                from app.core.agent import PermissionResolver
+
+                resolver = PermissionResolver(agent.permission, {}, agent.tools)
+                if resolver.resolve(check_name) == "deny":
+                    return "deny"
+        except Exception as e:
+            logger.debug(f"[SubAgent] 模板权限解析失败，放行: {e}")
+        return "allow"
+
+
+    def _drain_hook_queues(self) -> List[Dict[str, Any]]:
+        """消费 backend 的 _pre_tool_message_queue 和 _hook_message_queue
+
+        tool_executor.execute() 内部已同步触发 PreToolUse/PostToolUse，
+        对应消息已分别进 _pre_tool_message_queue 和 _hook_message_queue。
+        这里把两个队列的消息全取出来，由调用方按需插入到 tool_result 之前/之后。
+        """
+        msgs: List[Dict[str, Any]] = []
+        try:
+            backend = getattr(self.tool_executor, "_backend", None) if self.tool_executor else None
+            if not backend:
+                return msgs
+            for q_attr in ("_pre_tool_message_queue", "_hook_message_queue"):
+                q = getattr(backend, q_attr, None)
+                if q is None:
+                    continue
+                while True:
+                    try:
+                        msgs.append(q.get_nowait())
+                    except Exception:
+                        break
+        except Exception as e:
+            logger.debug(f"[SubAgent] drain hook queues failed: {e}")
+        return msgs
+
+
+    def _drain_posttool_queue(self) -> List[Dict[str, Any]]:
+        """仅消费 backend 的 _hook_message_queue（PostToolUse 消息）"""
+        msgs: List[Dict[str, Any]] = []
+        try:
+            backend = getattr(self.tool_executor, "_backend", None) if self.tool_executor else None
+            if not backend:
+                return msgs
+            q = getattr(backend, "_hook_message_queue", None)
+            if q is None:
+                return msgs
+            while True:
+                try:
+                    msgs.append(q.get_nowait())
+                except Exception:
+                    break
+        except Exception as e:
+            logger.debug(f"[SubAgent] drain posttool queue failed: {e}")
+        return msgs
+
+
+class SubAgentManager(QObject):
+    """子智能体管理器 - 管理子智能体任务分发"""
+
+    task_started = Signal(str, str, str)  # task_id, agent_name, task_description
+    task_finished = Signal(str, str)  # task_id, result
+    batch_finished = Signal()  # 批次内所有任务都完成时触发
+    # ★ T24：子智能体 ask 权限请求转发（window_id, task_id, tool_name, arguments）→ 主线程弹窗
+    permission_requested = Signal(str, str, str, dict)
+
+
+    def _drain_pretool_queue(self) -> List[Dict[str, Any]]:
+        """仅消费 backend 的 _pre_tool_message_queue（PreToolUse 消息）"""
+        msgs: List[Dict[str, Any]] = []
+        try:
+            backend = getattr(self.tool_executor, "_backend", None) if self.tool_executor else None
+            if not backend:
+                return msgs
+            q = getattr(backend, "_pre_tool_message_queue", None)
+            if q is None:
+                return msgs
+            while True:
+                try:
+                    msgs.append(q.get_nowait())
+                except Exception:
+                    break
+        except Exception as e:
+            logger.debug(f"[SubAgent] drain pretool queue failed: {e}")
+        return msgs
+
+
+    def _requires_reasoning_content(self, llm_config: Dict) -> bool:
+        """thinking 模式下，deepseek 系模型要求 tool-call assistant 保留 reasoning_content 字段。
+
+        与 chat_worker._requires_reasoning_content 保持一致：deepseek 官方及
+        opencode 等中转平台承载的 deepseek 系模型，上游 Console 均要求
+        tool_calls assistant 消息携带 reasoning_content 字段（可为空串）。
+        """
+        if not isinstance(llm_config, dict) or llm_config.get("思考模式") is not True:
+            return False
+        family = detect_provider_family(llm_config)
+        if family == "deepseek":
+            return True
+        model = str(llm_config.get("模型名称", "") or "").lower()
+        return model.startswith("deepseek")
+
+    # ========== Hook 集成（让子智能体也能应用所有 hook） ==========
+    # 设计目标：与 chat_worker 对齐，让子智能体也能触发/消费以下 hook：
+    #   - PreAssistantMessage / PostAssistantMessage：子智能体自己同步触发
+    #   - PreToolUse / PostToolUse：tool_executor.execute() 已触发，消息进 backend 队列，
+    #     此处只需消费对应队列
+    # 所有 hook context 都会注入 current_role="subagent" + agent_name，
+    # 让 hook 脚本能识别当前执行角色并按需分支。
+
+
+    def _trigger_hook_sync(
+        self,
+        event_name: str,
+        current_messages: List[Dict],
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """同步触发 hook 并把每条 hook 输出追加到 current_messages（in-place）
+
+        与 chat_worker._trigger_worker_hook 行为一致：
+        - 使用 trigger_event(sync) 同步执行 hook
+        - 用 _make_hook_message 包装成 user 消息（role=user，与 Claude Code 官方行为对齐）
+        - 直接 append 到 current_messages，下次 API 调用时 LLM 即可看到
+        """
+        try:
+            backend = getattr(self.tool_executor, "_backend", None) if self.tool_executor else None
+            if not backend or not backend.hook_manager:
+                return
+
+            ctx = self._build_hook_context(extra=extra_context)
+
+            # PreAssistantMessage / PostAssistantMessage：注入上下文使用量信息
+            # 让 hook（如 context_auto_compact）能检测当前 token 占比
+            if event_name in ("PreAssistantMessage", "PostAssistantMessage"):
+                try:
+                    from app.core.token_estimator import count_messages_tokens as _count
+                    from app.core.model_capabilities import resolve_context_limit as _resolve_limit
+
+                    token_count = _count(current_messages)
+                    token_limit = 0
+                    llm_config = getattr(self, "llm_config", None)
+                    if llm_config:
+                        token_limit = _resolve_limit(llm_config)
+                    ctx["token_count"] = token_count
+                    ctx["token_limit"] = token_limit
+                    if token_count > 0 and token_limit > 0:
+                        ctx["token_ratio"] = token_count / token_limit
+                    else:
+                        ctx["token_ratio"] = 0.0
+                except Exception:
+                    pass
+
+            # 取最新 user 消息作为 current_message（用于 matcher 匹配）
+            cur_msg = ""
+            for m in reversed(current_messages):
+                if m.get("role") == "user":
+                    c = m.get("content", "")
+                    if isinstance(c, str):
+                        cur_msg = c
+                    break
+
+            # 记录 trigger_event 前的队列大小，用于后续精确 drain
+            _q = getattr(backend, "_hook_message_queue", None)
+            qsize_before = _q.qsize() if _q is not None else 0
+
+            results = backend.hook_manager.trigger_event(
+                event_name,
+                context=ctx,
+                current_message=cur_msg,
+                trigger_async=False,
+            )
+
+            # 🛡️ 精确排出同步执行中 _execute_hook 通过 on_hook_finished 入队的消息，
+            # 避免 _inject_pending_hook_messages（_drain_hook_queues）重复注入。
+            # ★ 只排出本轮 trigger_event 新增的消息，不误伤其他路径放入的消息。
+            if _q is not None:
+                qsize_after = _q.qsize()
+                to_drain = qsize_after - qsize_before
+                for _ in range(to_drain):
+                    try:
+                        _q.get_nowait()
+                    except Exception:
+                        break
+                if to_drain > 0:
+                    logger.debug(
+                        f"[SubAgent] Drained {to_drain} msg(s) from hook queue after sync trigger_event({event_name})"
+                    )
+
+            # 收集成功执行的 hook 输出，注入 messages
+            # ★ 只注入标记为 add_to_context=true 的 hook 结果
+            from app.core.backend import _make_hook_message
+
+            injected = 0
+            for r in results:
+                if r.success and r.output and r.add_to_context:
+                    msg = _make_hook_message(event_name, r.output, r.status_message)
+                    current_messages.append(msg)
+                    injected += 1
+            if injected:
+                logger.debug(f"[SubAgent] Hook '{event_name}' injected {injected} msg(s) into messages")
+        except Exception as e:
+            logger.debug(f"[SubAgent] Hook '{event_name}' trigger failed: {e}")
+
+
+    def total_tokens(self) -> int:
+        """获取累计 token 总数（供 UI 显示）"""
+        return self._total_tokens
 
 class SubAgentManager(QObject):
     """子智能体管理器 - 管理子智能体任务分发"""
@@ -1991,3 +2292,180 @@ class SubAgentManager(QObject):
                 "agent": executor.agent_name,
             })
         return ToolResult(True, content={"tasks": tasks_info})
+
+
+    # ===== P2 补齐 manager（从原项目同步）=====
+
+    def _check_stalled_tasks(self):
+        """
+        检查所有运行中任务的最后活跃时间，如果日志静默超过 stall_timeout 则 cancel。
+        由 QTimer 定时触发（默认每 10 秒）。
+        """
+        import time
+
+        now = time.time()
+        for task_id in list(self._running_tasks.keys()):
+            executor = self._running_tasks.get(task_id)
+            if not executor or not executor.isRunning():
+                continue
+
+            last_activity = executor.get_last_activity_time()
+            if not last_activity:
+                continue
+
+            idle_time = now - last_activity
+            if idle_time <= self._stall_timeout:
+                continue
+
+            # 检测到 stall（日志静默超时）
+            error_msg = f"Task stalled: no log activity for {int(idle_time)}s (timeout={self._stall_timeout}s)"
+            logger.warning(
+                f"[SubAgentManager] ⚠️ Task {task_id[:8]} ({executor.agent_name}) "
+                f"stalled for {int(idle_time)}s, cancelling"
+            )
+
+            # 1. Cancel executor
+            executor.cancel()
+
+            # 2. 写入 finished_tasks
+            agent_name = executor.agent_name
+            task_description = executor.task_description
+            logs = executor.get_logs()
+            task_session_id = getattr(executor, "_task_session_id", self._current_session_id)
+            self._finished_tasks[task_id] = {
+                "result": "",
+                "error": error_msg,
+                "agent_name": agent_name,
+                "task_description": task_description,
+                "session_id": task_session_id,
+                "logs": logs,
+            }
+
+            # 3. 保存数据库（status="stalled"）
+            self._save_task_to_store(
+                task_id,
+                agent_name,
+                task_description,
+                "stalled",
+                "",
+                error_msg,
+                logs,
+                session_id=task_session_id,
+            )
+
+            # 4. 通知 DAG（如果有）
+            self._notify_dag_task_failed(task_id, error_msg)
+
+            # 5. 通知 UI
+            try:
+                self.task_finished.emit(task_id, "")
+            except Exception as e:
+                logger.error(f"[SubAgentManager] task_finished.emit 失败 (stalled path): {e}")
+
+            # 6. 从 running_tasks 移除（避免 get_finished_tasks 再处理一次）
+            #    注意：executor 线程可能还在运行（卡在 API 调用中），
+            #    但已经从管理器角度"移除"了，后续 finished_with_result 回调
+            #    会因 task_id 不在 running_tasks 而被安全忽略。
+            if task_id in self._running_tasks:
+                del self._running_tasks[task_id]
+
+
+    def _forward_permission_request(self, task_id: str, tool_name: str, arguments: dict):
+        """转发 executor 的权限请求到主线程（SubAgentManager → main_widget）。
+
+        携带 window_id（来自 executor 所在窗口的 backend），供多窗口场景
+        精确定位弹窗归属。
+        """
+        executor = self._running_tasks.get(task_id)
+        window_id = ""
+        if executor is not None and executor.tool_executor is not None:
+            backend = getattr(executor.tool_executor, "_backend", None)
+            if backend is not None:
+                window_id = getattr(backend, "_window_id", "") or ""
+        self.permission_requested.emit(window_id, task_id, tool_name, arguments)
+
+
+    def cancel_all(self):
+        """取消所有运行中的子智能体任务 + 停止 Stall 检测器
+
+        用于窗口关闭时清理当前窗口的所有子智能体任务，防止线程泄漏。
+        """
+        # 先停止 stall 检测器，避免在取消过程中触发额外的回调
+        self.stop_stall_detector()
+
+        # 取消所有运行中的任务
+        for task_id in list(self._running_tasks.keys()):
+            try:
+                executor = self._running_tasks[task_id]
+                agent_name = executor.agent_name
+                task_description = executor.task_description
+                logs = executor.get_logs()
+                task_session_id = getattr(executor, "_task_session_id", self._current_session_id)
+
+                # 标记取消（设置 _is_cancelled 标志，线程在下一次检查点退出）
+                executor.cancel()
+
+                # 写入 finished_tasks（与 _check_stalled_tasks / cancel_task 一致）
+                error_msg = "Task cancelled: window closed"
+                self._finished_tasks[task_id] = {
+                    "result": "",
+                    "error": error_msg,
+                    "agent_name": agent_name,
+                    "task_description": task_description,
+                    "session_id": task_session_id,
+                    "logs": logs,
+                }
+                # 保存到数据库
+                self._save_task_to_store(
+                    task_id,
+                    agent_name,
+                    task_description,
+                    "cancelled",
+                    "",
+                    error_msg,
+                    logs,
+                    session_id=task_session_id,
+                )
+                # 通知 DAG（如果有）
+                self._notify_dag_task_failed(task_id, error_msg)
+                # 发送完成信号让 UI 知道
+                try:
+                    self.task_finished.emit(task_id, "")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"[SubAgentManager] cancel_all: 取消任务 {task_id} 时出错: {e}")
+
+        self._running_tasks.clear()
+
+
+    def get_last_activity_time(self) -> float:
+        """获取最后活跃时间戳（供 SubAgentManager stall 检测使用）"""
+        return self._last_activity_time
+
+
+    def respond_permission(self, allow: bool):
+        """主线程响应权限询问结果（ask 分支继续执行/拒绝）。"""
+        self._permission_allow = bool(allow)
+        self._permission_answered = True
+        self._permission_event.set()
+
+
+    def set_stall_timeout(self, seconds: int):
+        """设置日志静默超时阈值（最少 30 秒）"""
+        self._stall_timeout = max(30, seconds)
+        logger.info(f"[SubAgentManager] Stall 超时已设置为 {self._stall_timeout}s")
+
+
+    def start_stall_detector(self):
+        """启动 stall 检测定时器（默认在 SubAgentManager 初始化时未启动，由外部调用）"""
+        if not self._stall_timer.isActive():
+            self._stall_timer.start()
+            logger.info("[SubAgentManager] Stall 检测器已启动")
+
+
+    def stop_stall_detector(self):
+        """停止 stall 检测定时器"""
+        if self._stall_timer.isActive():
+            self._stall_timer.stop()
+            logger.info("[SubAgentManager] Stall 检测器已停止")

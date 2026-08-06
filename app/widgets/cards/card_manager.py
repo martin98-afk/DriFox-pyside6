@@ -24,6 +24,26 @@ from loguru import logger
 class ContainerType(Enum):
     TOP = "top"      # chatscroll 上方
     BOTTOM = "bottom"  # chatscroll 下方
+    LEFT = "left"  # 内容区左侧停靠区（Tab 级全局卡片 / UI 插件卡片）
+    RIGHT = "right"  # 内容区右侧停靠区（Tab 级全局卡片 / UI 插件卡片）
+
+
+# ── 停靠区容器 ──
+# LEFT/RIGHT 作为独立停靠区：
+# - 仅同容器互斥（同一侧一次显示一张卡片）
+# - 不参与系统卡片的跨容器压制（打开设置卡片不会关掉左右停靠面板）
+# - 不被 question 卡片强制关闭
+#
+# BOTTOM 在 Tab 模式下通过 mark_coexist_containers() 加入共存集合，
+# 与 LEFT/RIGHT 共存（TabManagerWindow._setup_ui 中配置）。
+DOCK_CONTAINER_TYPES = frozenset({ContainerType.LEFT, ContainerType.RIGHT})
+
+
+# ── 全局卡片作用域 ──
+# Tab 管理器级别的卡片（系统配置/服务商编辑/Hook 编辑/MCP 编辑等）
+# 不再绑定单个对话窗口，统一注册在该保留 window_id 下。
+# 对话级卡片（项目/会话/模型选择等）仍使用各窗口自己的 window_id。
+GLOBAL_WINDOW_ID = "__global__"
 
 
 class CardManager:
@@ -77,21 +97,18 @@ class CardManager:
         #   }
         # }
         self._window_data: Dict[str, Dict[str, Any]] = {}
+        # 共存容器：同一窗口内仅同容器互斥、不跨容器互斥的容器类型集合
+        # （如 Tab 模式下 LEFT/RIGHT/BOTTOM 可同时显示、互不关闭）
+        self._coexist_containers: Dict[str, "frozenset[ContainerType]"] = {}
     
     def _ensure_window_initialized(self, window_id: str):
         """确保窗口数据已初始化"""
         if window_id not in self._window_data:
             self._window_data[window_id] = {
-                "cards": {
-                    ContainerType.TOP: {},
-                    ContainerType.BOTTOM: {},
-                },
+                "cards": {ct: {} for ct in ContainerType},
                 "containers": {},  # card_id -> ContainerType
                 "system_cards": set(),
-                "visible_cards": {
-                    ContainerType.TOP: None,
-                    ContainerType.BOTTOM: None,
-                },
+                "visible_cards": {ct: None for ct in ContainerType},
                 "shown_callbacks": {},
                 "hidden_callbacks": {},
                 "suppress_others_map": {},  # card_id -> set of suppressed card_ids
@@ -101,6 +118,93 @@ class CardManager:
     def _ensure_state_initialized(self):
         """兼容旧代码"""
         pass
+
+    def mark_coexist_containers(self, window_id: str, containers: "frozenset[ContainerType]"):
+        """标记指定窗口中可共存的容器类型
+
+        共存容器之间仅同容器互斥（同一侧一次显示一张卡片），不同容器可同时显示。
+        覆盖层（TOP 容器）与共存容器无互斥关系：四向区域可同时存在、互不关闭。
+
+        Args:
+            window_id: 窗口标识
+            containers: 共存容器类型集合（如 frozenset({LEFT, RIGHT, BOTTOM})）
+        """
+        self._ensure_window_initialized(window_id)
+        self._coexist_containers[window_id] = containers
+
+    def unregister_card(self, card_id: str, window_id: str):
+        """注销单张卡片（卡片销毁重建前调用）
+
+        清理 cards/containers/system_cards/visible_cards/压制关系中的所有痕迹，
+        使同名 card_id 可被重新 register_card 而不触发覆盖警告。
+        """
+        win_data = self._window_data.get(window_id)
+        if win_data is None:
+            return
+        container_type = win_data["containers"].pop(card_id, None)
+        if container_type is not None:
+            win_data["cards"].get(container_type, {}).pop(card_id, None)
+            if win_data["visible_cards"].get(container_type) == card_id:
+                win_data["visible_cards"][container_type] = None
+        win_data["system_cards"].discard(card_id)
+        win_data["shown_callbacks"].pop(card_id, None)
+        win_data["hidden_callbacks"].pop(card_id, None)
+        suppressed = win_data["suppress_others_map"].pop(card_id, None)
+        if suppressed:
+            still_suppressed = set()
+            for ids in win_data["suppress_others_map"].values():
+                still_suppressed |= ids
+            win_data["suppressed_by_others"] &= still_suppressed
+
+    # ============================================================
+    # 外部卡片注册（由 UI 插件调用）
+    # ============================================================
+
+    def register_external_card(
+        self,
+        window_id: str,
+        card_id: str,
+        widget_class: type,
+        container: "ContainerType",
+        default_visible: bool = False,
+    ) -> None:
+        """注册外部卡片（由 UI 插件调用）
+
+        Args:
+            window_id: 窗口 ID（多窗口隔离）
+            card_id: 卡片唯一 ID
+            widget_class: QWidget 子类
+            container: 容器位置
+            default_visible: 默认是否可见
+        """
+        if not hasattr(self, "_external_cards"):
+            self._external_cards: Dict[str, Dict[str, dict]] = {}
+        if window_id not in self._external_cards:
+            self._external_cards[window_id] = {}
+        self._external_cards[window_id][card_id] = {
+            "widget_class": widget_class,
+            "container": container,
+            "default_visible": default_visible,
+        }
+
+    def unregister_external_card(self, window_id: str, card_id: str) -> None:
+        """注销外部卡片"""
+        if not hasattr(self, "_external_cards"):
+            return
+        cards = self._external_cards.get(window_id, {})
+        cards.pop(card_id, None)
+
+    def get_external_card(self, window_id: str, card_id: str) -> Optional[dict]:
+        """获取外部卡片信息"""
+        if not hasattr(self, "_external_cards"):
+            return None
+        return self._external_cards.get(window_id, {}).get(card_id)
+
+    def list_external_cards(self, window_id: str) -> Dict[str, dict]:
+        """列出窗口的所有外部卡片"""
+        if not hasattr(self, "_external_cards"):
+            return {}
+        return dict(self._external_cards.get(window_id, {}))
     
     def register_window(self, window_id: str):
         """注册窗口到管理器（窗口创建时调用）"""
@@ -110,6 +214,7 @@ class CardManager:
         """注销窗口及其所有卡片数据（窗口关闭时调用）"""
         if window_id in self._window_data:
             del self._window_data[window_id]
+        self._coexist_containers.pop(window_id, None)
     
     def register_card(self, window_id: str, container_type: ContainerType, card_id: str, card_widget, system_card: bool = False, suppress_others: list = None):
         """注册卡片到管理器
@@ -164,6 +269,25 @@ class CardManager:
         
         # 如果卡片已经可见，不做任何事
         if win_data["visible_cards"].get(container_type) == card_id:
+            return
+
+        # ── 共存 / 停靠区卡片（LEFT/RIGHT/BOTTOM）：独立于系统卡片压制体系 ──
+        # 仅同容器互斥，不受 question / 系统卡片 / 优先卡片影响
+        # 与覆盖层（TOP）无互斥关系，四向区域可同时存在
+        coexist_cts = self._coexist_containers.get(window_id, frozenset())
+        if container_type in DOCK_CONTAINER_TYPES or container_type in coexist_cts:
+            self._hide_same_container_cards(window_id, container_type, exclude_card_id=card_id)
+            try:
+                if hasattr(card_widget, "show_card"):
+                    card_widget.show_card()
+                else:
+                    card_widget.setVisible(True)
+            except RuntimeError:
+                self._check_and_remove_deleted_card(window_id, card_id, container_type, card_widget)
+                return
+            win_data["visible_cards"][container_type] = card_id
+            for cb in win_data["shown_callbacks"].get(card_id, []):
+                cb(card_id)
             return
         
         # ── Question 最高优先级：如果 question 已显示，其他非 question 卡片不能打断 ──
@@ -343,10 +467,13 @@ class CardManager:
                 self.hide_card(card_id, window_id)
 
     def _hide_all_cards(self, window_id: str):
-        """隐藏窗口内所有卡片"""
+        """隐藏窗口内所有卡片（停靠区 LEFT/RIGHT 与共存容器豁免）"""
         if window_id not in self._window_data:
             return
+        coexist_cts = self._coexist_containers.get(window_id, frozenset())
         for container_type in ContainerType:
+            if container_type in DOCK_CONTAINER_TYPES or container_type in coexist_cts:
+                continue
             self._hide_same_container_cards(window_id, container_type)
 
     def _hide_same_container_cards(self, window_id: str, container_type: ContainerType, exclude_card_id: str = None):

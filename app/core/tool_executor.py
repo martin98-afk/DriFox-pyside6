@@ -3,7 +3,9 @@
 工具执行器模块 - 统一处理各种工具调用
 """
 import os
+import time
 import orjson
+import json as _json
 import re
 import threading
 from pathlib import Path
@@ -12,6 +14,8 @@ from loguru import logger
 from typing import Dict, List, Optional, Callable
 
 from app.core.hook_manager import HookDecision
+from app.core.model_capabilities import resolve_context_limit
+from app.core.token_estimator import count_messages_tokens
 
 # 预编译正则表达式
 _FILE_PREFIX_PATTERN = re.compile(r'^file:/{1,3}')
@@ -34,11 +38,15 @@ class ToolExecutor:
     # 确保工作目录（workdir）完全隔离，多窗口互不影响
     # MCPClientManager 本身已是全局单例，连接仍跨窗口共享
 
+    # 自动 LSP 诊断冷却（防止连续 write/edit 造成诊断洪流）
+    _DIAG_COOLDOWN_SECONDS = 3.0
+    _last_diag_time: float = 0.0
+
     def __init__(self, homepage=None, workdir: str = None, backend=None):
         self._homepage = homepage
         self._backend = backend  # ChatBackend 引用，用于访问 HookManager
         self._builtin_tools: Optional[BuiltinTools] = None
-        self._workdir = workdir
+        self._workdir = workdir or self._default_workdir()
         self._custom_tools: Dict[str, Callable] = {}
         self._session_id: Optional[str] = None
         self._call_id: Optional[str] = None
@@ -162,6 +170,12 @@ class ToolExecutor:
         """获取文件操作记录器"""
         return self._file_recorder
 
+
+    def _check_team_member(self) -> bool:
+        """检查当前窗口是否是团队成员（委托给共用函数）"""
+        from app.core.team_manager import check_team_member
+
+        return check_team_member(self._backend)
     def _record_file_operation_before(self, tool_name: str, args: dict,
                                        session_id: str = None, call_id: str = None):
         """
@@ -285,6 +299,47 @@ class ToolExecutor:
 
     # ========== PostToolUse hook 统一触发 ==========
 
+
+    def _get_context_usage_info(self) -> tuple:
+        """获取当前会话的 token 使用量和上下文限制
+
+        从 session 的消息估算 token 数，从模型配置解析上下文窗口限制。
+
+        Returns:
+            (token_count, token_limit):
+                token_count: 当前对话已占用的 token 数（估算值）
+                token_limit: 当前模型的最大上下文窗口限制
+                任一为 0 表示无法获取。
+        """
+        if not (self._backend and self._backend.session_manager):
+            return 0, 0
+
+        session = self._backend.get_current_session()
+        if not session or not getattr(session, "messages", None):
+            return 0, 0
+
+        messages = session.messages
+        if not messages:
+            return 0, 0
+
+        # 估算 token 数
+        token_count = 0
+        try:
+            token_count = count_messages_tokens(messages)
+        except Exception:
+            pass
+
+        # 解析上下文限制
+        token_limit = 0
+        try:
+            getter = getattr(self._backend, "_get_model_config", None)
+            if getter and callable(getter):
+                llm_config = getter() or {}
+                token_limit = resolve_context_limit(llm_config)
+        except Exception:
+            pass
+
+        return token_count, token_limit
     def _trigger_post_tool_use(self, tool_name: str, args: dict, result=None) -> None:
         """触发 PostToolUse hook（统一方法，减少重复代码）
 
@@ -330,12 +385,116 @@ class ToolExecutor:
                         current_message_text = msg.get('content', '')
                         break
 
-        self._backend.hook_manager.trigger_event(
+        # ====== 注入上下文使用量信息（供 auto-compact hook 检测）======
+        token_count, token_limit = self._get_context_usage_info()
+        context["token_count"] = token_count
+        context["token_limit"] = token_limit
+        if token_count > 0 and token_limit > 0:
+            context["token_ratio"] = token_count / token_limit
+        else:
+            context["token_ratio"] = 0.0
+        # ============================================================
+
+        results = self._backend.hook_manager.trigger_event(
             "PostToolUse",
             context=context,
             current_message=current_message_text,
         )
 
+        # 检查 PostToolUse hook 结果中是否有 auto-compact 触发信号
+        self._check_auto_compact(results)
+
+
+    def _check_auto_compact(self, results: list) -> None:
+        """检查 PostToolUse hook 结果中是否有 auto-compact 触发信号
+
+        hook 函数的返回值（JSON）格式：
+            {"auto_compact": true, "ratio": 0.85}
+
+        Args:
+            results: trigger_event 返回的 HookExecutionResult 列表
+        """
+        if not results or not self._backend:
+            return
+
+        for r in results:
+            if not r.success or not r.output:
+                continue
+            try:
+                data = _json.loads(r.output)
+                if isinstance(data, dict) and data.get("auto_compact"):
+                    ratio = float(data.get("ratio", 0.0))
+                    # 交给后端处理（带冷却）
+                    self._backend.request_auto_compact(ratio)
+                    return  # 只触发一次
+            except (_json.JSONDecodeError, ValueError, TypeError):
+                pass
+    def _try_auto_lsp_diagnose(self, tool_name: str, args: dict, result: "ToolResult") -> "ToolResult":
+        """文件编辑成功后，若开启自动诊断则运行 LSP 诊断并追加到结果
+
+        冷却机制：_DIAG_COOLDOWN_SECONDS（3 秒）内不重复触发，
+        防止连续 write/edit/multi_edit 操作造成 LSP CLI 诊断洪流。
+
+        Args:
+            tool_name: 工具名 (write/edit/multi_edit)
+            args: 工具参数
+            result: 原始工具结果
+
+        Returns:
+            追加了诊断信息的结果（或原始结果）
+        """
+        # 0. 冷却检查
+        now = time.monotonic()
+        if now - self._last_diag_time < self._DIAG_COOLDOWN_SECONDS:
+            return result  # 冷却期内跳过
+        self._last_diag_time = now
+
+        # 1. 检查自动诊断开关
+        try:
+            cfg = Settings.get_instance()
+            if not cfg.lsp_auto_diagnose.value:
+                return result
+        except Exception as e:
+            logger.debug(f"[ToolExecutor] 自动诊断开关读取失败: {e}")
+            return result
+
+        # 2. 获取文件路径并解析
+        file_path = args.get("path")
+        if not file_path:
+            return result
+
+        try:
+            full_path = self._builtin_tools._file_tools._resolve_path(file_path)
+        except Exception as e:
+            logger.debug(f"[ToolExecutor] 自动诊断路径解析失败: {e}")
+            return result
+
+        # 3. 检查是否有对应的 LSP 客户端
+        try:
+            from app.core.lsp.lsp_manager import LspManager
+            lsp_mgr = LspManager.get_instance()
+            client = lsp_mgr.get_client_for_file(str(full_path))
+            if not client:
+                return result  # 无对应 LSP 服务器
+        except Exception as e:
+            logger.debug(f"[ToolExecutor] 自动诊断 LSP 路由失败: {e}")
+            return result
+
+        # 4. 运行快速诊断（跳过 LSP 协议握手，直接 CLI）
+        try:
+            diag_result = lsp_mgr.sync_quick_diagnostics(str(full_path), timeout=5.0)
+        except Exception as e:
+            logger.warning(f"[ToolExecutor] 自动 LSP 快速诊断失败: {e}")
+            return result
+
+        # 诊断文本追加到 result.content 末尾，使其自然通过消息持久化路径保留（
+        # consolidate_messages → normalize_message 保留 content 字段），
+        # 确保 LLM 在各轮次都能看到诊断结果，避免跨轮 content 变化导致 KV 缓存命中丢失。
+        diag_msg = "[LSP 自动诊断] 未发现问题" if not diag_result else diag_result
+        result.content = f"{result.content}\n\n{diag_msg}"
+
+        logger.debug(f"[ToolExecutor] 自动 LSP 诊断完成: {tool_name} → {file_path}")
+        return result
     def set_memory_manager(self, memory_manager):
         if self._builtin_tools:
             self._builtin_tools.set_memory_manager(memory_manager)
@@ -387,6 +546,25 @@ class ToolExecutor:
                 self._builtin_tools.workdir = Path(default_wd)
             logger.info(f"[ToolExecutor] Workdir updated: {workdir or 'default'}")
 
+
+    def _default_workdir(self) -> str:
+        """获取默认工作目录（项目根 / exe 根，与 _initialize_builtin_tools 一致）
+
+        规范化：用 Path 解析后转为 str，避免 Windows 路径带尾随反斜杠
+        （如 'D:\\work\\DriFoxx\\' 导致 os.path.basename 返回空字符串）。
+
+        PyInstaller 打包后：使用 exe 所在目录，而非 _internal 临时解压目录。
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                # PyInstaller: _MEIPASS 指向 _internal 临时目录，不可作为项目根。
+                # 改用 sys.executable 所在目录（exe 的安装目录）。
+                return str(Path(sys.executable).resolve().parent)
+            from app.utils.utils import resource_path
+
+            return str(Path(resource_path("")).resolve())
+        except Exception:
+            return str(Path(__file__).resolve().parent.parent.parent)
     def set_key_documents_repo(self, repo, project: str = "默认项目"):
         """设置关键文档仓储和当前项目"""
         if self._builtin_tools and self._builtin_tools._task_tools:
@@ -717,6 +895,10 @@ class ToolExecutor:
                 if tool_name in self._FILE_OPS_TO_TRACK and result and result.success:
                     self._record_file_operation_after(tool_name, args, file_path_before, local_session_id, local_call_id)
                 
+                # 自动 LSP 诊断：文件编辑成功后，若开启则自动诊断
+                if result and result.success and tool_name in ("write", "edit", "multi_edit"):
+                    result = self._try_auto_lsp_diagnose(tool_name, args, result)
+
                 # Trigger PostToolUse hook（统一方法，含结果回填）
                 self._trigger_post_tool_use(tool_name, args, result)
 

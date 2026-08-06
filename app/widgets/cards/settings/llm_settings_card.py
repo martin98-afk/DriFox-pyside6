@@ -28,6 +28,7 @@ from app.utils.startup_manager import set_auto_start
 from app.utils.theme_manager import theme_manager
 from app.utils.utils import get_icon, get_unified_font, get_font_family_css
 from app.widgets.cards.settings.gateway_setting_card import GatewaySettingCard
+from app.widgets.cards.settings.gitee_card import GiteeCard
 from app.widgets.cards.settings.base_settings_card import BaseSettingsCard
 from app.widgets.cards.settings.list_setting_card import SkillListSettingCard
 from app.widgets.cards.settings.mcp_setting_card import MCPListSettingCard
@@ -210,6 +211,10 @@ class LLMSettingsCard(SystemCardFrame):
         content_layout.setContentsMargins(0, 4, 0, 4)
         content_layout.setSpacing(6)
 
+        # ---- Gitee 云同步（账号绑定） ----
+        self.giteeCard = GiteeCard(self)
+        content_layout.addWidget(self.giteeCard)
+
         # ---- 大模型分隔标签 ----
         self._sep_llm_label = self._make_sep_label("大模型")
         self._section_anchors["llm"] = self._sep_llm_label
@@ -285,6 +290,17 @@ class LLMSettingsCard(SystemCardFrame):
             home=self,
         )
         content_layout.addWidget(self.gatewayCard)
+
+        # 锁屏远程
+        self.lockRemoteCard = SwitchSettingCard(
+            FluentIcon.SYNC,
+            "锁屏远程",
+            "保持系统唤醒、屏幕常亮。",
+            configItem=self.cfg.lock_screen_remote_enabled,
+            parent=self,
+        )
+        self.lockRemoteCard.checkedChanged.connect(self._on_lock_remote_toggled)
+        content_layout.addWidget(self.lockRemoteCard)
 
         # 开机自启
         self.autoStartCard = SwitchSettingCard(
@@ -707,6 +723,34 @@ class LLMSettingsCard(SystemCardFrame):
             service.start(background=True)
         if hasattr(self, "llmApiEnabledCard"):
             self.llmApiEnabledCard.setContent(f"http://localhost:{port}/docs")
+
+    def _on_lock_remote_toggled(self, enabled: bool):
+        """锁屏远程开关：开启时保持系统/屏幕唤醒并锁屏，关闭时恢复休眠策略"""
+        from app.utils.fluent_shim import InfoBar, InfoBarPosition
+        from app.widgets.tab_manager_window import TabManagerWindow
+        from app.core.system.lock_screen_remote import get_lock_screen_remote_manager
+
+        # InfoBar 统一挂到 tab 管理器顶层窗口（未就绪时兜底卡片所在窗口）
+        bar_parent = TabManagerWindow.get_instance() or self.window()
+        mgr = get_lock_screen_remote_manager()
+        if enabled:
+            mgr.enable(lock_now=False, keep_display_on=True)
+            InfoBar.success(
+                title="锁屏远程",
+                content="已开启：系统保持唤醒，屏幕常亮。",
+                position=InfoBarPosition.BOTTOM,
+                duration=2500,
+                parent=bar_parent,
+            ).show()
+        else:
+            mgr.disable()
+            InfoBar.info(
+                title="锁屏远程",
+                content="已关闭，恢复系统正常休眠策略。",
+                position=InfoBarPosition.BOTTOM,
+                duration=2500,
+                parent=bar_parent,
+            ).show()
 
     def showEvent(self, event):
         if hasattr(self, 'llmProviderCard'):

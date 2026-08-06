@@ -9,15 +9,15 @@
 from typing import List, Dict
 
 import html
-from PySide6.QtCore import Qt, Signal, QTimer, QRect
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import Qt, Signal, QTimer, QRect, QEvent, QPoint
+from PySide6.QtGui import QMouseEvent, QTextDocument, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QScrollArea, QFrame, QSizePolicy,
 )
 
 from app.utils.utils import get_font_family_css, get_local_skills, get_skill_by_name
-from app.utils.design_tokens import Colors, font_size_css
+from app.utils.design_tokens import Colors, font_size_css, get_unified_scrollbar_style
 from app.core.command_manager import CommandManager, CommandType, CommandParameter
 from app.widgets.elided_label import _ElidedLabel
 
@@ -26,6 +26,85 @@ from app.widgets.elided_label import _ElidedLabel
 
 ITEM_HEIGHT = 36       # 每个 item 高度
 MAX_VISIBLE_ITEMS = 8  # 最多同时显示 item 数
+
+# ── 矮窗口自适应参数 ──
+CARD_MIN_VISIBLE_ITEMS = 1  # 矮到极致时仍保留的最少可见 item 数
+CARD_MIN_HEIGHT = ITEM_HEIGHT * 2 + 1  # 矮到极致时至少保留 2 行 item 的高度
+CARD_RESIZE_RESERVE = 120  # 顶部工具栏 + 最小聊天区预留高度（px）
+
+
+
+def _qcolor_from_rgba(s: str) -> QColor:
+    """将 Colors 中的 rgba(...) 字符串解析为 QColor
+
+    Qt5 的 QColor 仅支持 #RRGGBB / 颜色名，不支持 rgba(r,g,b,a) 函数式写法，
+    直接 QColor("rgba(33,33,38,250)") 会得到无效颜色（渲染成黑色）。
+    这里手动解析元组构造 QColor，兼容 rgb()/rgba() 与十六进制/颜色名回退。
+    """
+    s = (s or "").strip()
+    if s.startswith("rgb(") or s.startswith("rgba("):
+        inner = s[s.index("(") + 1 : s.rindex(")")]
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) >= 3:
+            r, g, b = int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
+            a = 255
+            if len(parts) >= 4:
+                af = float(parts[3])
+                a = int(af * 255) if af <= 1.0 else int(af)
+            return QColor(r, g, b, a)
+    return QColor(s)
+
+def _split_value_entry(entry) -> tuple:
+    """将枚举值条目拆分为 (value, description)
+
+    兼容两种格式：
+    - 纯字符串："gpt-4o" → ("gpt-4o", "")
+    - dict：{"value": "gpt-4o", "description": "..."} → ("gpt-4o", "...")
+    保持向后兼容：旧数据源（纯字符串列表）无需改动即可继续工作。
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("value", "")), str(entry.get("description", "") or "")
+    return str(entry), ""
+
+class _DescTooltipBubble(QLabel):
+    """悬浮描述气泡：自绘圆角主题实底背景
+
+    背景说明（关键）：顶层窗口设置了 WA_TranslucentBackground 后，Qt 会跳过
+    QStyle 的背景填充，导致样式表的 background 不绘制、窗口完全透明、文字看不清。
+    因此这里在 paintEvent 中手动用 QPainter 绘制圆角实底背景 + 边框，保证背景
+    始终可见；文字仍由基类 QLabel 渲染（含富文本关键字高亮）。
+    圆角外的区域保持透明。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._bg = _qcolor_from_rgba(Colors.CARD_BG_SOLID)
+        self._border = _qcolor_from_rgba(Colors.DIVIDER_COLOR)
+        self._radius = 6
+
+    def setBrushColors(self, bg: str, border: str):
+        """刷新背景/边框颜色（主题切换时调用）"""
+        self._bg = _qcolor_from_rgba(bg)
+        self._border = _qcolor_from_rgba(border)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        r = self._radius
+        # 背景实底
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(self._bg)
+        painter.drawRoundedRect(rect, r, r)
+        # 边框
+        pen = QPen(self._border)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect, r, r)
+        # 文字（含富文本高亮）由基类绘制，位于背景之上
+        super().paintEvent(event)
 
 
 class CommandItemWidget(QWidget):
@@ -70,23 +149,14 @@ class CommandItemWidget(QWidget):
         self._shortcut_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         layout.addWidget(self._shortcut_label)
 
-        # 类型标签（技能显示【技能】，智能体显示【智能体】，提示词显示【提示词】）
+        # 类型标签（技能【技能】/智能体【智能体】/提示词【提示词】/UI 插件【UI】）
+        # 统一创建 + _update_tag_visibility 动态控制文本与显隐（widget 复用时刷新）
         item_type = self._data["type"]
-        if item_type == "skill":
-            self._tag_label = QLabel("【技能】")
-            self._tag_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self._tag_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
-            layout.addWidget(self._tag_label)
-        elif item_type == "agent":
-            self._tag_label = QLabel("【智能体】")
-            self._tag_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self._tag_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
-            layout.addWidget(self._tag_label)
-        elif item_type == "prompt":
-            self._tag_label = QLabel("【提示词】")
-            self._tag_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            self._tag_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
-            layout.addWidget(self._tag_label)
+        self._tag_label = QLabel()
+        self._tag_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._tag_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        layout.addWidget(self._tag_label)
+        self._update_tag_visibility()
 
         # 快捷键文本（仅 command 类型且有快捷键时显示）
         shortcut = self._data.get("shortcut", "")
@@ -283,6 +353,25 @@ class CommandItemWidget(QWidget):
             if hls:
                 self._desc_label.setHighlights(hls, Colors.SEND_BTN_START)
 
+    def _update_tag_visibility(self):
+        """根据 item 类型和 subtype 更新标签文本和可见性（从原项目同步）"""
+        item_type = self._data["type"]
+        is_ui_plugin = item_type == "command" and self._data.get("subtype") == "ui_plugin"
+        if is_ui_plugin:
+            self._tag_label.setText("【UI】")
+            self._tag_label.setVisible(True)
+        elif item_type == "skill":
+            self._tag_label.setText("【技能】")
+            self._tag_label.setVisible(True)
+        elif item_type == "agent":
+            self._tag_label.setText("【智能体】")
+            self._tag_label.setVisible(True)
+        elif item_type == "prompt":
+            self._tag_label.setText("【提示词】")
+            self._tag_label.setVisible(True)
+        else:
+            self._tag_label.setVisible(False)
+
     def set_selected(self, selected: bool):
         """设置选中状态"""
         self._selected = selected
@@ -300,6 +389,8 @@ class CommandItemWidget(QWidget):
         self._hovered = False
         self._selected = False
         self._update_display()
+        # 刷新标签可见性（widget 复用旧标签残留修复）
+        self._update_tag_visibility()
         # 刷新快捷键标签
         shortcut = item_data.get("shortcut", "")
         if item_data["type"] == "command" and shortcut:
@@ -439,6 +530,70 @@ class ParameterItemWidget(QWidget):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+    def _apply_subwidget_styles(self):
+        """刷新 ParameterItemWidget 的子标签样式（颜色、字体、背景）
+
+        颜色 / 字体 / 背景全部由主题 token 驱动；切主题后通过 refresh_style 再次调用即可。
+        字体大小/族使用 font_size_css + get_font_family_css 与全局 UI 字号联动。
+
+        视觉规范：
+        - 参数名：font-size 12、bold；默认色 SEND_BTN_START，必填时 HTML <span> 覆盖星号为 ERROR 红色
+        - 参数说明：font-size 11、TEXT_SECONDARY、stretch 撑满
+        """
+        Colors.refresh()
+        font_css = get_font_family_css()
+        # 参数名（12px + bold；默认色 SEND_BTN_START，必填时 HTML <span> 覆盖星号色为 ERROR）
+        if hasattr(self, "_name_label") and self._name_label is not None:
+            self._name_label.setStyleSheet(f"""
+                QLabel {{
+                    color: {Colors.SEND_BTN_START};
+                    background: transparent;
+                    font-weight: bold;
+                    {font_css} {font_size_css(12)};
+                }}
+            """)
+            self._update_name_label_text()
+        # 参数说明（次要：11px + TEXT_SECONDARY，stretch 撑满剩余空间）
+        if getattr(self, "_desc_label", None) is not None:
+            self._desc_label.setStyleSheet(f"""
+                QLabel {{
+                    color: {Colors.TEXT_SECONDARY};
+                    background: transparent;
+                    {font_css} {font_size_css(11)};
+                }}
+            """)
+
+    def _update_name_label_text(self):
+        """根据必填/可选和激活状态更新参数名
+
+        必填时前缀红色 ERROR 星号；已激活参数显示 ✓ 前缀 + 次要色。
+        QLabel 在 RichText 模式下，未包裹在带 color 的 span 内的文本
+        会用默认调色板色（通常为黑），不会继承 stylesheet color。
+        因此把参数名也用 <span> 显式包裹，统一走 SEND_BTN_START（或 TEXT_SECONDARY 当已激活）。
+        """
+        if not hasattr(self, "_name_label") or self._name_label is None:
+            return
+        escaped = html.escape(self._param.name)
+        star = f'<span style="color: {Colors.ERROR};">*</span>' if self._param.required else ""
+        check = f'<span style="color: {Colors.REALTIME_SUCCESS};">✓ </span>' if self._active else ""
+        color = Colors.TEXT_SECONDARY if self._active else Colors.SEND_BTN_START
+        self._name_label.setText(f'{check}{star}<span style="color: {color};">{escaped}</span>')
+
+    def set_active(self, active: bool):
+        """设置激活状态：参数已在输入文本中出现时标记为已激活
+
+        激活的参数保持可见（不隐藏），视觉上保留 ✓ 前缀 + 次要色参数名，
+        但不再覆盖背景色，方便 hover 效果穿透，避免取消参数时看不出悬停哪个。
+        """
+        self._active = active
+        self._apply_subwidget_styles()
+        self._apply_style()
+
+    def is_active(self) -> bool:
+        return self._active
+
 
 
 class CommandCard(QWidget):
@@ -662,6 +817,344 @@ class CommandCard(QWidget):
         self._detail_container.setCursor(Qt.PointingHandCursor)
         self._detail_container.mousePressEvent = self._on_detail_clicked
 
+
+    def _apply_detail_desc_style(self):
+        """刷新 detail 模式命令说明标签的样式"""
+        Colors.refresh()
+        if not hasattr(self, "_detail_desc_label") or self._detail_desc_label is None:
+            return
+        self._detail_desc_label.setStyleSheet(f"""
+            QLabel {{ color: {Colors.TEXT_PRIMARY}; {get_font_family_css()} {font_size_css(12)}; background: transparent; margin: 0; padding: 0; }}
+        """)
+
+    def _apply_desc_tooltip_style(self):
+        """刷新悬浮描述 tooltip（气泡）的样式
+
+        视觉规范：
+        - 主题实底背景（CARD_BG_SOLID，卡片表面色），保证在任意聊天背景上都清晰可读
+        - 圆角 + 细分隔边框，营造悬浮信息气泡质感
+        - 文字保持 TEXT_PRIMARY，确保一眼可读
+        - 气泡以独立顶层窗口（WA_TranslucentBackground）悬浮在卡片上方，
+          由 _position_desc_tooltip 定位；圆角外的区域保持透明
+        """
+        Colors.refresh()
+        if getattr(self, "_desc_tooltip_label", None) is None:
+            return
+        # 背景/边框由 _DescTooltipBubble.paintEvent 自绘（WA_TranslucentBackground 下
+        # 样式表 background 不绘制），此处通过 setBrushColors 传入主题色。
+        self._desc_tooltip_label.setBrushColors(Colors.CARD_BG_SOLID, Colors.DIVIDER_COLOR)
+        self._desc_tooltip_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_PRIMARY};
+                {get_font_family_css()} {font_size_css(11)};
+                border: none;
+                border-radius: 6px;
+                margin: 6px 8px 6px 8px;
+                padding: 6px 10px;
+            }}
+        """)
+        # 字体/主题变化可能改变换行高度，重新定位气泡
+        if self._desc_tooltip_label.isVisible():
+            self._position_desc_tooltip()
+
+    def _ensure_desc_tooltip(self):
+        """惰性创建悬浮描述气泡（需要顶层窗口作为父级）
+
+        将气泡创建为独立顶层窗口（Frameless + ToolTip + 透明背景），
+        浮在卡片上方覆盖聊天区，鼠标穿透，带阴影营造悬浮感。
+        """
+        if getattr(self, "_desc_tooltip_label", None) is not None:
+            return
+        top = self.window()
+        if top is None:
+            return
+        lbl = _DescTooltipBubble(top)
+        lbl.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip | Qt.WindowDoesNotAcceptFocus)
+        lbl.setAttribute(Qt.WA_TranslucentBackground, True)
+        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.NoTextInteraction)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignTop)  # 顶部对齐，避免 VCenter 平分多余空间导致上下 padding 不均
+        # ⚠️ 注意：不在顶层 WA_TranslucentBackground 窗口上使用 QGraphicsDropShadowEffect。
+        # Windows 分层窗口（Layered Window）下，QGraphicsDropShadowEffect 的 bounding rect
+        # 会延伸到窗口边界之外，导致 Qt 传给 UpdateLayeredWindowIndirect 的脏区域包含负坐标，
+        # Windows 拒绝该参数并报 "参数错误"（UpdateLayeredWindowIndirect failed）。
+        # 气泡已通过 paintEvent 自绘圆角实底 + 边框，视觉上足够清晰。
+        self._desc_tooltip_label = lbl
+        self._apply_desc_tooltip_style()
+        # 安装父控件 move 钩子，确保气泡跟随父控件移动
+        self._ensure_parent_move_hook()
+
+    def _position_desc_tooltip(self):
+        """将悬浮气泡定位到卡片正上方（覆盖聊天区），并自适应宽度/高度
+
+        气泡底部与卡片顶边保留 GAP 间距；宽度对齐卡片宽度。
+        高度按当前宽度精确测量换行后高度（含样式 margin/padding），
+        并受可用上方空间约束，避免极端长描述溢出屏幕顶部。
+        """
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is None or not lbl.isVisible():
+            return
+        top = self.window()
+        if top is None:
+            return
+        card_global = self.mapToGlobal(QPoint(0, 0))
+        win_global = top.mapToGlobal(QPoint(0, 0))
+        gap = 6
+        # 对齐卡片宽度（气泡比卡片窄 2px 以贴合圆角边框）
+        w = max(1, self.width() - 2)
+        lbl.setFixedWidth(w)
+        # 可用上方空间（窗口顶部到卡片顶边，减去间距）
+        available_above = max(0, (card_global.y() - win_global.y()) - gap)
+        if available_above > 60:
+            line_h = lbl.fontMetrics().lineSpacing()
+            allowed = max(2, (available_above - 22) // line_h)
+            tip_h = self._compute_desc_tooltip_height(max_lines=min(16, allowed))
+        else:
+            tip_h = self._compute_desc_tooltip_height(max_lines=16)
+        # 安全兜底：气泡高度不超过卡片上方可用空间，避免溢出屏幕顶部
+        if available_above > 0:
+            tip_h = min(tip_h, available_above)
+        else:
+            # 卡片上方无可用空间（卡片紧贴窗口顶边），隐藏气泡避免遮挡卡片
+            tip_h = 0
+        lbl.setFixedHeight(tip_h)
+        if tip_h <= 0:
+            lbl.setVisible(False)
+            return
+        gx = card_global.x() + 1
+        gy = card_global.y() - tip_h - gap
+        if gy < win_global.y():
+            gy = win_global.y()
+        lbl.move(gx, gy)
+
+    def _compute_desc_tooltip_height(self, max_lines: int = 16) -> int:
+        """计算描述 tooltip 的高度（像素）
+
+        - 用 QTextDocument 以 QLabel 自身相同的字体/富文本引擎精确测量换行后高度，
+          与最终渲染结果一致，避免旧实现用 QFontMetrics.boundingRect 估算时
+          （未计入富文本行高、宽度取值偏差、HTML 高亮标签被当作正文等）导致高度偏小、
+          文字被裁切（包括首行只显示半截）的问题。
+        - 优先使用 label 的实际宽度（已布局）；卡片尚未布局时退回 card 宽度估算。
+        - max_lines 仅作为极端长描述的兜底上限，正常描述会完整展示。
+        """
+        if not hasattr(self, "_desc_tooltip_label") or self._desc_tooltip_label is None:
+            return 0
+        text = self._desc_tooltip_label.text()
+        if not text.strip():
+            return 0
+        # 实际可用宽度：优先 label 已布局宽度，否则退回卡片宽度 - 左右边框(2px)
+        label_w = self._desc_tooltip_label.width()
+        if label_w <= 0:
+            label_w = self.width() - 2
+        if label_w <= 0:
+            return 0
+        # 样式表：margin 6px 8px 6px 8px + padding 6px 10px
+        # → 文本实际渲染宽度 = label 宽度 - 左右 margin(8*2) - 左右 padding(10*2)
+        inner_w = max(1, label_w - 36)
+        # 用 QTextDocument 复现 QLabel 的换行高度（documentMargin=0 表示只量文本本身，
+        # 外层 margin/padding 由下方手动累加，数值完全可控）。
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setDefaultFont(self._desc_tooltip_label.font())
+        if self._desc_tooltip_label.textFormat() == Qt.RichText:
+            doc.setHtml(text)
+        else:
+            doc.setPlainText(text)
+        doc.setTextWidth(inner_w)
+        text_h = math.ceil(doc.size().height())
+        # 上下 margin(6+6) + 上下 padding(6+6) = 24px
+        # 额外加 4px 容差：QTextDocument 无父级时使用默认 DPI 做字体度量，
+        # 与 QLabel 实际屏幕渲染存在亚像素差异（尤其是 125%+ 缩放时），
+        # 导致短文本最后一行底部被吞 1/3，加 4px 安全边距补偿。
+        total = 28 + text_h
+        if max_lines and max_lines > 0:
+            fm = self._desc_tooltip_label.fontMetrics()
+            line_h = fm.lineSpacing()
+            total = min(total, 24 + int(max_lines * line_h))
+        return total
+
+    def _update_desc_tooltip(self, item: Optional[Dict[str, str]] = None):
+        """根据当前选中项更新悬浮气泡文本与可见性
+
+        Args:
+            item: 可选的选中项数据；为 None 时从 _filtered_items 与 _selected_index 推导
+        """
+        # 延迟创建悬浮气泡（需要顶层窗口）
+        self._ensure_desc_tooltip()
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is None:
+            return
+        # 值选择模式（枚举值列表）：最上方 tooltip 显示当前选中枚举值的描述
+        if self._value_selection_mode:
+            self._update_value_desc_tooltip()
+            return
+        # 其他 detail 模式（参数列表）自带描述区，无需重复 tooltip
+        if self._detail_mode:
+            lbl.setVisible(False)
+            # detail 模式的高度由 _adjust_detail_height 控制，此处不刷新
+            return
+        if item is None:
+            if 0 <= self._selected_index < len(self._filtered_items):
+                item = self._filtered_items[self._selected_index]
+            else:
+                item = None
+        desc = (item or {}).get("description", "") if item else ""
+        if not desc.strip():
+            # 空描述：隐藏（不显示空白气泡）；气泡独立窗口，无布局高度需刷新
+            self._has_tooltip_text = False
+            lbl.setVisible(False)
+            return
+        # HTML 转义 + 多关键字高亮（与 _ElidedLabel._update_display 对齐）
+        safe = html.escape(desc)
+        if self._current_text_query:
+            hls = CommandItemWidget._all_highlight_queries(desc, self._current_text_query)
+            if hls:
+                lower_safe = safe.lower()
+                spans = []
+                for hl in hls:
+                    escaped_hl = html.escape(hl)
+                    lower_hl = escaped_hl.lower()
+                    idx = lower_safe.find(lower_hl)
+                    if idx >= 0:
+                        spans.append((idx, idx + len(escaped_hl)))
+                if spans:
+                    spans.sort()
+                    merged = [spans[0]]
+                    for s in spans[1:]:
+                        if s[0] <= merged[-1][1]:
+                            merged[-1] = (merged[-1][0], max(merged[-1][1], s[1]))
+                        else:
+                            merged.append(s)
+                    parts = []
+                    pos = 0
+                    for start, end in merged:
+                        if pos < start:
+                            parts.append(safe[pos:start])
+                        parts.append(
+                            f'<span style="color: {Colors.SEND_BTN_START}; font-weight: bold;">{safe[start:end]}</span>'
+                        )
+                        pos = end
+                    if pos < len(safe):
+                        parts.append(safe[pos:])
+                    safe = "".join(parts)
+        # QLabel AutoText 只认字面 < 与 "& "，不认 &quot; 等 HTML 实体：
+        # escape 后不含 < 的文本会被判定为 PlainText，实体字面显示（&quot; 问题）。
+        # 显式强制 RichText，让实体在渲染时被解析为真实字符。
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setText(safe)
+        self._has_tooltip_text = True
+        # 先定位再显示，避免 tooltip 在错误位置闪现
+        # 若卡片尚未布局（width<=0），延迟到 layout 完成后再定位+显示
+        if self.width() <= 0:
+            lbl.setVisible(False)
+            QTimer.singleShot(0, self._update_desc_tooltip)
+            return
+        self._position_desc_tooltip()
+        lbl.setVisible(True)
+
+    def _apply_list_height(self):
+        """统一刷新卡片总高度：仅命令列表高度（含分区分隔线）
+
+        由 _render / 选中变更 / detail→list 切换等多个入口复用。
+        当卡片空列表时直接置 0（卡片可见性由 _filtered_items 控制，调用方负责）。
+
+        顶部描述 tooltip 已改为「悬浮气泡」（独立顶层窗口，见 _desc_tooltip_label），
+        不在卡片布局内，因此不占用卡片高度预算——无论描述多长，命令列表始终拥有
+        完整可用空间。矮窗口自适应仅压缩列表可见项数量（剩余项在滚动区滚动）。
+        detail 模式由 _adjust_detail_height 控制高度，此处不干预。
+        """
+        item_count = len(self._item_widgets)
+        divider_count = len(self._dividers)
+        total_items = item_count + divider_count
+        if total_items == 0:
+            self.setFixedHeight(0)
+            return
+        if self._detail_mode:
+            return
+
+        visible = min(total_items, MAX_VISIBLE_ITEMS)
+        natural = visible * ITEM_HEIGHT + divider_count * 1
+
+        budget = self._available_card_budget()
+        if natural <= budget:
+            # 正常/高窗口：完整展示至多 MAX_VISIBLE_ITEMS 项
+            self.setFixedHeight(natural)
+            self._sync_desc_tooltip_position()
+            return
+
+        # ── 矮窗口自适应压缩：仅压缩可见项数量 ──
+        visible_fit = max(
+            CARD_MIN_VISIBLE_ITEMS,
+            min(total_items, MAX_VISIBLE_ITEMS, budget // ITEM_HEIGHT),
+        )
+        self.setFixedHeight(visible_fit * ITEM_HEIGHT + divider_count * 1)
+        self._sync_desc_tooltip_position()
+
+    def _update_value_desc_tooltip(self):
+        """值选择模式（枚举值列表）：最上方 tooltip 显示当前选中枚举值的描述
+
+        复用列表模式的悬浮气泡系统（_desc_tooltip_label）：气泡独立顶层窗口，
+        浮在卡片上方，不占布局高度；无描述（或空描述）时隐藏，与列表模式一致。
+        """
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is None:
+            return
+        desc = ""
+        if 0 <= self._selected_value_index < len(self._value_widgets):
+            w = self._value_widgets[self._selected_value_index]
+            desc = getattr(w, "description", "") or ""
+        desc = (desc or "").strip()
+        if not desc:
+            self._has_tooltip_text = False
+            lbl.setVisible(False)
+            return
+        safe = html.escape(desc)
+        # 同 _update_desc_tooltip：强制 RichText，避免 AutoText 将纯文本实体
+        # （&quot; 等）判定为 PlainText 而字面显示
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setText(safe)
+        self._has_tooltip_text = True
+        # 先定位再显示，避免 tooltip 在错误位置闪现；卡片未布局时延迟
+        if self.width() <= 0:
+            lbl.setVisible(False)
+            QTimer.singleShot(0, self._update_desc_tooltip)
+            return
+        self._position_desc_tooltip()
+        lbl.setVisible(True)
+
+    def _sync_desc_tooltip_position(self):
+        """卡片几何变化（高度/位置）后，将悬浮气泡重新锚定到卡片上方
+
+        气泡以卡片顶边为锚点，卡片底部固定、高度变化时顶边随之移动，
+        因此需要同步重定位，避免气泡悬空或覆盖卡片。
+        """
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is not None and lbl.isVisible():
+            self._position_desc_tooltip()
+
+    def _available_card_budget(self) -> int:
+        """命令卡片在矮窗口下允许占用的最大高度（px）
+
+        预算 = 顶层窗口高度 - 输入区实际高度 - 工具栏/最小聊天区预留。
+        仅在自然高度超过预算时进入压缩（见 _apply_list_height）。
+        无窗口环境（单元测试构造的无父 CommandCard）返回极大值，即不约束——
+        保持与旧行为一致，确保现有高度测试不受影响。
+        """
+        top = self.window()
+        if top is None or top.height() <= 0:
+            return 16777215
+        reserve = CARD_RESIZE_RESERVE
+        # 输入区实际高度（_input_card 在 _bottom_input_container 内，可能随内容增高）
+        p = self.parent()
+        if p is not None:
+            inp = p.findChild(QWidget, "_input_card")
+            if inp is not None:
+                reserve += inp.height()
+        budget = top.height() - reserve
+        return max(CARD_MIN_HEIGHT, budget)
+
+
     # ---- Detail 模式 ----
 
     @property
@@ -785,6 +1278,118 @@ class CommandCard(QWidget):
 
         # 动态计算高度
         self._adjust_detail_height()
+
+
+    def _ensure_parent_move_hook(self):
+        """给父控件安装一次性 move 事件过滤器
+
+        父控件（BottomCardContainer）移动时，CommandCard 作为子控件
+        其 screen 位置也会改变，但 card 自身的 moveEvent 不会触发
+        （因为 card 在父控件内的相对位置未变），导致悬浮气泡留在错误位置。
+        此处监听父控件的 move 事件，同步重定位气泡。
+        """
+        if self._parent_move_hooked:
+            return
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        parent.installEventFilter(self)
+        self._parent_move_hooked = True
+
+    def _ensure_window_resize_hook(self):
+        """给顶层窗口安装一次性的 resize 事件过滤器，窗口高度变化时按预算重算卡片高度"""
+        if self._window_resize_hooked:
+            return
+        top = self.window()
+        if top is None:
+            return
+        top.installEventFilter(self)
+        self._window_resize_hooked = True
+        # 同时安装父控件 move 钩子（两者独立，互不干扰）
+        self._ensure_parent_move_hook()
+
+    def eventFilter(self, obj, event):
+        """监听顶层窗口 resize / move 以及父控件 move：
+
+        - window resize：高度/宽度变化（卡片自身收不到的窗口级 resize）时按最新预算
+          重算卡片高度，并重定位悬浮气泡，保证矮窗口压缩/放宽实时生效。
+        - window move：窗口被拖动时，悬浮气泡（独立顶层窗口）需同步跟随重定位。
+        - parent move：父控件移动导致卡片 screen 位置变化时，重定位气泡。
+        """
+        # 父控件移动 → 只需重定位悬浮气泡（卡片高度/预算不受影响）
+        parent = self.parentWidget()
+        if obj is parent and event.type() == QEvent.Move:
+            self._sync_desc_tooltip_position()
+            return False
+        if obj is self.window() and event.type() in (QEvent.Resize, QEvent.Move):
+            if self._resize_recompute_timer is None:
+                self._resize_recompute_timer = QTimer(self)
+                self._resize_recompute_timer.setSingleShot(True)
+                self._resize_recompute_timer.setInterval(0)
+                self._resize_recompute_timer.timeout.connect(self._on_window_geom_changed)
+            self._resize_recompute_timer.start()
+            return False
+        return super().eventFilter(obj, event)
+
+    def _on_window_geom_changed(self):
+        """窗口尺寸/位置变化后的统一处理：重算卡片高度 + 重定位悬浮气泡"""
+        self._apply_list_height()
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is not None and lbl.isVisible():
+            self._position_desc_tooltip()
+
+    def moveEvent(self, event):
+        """卡片因布局（如底部锚定、高度变化）移动时，将悬浮气泡重新锚定到卡片上方"""
+        super().moveEvent(event)
+        self._sync_desc_tooltip_position()
+
+    def showEvent(self, event):
+        """卡片显示时同步 _visible 标志位
+
+        当 CardManager 或其他外部代码直接调用 setVisible(True) 时，
+        _visible 应当反映 widget 的实际可见性。此方法确保两者一致。
+        """
+        super().showEvent(event)
+        self._visible = True
+
+    def hideEvent(self, event):
+        """卡片隐藏时同步 _visible 标志位并隐藏悬浮气泡
+
+        当 CardManager 或其他外部代码直接调用 setVisible(False) 时，
+        _visible 会被正确置为 False，避免 refresh_if_visible 误以为
+        卡片仍可见而去刷新数据但不显示卡片。
+        """
+        super().hideEvent(event)
+        self._visible = False
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is not None:
+            lbl.hide()
+
+    def resizeEvent(self, event):
+        """卡片宽度变化（或首帧布局）时，重算并定位悬浮描述气泡 + 刷新卡片总高度。
+
+        悬浮气泡是独立顶层窗口、按宽度换行的 QLabel。若卡片宽度改变
+        （如窗口缩放）而气泡高度未同步，换行行数会变但高度不变，
+        导致文字被裁切（首行也可能只显示半截）。此处按宽度变化重算并定位。
+        窗口纯高度变化（宽度不变，卡片自身收不到 resizeEvent）由
+        eventFilter 监听顶层窗口 resize 处理。
+        仅当宽度真正变化时才重入气泡重算，避免 setFixedHeight 触发的
+        高度变化再次进入本方法形成自激。
+        """
+        super().resizeEvent(event)
+        self._ensure_window_resize_hook()
+        new_w = self.width()
+        if new_w == getattr(self, "_last_tip_width", -1):
+            return
+        self._last_tip_width = new_w
+        lbl = getattr(self, "_desc_tooltip_label", None)
+        if lbl is not None and lbl.isVisible():
+            # 宽度变化：重新测算气泡换行高度并定位（_position_desc_tooltip 内含重算）
+            self._position_desc_tooltip()
+        else:
+            # 气泡未显示：仍按新宽度/新预算重算卡片高度
+            self._apply_list_height()
+
 
     def _adjust_detail_height(self):
         """根据内容动态调整 detail 容器高度"""
@@ -981,6 +1586,105 @@ class CommandCard(QWidget):
 
         # 重算高度
         self._adjust_detail_height()
+
+
+    def _cursor_past_param_value(self, text: str, token_end: int, cursor_pos: int) -> bool:
+        """判断光标是否已越过参数值后的第一个空格（即离开此参数）
+
+        用于决定是否退出或跳过值选择模式。
+        注意：行尾空格（空格后无实质内容，用户刚打完值）**不算已离开**，
+        否则手打 `/subagent --model=gpt ` 会因末尾空格被误判为离开，
+        导致枚举列表永不弹出（与 Tab 选择路径行为不一致）。
+        只有空格后还有其它内容且光标越过该空格时才判定为离开。
+
+        参数值在末尾（无空格）或紧跟另一参数名时，
+        cursor_pos 不会 > space_after，不会误判为"已离开"。
+        """
+        if cursor_pos < 0:
+            return False
+        space_after = text.find(" ", token_end)
+        if space_after < 0:
+            return False
+        # 行尾空格（空格后只剩空白，用户刚打完值）：不算已离开，
+        # 与 Tab 路径（_execute_param_selection → _switch_to_value_selection）对齐
+        if not text[space_after + 1 :].strip():
+            return False
+        return cursor_pos > space_after
+
+    def _extract_value_query(self, text: str, after_token_end: int, cursor_pos: int) -> str:
+        """提取 value 参数 = 之后到光标前/下一个空格前的子串作为搜索关键字"""
+        if cursor_pos < 0 or cursor_pos > len(text):
+            cursor_pos = len(text)
+        # 右边界 = min(光标, 下一个空格)
+        right = cursor_pos
+        space_pos = text.find(" ", after_token_end)
+        if space_pos >= 0 and space_pos < right:
+            right = space_pos
+        return text[after_token_end:right].lower()
+
+    def _extract_param_filter(self, full_text: str) -> str:
+        """从输入文本提取用户当前正在输入的部分参数名
+
+        用于参数列表过滤：当用户在输入框中输入 `--q` 时，
+        参数列表只显示以 `--q` 开头的参数（如 --quick）。
+
+        规则：
+        - 如果不是 detail 模式或没有命令名 → 返回空
+        - 提取命令名后的文本，取最后一个 --xxx 部分
+        - 包含 = → 已进入值选择模式，不过滤
+        - 末尾空格 → 刚完成一个参数，不过滤
+        - -- 后至少有一个字符才过滤
+
+        Returns:
+            过滤前缀（如 "--q"），空字符串表示不应用过滤
+        """
+        if not full_text or not self._detail_cmd_name:
+            return ""
+
+        cmd_prefix = f"/{self._detail_cmd_name} "
+        idx = full_text.find(cmd_prefix)
+        if idx < 0:
+            return ""
+
+        after_cmd = full_text[idx + len(cmd_prefix) :]
+
+        # 包含 = → 在输入值列表，不过滤参数列表
+        if "=" in after_cmd:
+            return ""
+
+        # 末尾空格 → 刚完成一个参数
+        if after_cmd.endswith(" "):
+            return ""
+
+        # 取最后一个 --xxx 单词
+        import re
+
+        tokens = re.findall(r"(?<!\S)(--[\w-]+)", after_cmd)
+        if not tokens:
+            return ""
+
+        last = tokens[-1]
+        # 至少 --x 三个字符
+        if len(last) < 3:
+            return ""
+
+        return last
+
+    def _matches_type_filter(item: Dict[str, Any], type_filter: Optional[set]) -> bool:
+        """判断 item 是否匹配类别过滤器集合
+
+        type_filter 为 None 或空时不过滤。
+        "ui" 不是 item.type 的字面值，而是映射到 type="command" 且 subtype="ui_plugin" 的 UI 插件命令。
+        """
+        if not type_filter:
+            return True
+        if item["type"] in type_filter:
+            return True
+        # 特殊处理：#ui 过滤 → 匹配 UI 插件命令
+        if "ui" in type_filter and item["type"] == "command" and item.get("subtype") == "ui_plugin":
+            return True
+        return False
+
 
     # ---- 自动检测 --model 触发值选择 / 实时搜索 ----
 
@@ -1547,6 +2251,56 @@ class CommandCard(QWidget):
             self._update_selection()
             self.select_current()
 
+
+    def _on_item_hovered(self, widget):
+        """鼠标悬停到 item → 同步选中索引
+
+        实现 hover 即选中：鼠标悬停到哪个 item，键盘导航的起始位置就跟随到哪。
+        tooltip 也会自动跟随（_update_selection 内部调用 _update_desc_tooltip）。
+        """
+        if self._detail_mode:
+            return  # detail 模式不处理列表 hover
+        try:
+            idx = self._item_widgets.index(widget)
+        except ValueError:
+            return
+        # 索引相同则跳过，避免不必要的重绘
+        if idx == self._selected_index:
+            return
+        self._selected_index = idx
+        self._update_selection()
+
+    def _on_param_hovered(self, widget):
+        """鼠标悬停到参数项 → 同步选中索引（仅在 detail 模式 + 参数列表可见时生效）
+
+        实现 hover 即选中：鼠标悬停到哪个参数，键盘导航的起始位置就跟随到哪。
+        若当前处于值选择模式，悬停参数项不打断值列表浏览（让用户先选完值）。
+        """
+        if not self._detail_mode or self._value_selection_mode:
+            return
+        try:
+            idx = self._param_widgets.index(widget)
+        except ValueError:
+            return
+        if idx == self._selected_param_index:
+            return
+        self._selected_param_index = idx
+        self._update_param_selection()
+
+    def _on_value_hovered(self, widget):
+        """鼠标悬停到值选择项 → 同步选中索引（仅在值选择模式生效）"""
+        if not self._value_selection_mode:
+            return
+        try:
+            idx = self._value_widgets.index(widget)
+        except ValueError:
+            return
+        if idx == self._selected_value_index:
+            return
+        self._selected_value_index = idx
+        self._update_value_selection()
+
+
     def _on_detail_clicked(self, event):
         """detail 模式点击 → 选中当前命令（携带 detail 选中类型）
 
@@ -1728,3 +2482,169 @@ class CommandCard(QWidget):
     @property
     def filtered_count(self) -> int:
         return len(self._filtered_items)
+
+
+    def refresh_style(self):
+        """响应主题切换：刷新 CommandCard 内所有主题相关的样式
+
+        覆盖范围：
+        - CommandCard 自身（背景 / 边框 / 圆角）
+        - detail 容器内的静态 widget（描述 / 位置参数提示 / 静态 hint）
+        - detail 滚动区（参数列表 + 值选择列表）
+        - 命令列表 widget（CommandItemWidget._apply_style）
+        - 参数列表 widget（ParameterItemWidget.refresh_style）
+        - 值选择列表项（按当前选中状态）
+        - 分隔线（如有，刷新颜色）
+        """
+        Colors.refresh()
+        # 1. CommandCard 自身
+        self._apply_self_style()
+        # 1.5 列表顶部描述 tooltip（主题感知）
+        self._apply_desc_tooltip_style()
+        # 2. detail 容器内的静态 widget
+        self._apply_detail_desc_style()
+        self._apply_detail_positional_hint_style()
+        self._apply_detail_hint_style()
+        # 3. detail 滚动区
+        if hasattr(self, "_detail_params_scroll") and self._detail_params_scroll is not None:
+            self._apply_scroll_area_styles(self._detail_params_scroll)
+        if hasattr(self, "_detail_value_scroll") and self._detail_value_scroll is not None:
+            self._apply_scroll_area_styles(self._detail_value_scroll)
+        # 4. 命令列表 widget（hover/selected 背景）
+        for w in list(self._item_widgets):
+            try:
+                w._apply_style()
+            except RuntimeError:
+                continue
+        # 5. 参数列表 widget（背景 + 子标签）
+        for w in list(self._param_widgets):
+            try:
+                w.refresh_style()
+            except RuntimeError:
+                continue
+        # 6. 值选择列表项（按当前选中状态）
+        for i, w in enumerate(self._value_widgets):
+            try:
+                w.set_selected(i == self._selected_value_index)
+            except RuntimeError:
+                continue
+        # 7. 分隔线列表
+        for div in list(self._dividers):
+            try:
+                div.setStyleSheet(f"background: {Colors.DIVIDER_COLOR}; border: none;")
+            except RuntimeError:
+                pass
+
+    def _apply_self_style(self):
+        """应用 CommandCard 自身的样式（背景/边框/圆角）。
+
+        抽出为独立方法以便主题切换时重新调用。
+        """
+        Colors.refresh()
+        self.setStyleSheet(f"""
+            CommandCard {{
+                background-color: {Colors.REALTIME_BG};
+                border: 1px solid {Colors.REALTIME_BORDER};
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+            }}
+        """)
+
+    def _apply_scroll_area_styles(self, scroll_area: "QScrollArea"):
+        """应用列表/参数/值三个滚动区的统一样式（滚动条 + viewport）
+
+        Args:
+            scroll_area: 目标 QScrollArea（_detail_params_scroll / _detail_value_scroll）
+        """
+        Colors.refresh()
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+{get_unified_scrollbar_style(4)}
+        """)
+        scroll_area.viewport().setStyleSheet("background: transparent; border: none;")
+
+    def _apply_detail_positional_hint_style(self):
+        """刷新 detail 模式位置参数提示标签的样式"""
+        Colors.refresh()
+        if not hasattr(self, "_detail_positional_hint") or self._detail_positional_hint is None:
+            return
+        self._detail_positional_hint.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_ACCENT};
+                {get_font_family_css()} {font_size_css(11)};
+                background: {Colors.DIVIDER_COLOR};
+                border-radius: 4px;
+                padding: 2px 8px;
+                margin: 0;
+            }}
+        """)
+
+    def _apply_detail_hint_style(self):
+        """刷新 detail 模式静态参数提示标签的样式"""
+        Colors.refresh()
+        if not hasattr(self, "_detail_hint_label") or self._detail_hint_label is None:
+            return
+        self._detail_hint_label.setStyleSheet(f"""
+            QLabel {{ color: {Colors.SEND_BTN_START}; {get_font_family_css()} {font_size_css(12)}; background: transparent; margin: 0; padding: 0; }}
+        """)
+
+    def refresh_if_visible(self):
+        """热重载后调用：仅在卡片可见时重建数据并刷新 UI
+
+        修复：原代码在插件热重载后强制调用 show_card(query)，会触发
+        _reset_detail_mode()，导致用户正在查看的 detail 模式参数提示突然
+        消失。本方法改为：
+        - 卡片不可见：仅标记 dirty，下次 show_card 自动重建
+        - 卡片可见且处于列表模式：重建数据 + load_items 保留当前过滤
+        - 卡片可见且处于 detail 模式：重建数据 + 刷新 detail 视图
+          （保留参数提示，仅更新命令元数据）
+
+        此外用 _current_query 而非 input_area.toPlainText()，避免
+        破坏当前过滤上下文。
+        """
+        if not self._visible:
+            # 卡片不可见：仅标记脏，下次 show_card 重建
+            self._cache_dirty = True
+            return
+        # 卡片可见：先标记缓存脏，确保 _refresh_data 跳过缓存重建
+        self._cache_dirty = True
+        self._refresh_data()
+        if self._detail_mode:
+            # detail 模式：重建 detail 视图（参数描述、参数列表）以反映命令变更
+            try:
+                self._refresh_detail_view()
+            except Exception:
+                # 重建失败时不破坏当前 detail 视图（避免参数提示消失）
+                logger.warning("[CommandCard] detail 视图重建失败，保持当前状态")
+            return
+        # 列表模式：用当前 query 重新加载（非增量以保证排序/分组准确）
+        self.load_items(self._current_query, incremental=False)
+        # 热重载后确保卡片可见：load_items 不会自动调用 setVisible，
+        # 若卡片因外部原因（如其他卡片互斥切换）被隐藏但 _visible 仍为 True，
+        # 新数据渲染后需显式恢复可见性。
+        if len(self._filtered_items) > 0:
+            self.setVisible(True)
+
+    def _refresh_detail_view(self):
+        """重建 detail 模式的参数视图（命令元数据变更后调用）
+
+        与 show_command_detail 不同：本方法强制重新渲染（即使 cmd_name 未变），
+        以反映热重载后的命令/参数描述变更。
+        保留 _current_query 和输入框上下文。
+        """
+        cmd_name = self._detail_cmd_name
+        if not cmd_name:
+            return
+        selected_type = self._detail_selected_type or ""
+        # 临时退出 detail 模式，绕过 show_command_detail 的"已在此命令则跳过"逻辑
+        # 然后立即重新进入，触发完整重建
+        # 注意：_reset_detail_mode 会清空 _detail_cmd_name，需要先备份
+        saved_cmd_name = self._detail_cmd_name
+        saved_selected_type = self._detail_selected_type
+        self._reset_detail_mode()
+        # 恢复 _detail_mode=False 已被 _reset_detail_mode 设置，
+        # show_command_detail 会重新设置 _detail_mode=True
+        self.show_command_detail(saved_cmd_name, saved_selected_type)
+

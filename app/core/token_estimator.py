@@ -424,3 +424,152 @@ def get_default_counter(model: str = "gpt-4") -> TokenCounter:
     if _default_counter is None or _default_counter.model != model:
         _default_counter = TokenCounter(model)
     return _default_counter
+
+# ===== P2 补齐（从原项目同步）=====
+
+def _compute_message_tokens(msg: Dict, model: str) -> int:
+    """计算单条消息的 token（不含模型校正系数）
+
+    内部辅助：从原 count_messages_tokens 循环体抽出，便于：
+    1. 公共 API per_message_tokens() 单条计算时复用
+    2. count_messages_tokens() 列表循环累加时复用，避免代码重复
+
+    算法与原 count_messages_tokens 内联循环完全一致（4 overhead + role +
+    content + reasoning + tool_calls + tool_call_id），返回未应用 ratio 的 raw 值。
+    """
+    if not isinstance(msg, dict):
+        return 0
+
+    total = 4  # 单条消息的 overhead（与原 len(messages) * 4 一致）
+
+    role = msg.get("role", "")
+    if role:
+        total += estimate_tokens(str(role), model)
+
+    # content 处理
+    content = msg.get("content")
+    if content is None:
+        pass  # 无 content，跳过
+    elif isinstance(content, str):
+        if content:  # 确保非空字符串
+            total += estimate_tokens(content, model)
+    elif isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                text = item.get("text", "")
+                if text:
+                    total += estimate_tokens(text, model)
+            elif item.get("type") == "image_url":
+                # 图片 token 估算 (简化版)
+                total += 85  # 图片基准开销
+
+    # reasoning_content 处理 (DeepSeek V4 / GLM-5 thinking mode)
+    reasoning = msg.get("reasoning_content")
+    if reasoning and isinstance(reasoning, str):
+        total += estimate_tokens(reasoning, model)
+
+    # tool_calls 处理
+    tool_calls = msg.get("tool_calls")
+    if tool_calls and isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            total += 3  # tool_call overhead
+            function = tool_call.get("function") or {}
+            name = function.get("name") if isinstance(function, dict) else ""
+            args = function.get("arguments") if isinstance(function, dict) else ""
+            if name:
+                total += estimate_tokens(str(name), model)
+            if args:
+                total += estimate_tokens(str(args), model)
+
+    # tool_call_id 处理
+    tool_call_id = msg.get("tool_call_id")
+    if tool_call_id:
+        total += estimate_tokens(str(tool_call_id), model)
+
+    return total
+
+
+
+def _get_model_token_ratio(model: str) -> float:
+    """获取模型 token 校正系数"""
+    model_lower = model.lower()
+    for key, ratio in _MODEL_TOKEN_RATIOS.items():
+        if key in model_lower:
+            return ratio
+    return _MODEL_TOKEN_RATIOS["default"]
+
+
+
+def _get_token_cache() -> list:
+    """获取 thread-local 的 is 列表缓存"""
+    cache = getattr(_token_count_cache_local, "cache", None)
+    if cache is None:
+        cache = []
+        _token_count_cache_local.cache = cache
+    return cache
+
+
+
+def _lookup_token_cache(messages: list, model: str, tools_sig: int) -> int | None:
+    """is 身份扫描；命中时返回缓存结果"""
+    for entry in _get_token_cache():
+        obj, m, ts, result = entry
+        if obj is messages and m == model and ts == tools_sig:
+            # 命中后移到末尾保活（LRU）
+            cache = _get_token_cache()
+            cache.remove(entry)
+            cache.append(entry)
+            return result
+    return None
+# ==========
+
+
+
+def _set_token_cache(messages: list, model: str, tools_sig: int, result: int):
+    """写入 is 列表缓存；超上限时逐出最旧条目"""
+    cache = _get_token_cache()
+    # 移除同一对象的旧条目（若有）
+    cache[:] = [e for e in cache if e[0] is not messages]
+    cache.append((messages, model, tools_sig, result))
+    if len(cache) > _MAX_TOKEN_CACHE_ENTRIES:
+        cache.pop(0)
+
+
+
+def get_model_token_ratio(model: str) -> float:
+    """获取模型 token 校正系数（公开接口）"""
+    return _get_model_token_ratio(model)
+
+
+
+def per_message_tokens(
+    msg: Dict,
+    model: str = "gpt-4",
+) -> int:
+    """计算单条消息的 token 数（与 count_messages_tokens([msg], model) 等价）
+
+    性能优化（O-01）：在循环中按角色累加 token 时使用本函数，避免：
+    1. 每次为单条消息构造临时 [msg] 列表（list 分配开销）
+    2. 触发 count_messages_tokens 的 is 身份缓存必然 MISS（[msg] 是新列表）
+
+    旧实现场景：UI 上下文快照 100 条消息 → ~102 次 count_messages_tokens 调用
+    新实现：单次扫描 + 直接累加，~N+1 次 per_message_tokens 调用但无 list 分配/缓存查找
+
+    Args:
+        msg: 消息字典
+        model: 模型名称
+
+    Returns:
+        token 数（最小 0，含消息 overhead + 模型校正系数）
+    """
+    raw = _compute_message_tokens(msg, model)
+    if raw <= 0:
+        return 0
+    total = int(raw * _get_model_token_ratio(model))
+    return max(0, total)
+
+

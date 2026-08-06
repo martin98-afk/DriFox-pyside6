@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 余额显示组件 - 支持 DeepSeek 和 SiliconFlow
-"""
-import requests
-from typing import Optional
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel
-from PySide6.QtGui import QColor
-from app.utils.utils import get_font_family_css
-from app.utils.design_tokens import scale_font_size
 
+用量聚合（T6）：余额查询逻辑迁移至 app/core/usage_service.py 进程级单例，
+本组件只负责显示——set_provider 仅更新显示状态，请求/缓存/轮询由
+UsageService 统一驱动，结果经 balance_ready 信号广播回来。
+"""
+
+from typing import Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+
+from app.utils.design_tokens import scale_font_size
+from app.utils.utils import get_font_family_css
 
 # 支持余额查询的服务商及其接口
 BALANCE_APIS = {
@@ -30,8 +34,8 @@ SUPPORTED_PROVIDERS = list(BALANCE_APIS.keys())
 
 
 class BalanceDisplay(QWidget):
-    """余额显示组件"""
-    
+    """余额显示组件（显示层，请求委托 UsageService 全局单例）"""
+
     # 信号：当余额更新时发出
     balance_updated = Signal(float, str)  # balance, currency
 
@@ -41,18 +45,19 @@ class BalanceDisplay(QWidget):
         self._currency = "¥"
         self._loading = False
         self._current_provider = ""
-        
+        self._current_config_id = ""  # 当前显示结果对应的 config_id（竞态校验）
+
         # 布局：图标 + 金额
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(4)
         layout.setAlignment(Qt.AlignVCenter)
-        
+
         # 余额图标
         self._icon_label = QLabel("💰", self)
         self._icon_label.setFixedWidth(16)
         self._icon_label.setAlignment(Qt.AlignCenter)
-        
+
         # 金额标签
         self._balance_label = QLabel("", self)
         self._balance_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -66,118 +71,83 @@ class BalanceDisplay(QWidget):
                 padding: 0px;
             }}
         """)
-        
+
         layout.addWidget(self._icon_label)
         layout.addWidget(self._balance_label)
-        
+
         # 初始隐藏
         self.setVisible(False)
         self.setFixedHeight(20)
-        
-        # 定时器用于延迟加载
-        self._load_timer = QTimer(self)
-        self._load_timer.setSingleShot(True)
-        self._load_timer.timeout.connect(self._do_fetch_balance)
-        
+
+        # ★ 用量聚合（T6）：余额结果由进程级单例 UsageService 广播
+        # （缓存命中 / 后台抓取结果均经此信号），本组件只负责消费显示。
+        # UsageService 只存 config 快照不持窗口引用；本连接随组件销毁自动断开。
+        from app.core.usage_service import UsageService
+
+        UsageService.get_instance().balance_ready.connect(self.show_balance_result)
+
         self.setToolTip("余额查询")
 
-    def set_provider(self, provider_name: str, api_key: Optional[str] = None, api_url: Optional[str] = None):
-        """设置当前服务商并加载余额"""
-        # 先停止之前的定时器，避免显示混乱
-        self._load_timer.stop()
-        
+    def set_provider(self, provider_name: str, config_id: str = ""):
+        """设置当前服务商（仅更新显示状态；请求由 UsageService 统一驱动）
+
+        Args:
+            provider_name: 真实服务商名（白名单判断）
+            config_id: 当前配置 ID（UUID，用于结果竞态校验）
+        """
         # 如果不是支持的服务商，隐藏组件
         if provider_name not in SUPPORTED_PROVIDERS:
             self.setVisible(False)
             self._balance = None
             self._current_provider = ""
+            self._current_config_id = ""
             return
-        
-        api_key = api_key or ""
-        if not api_key:
-            self.setVisible(False)
-            self._balance = None
-            self._current_provider = ""
-            self.setToolTip("未配置 API Key")
-            return
-        
-        # 立即显示加载状态
+
+        # 立即显示加载状态（具体余额结果由 balance_ready 广播带回）
+        self._current_provider = provider_name
+        self._current_config_id = config_id
         self._balance_label.setText("...")
         self._icon_label.setText("⏳")
         self.setVisible(True)
-        
-        # 延迟加载，避免频繁切换时多次请求
-        self._current_provider = provider_name
-        self._provider_name = provider_name
-        self._api_key = api_key
-        self._load_timer.start(200)  # 200ms 延迟
-        
+
     def refresh(self):
-        """手动刷新余额（对话完成后调用）"""
+        """手动刷新余额（对话完成后调用）— 请求由 UsageService 单例统一驱动
+
+        仅恢复加载态显示；实际重新拉取由 main_widget._refresh_balance →
+        UsageService.request_balance 触发（TTL 内命中缓存，过期重拉）。
+        """
         if self._current_provider:
-            # 先停止之前的请求
-            self._load_timer.stop()
-            # 立即显示加载状态
             self._balance_label.setText("...")
             self._icon_label.setText("⏳")
-            self._load_timer.start(100)  # 快速刷新
 
-    def _do_fetch_balance(self):
-        """实际执行余额查询"""
-        if not hasattr(self, "_provider_name") or not hasattr(self, "_api_key"):
+    def show_balance_result(self, provider_name: str, config_id: str, result):
+        """UsageService 广播的余额结果（主线程执行）。
+
+        过期结果（用户已切换服务商/配置）通过 config_id 校验直接忽略。
+        """
+        # 过期结果（用户已切换服务商）直接忽略
+        if config_id != self._current_config_id:
+            return
+        self._loading = False
+        self._icon_label.setText("💰")
+
+        if not result or result.get("hide"):
+            self.setVisible(False)
+            if result and result.get("tooltip"):
+                self.setToolTip(result["tooltip"])
             return
 
-        provider_name = self._provider_name
-        api_key = self._api_key
-
-        config = BALANCE_APIS.get(provider_name)
-        if not config:
-            self.setVisible(False)
-            return
-
-        self._loading = True
-        self._balance_label.setText("...")
-        self._icon_label.setText("⏳")
-        self.setVisible(True)
-
-        try:
-            headers = {"Authorization": f"Bearer {api_key}"}
-            response = requests.get(config["url"], headers=headers, timeout=10)
-
-            if response.status_code == 200:
-                data = response.json()
-                balance = self._extract_balance(data, config)
-                if balance is not None:
-                    self._balance = float(balance)
-                    self._currency = config["currency"]
-                    self._update_display()
-                    self.setToolTip(f"{provider_name} 余额")
-                    self.balance_updated.emit(self._balance, self._currency)
-                else:
-                    self.setVisible(False)
-                    self.setToolTip("获取余额失败")
-            else:
-                self.setVisible(False)
-                self.setToolTip(f"余额查询失败 (HTTP {response.status_code})")
-
-        except requests.exceptions.Timeout:
-            self.setVisible(False)
-            self.setToolTip("余额查询超时")
-        except requests.exceptions.ConnectionError:
-            self.setVisible(False)
-            self.setToolTip("连接失败")
-        except Exception as e:
-            self.setVisible(False)
-            self.setToolTip(f"余额查询异常: {str(e)}")
-        finally:
-            self._loading = False
-            self._icon_label.setText("💰")
+        self._balance = result["balance"]
+        self._currency = result["currency"]
+        self._update_display()
+        self.setToolTip(f"{result['provider']} 余额")
+        self.balance_updated.emit(self._balance, self._currency)
 
     def _extract_balance(self, data: dict, config: dict) -> Optional[float]:
         """从响应数据中提取余额"""
         try:
             balance_key = config["balance_key"]
-            
+
             if balance_key == "total_balance":
                 # DeepSeek: {"balance_infos": [{"total_balance": "0.92", ...}]}
                 balance_infos = data.get("balance_infos", [])
@@ -203,24 +173,22 @@ class BalanceDisplay(QWidget):
 
         balance = self._balance
         color = "#5aa9ff"  # 默认蓝色
-        
+
         # 根据余额大小设置颜色
         if balance < 0:
             # 欠费或余额为负 - 红色
             color = "#ff6b6b"
-            display_text = f"{self._currency}{balance:.2f}"
         elif balance < 1:
-            # 小余额，显示更多小数 - 黄色警告
+            # 小余额 - 黄色警告
             color = "#f6c453"
-            display_text = f"{self._currency}{balance:.3f}"
         elif balance < 10:
             # 低于10元 - 橙色
             color = "#ff9f43"
-            display_text = f"{self._currency}{balance:.2f}"
         else:
             # 正常余额 - 蓝色
             color = "#5aa9ff"
-            display_text = f"{self._currency}{balance:.2f}"
+        # 统一保留 1 位小数
+        display_text = f"{self._currency}{balance:.1f}"
 
         self._balance_label.setStyleSheet(f"""
             QLabel {{
@@ -240,5 +208,6 @@ class BalanceDisplay(QWidget):
         self._balance = None
         self._balance_label.setText("")
         self._current_provider = ""
+        self._current_config_id = ""
         self.setVisible(False)
         self.setToolTip("余额查询")

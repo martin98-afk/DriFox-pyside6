@@ -31,6 +31,90 @@ from app.utils.utils import get_app_data_dir
 # 支持的图片扩展名
 _IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
 
+# Auto-compact 防重复触发冷却（秒）
+_AUTO_COMPACT_COOLDOWN = 30.0
+
+
+def _event_to_tag(event_name: str) -> str:
+    """将事件名转换为 Claude Code 兼容的 kebab-case 标签
+
+    例:
+        UserPromptSubmit → user-prompt-submit
+        PreUserMessage   → pre-user-message
+        PreToolUse       → pre-tool-use
+        PostToolUse      → post-tool-use
+        SessionStart     → session-start
+        Stop             → stop
+    """
+    # PascalCase / camelCase → kebab-case
+    kebab = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", event_name)
+    kebab = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", kebab)
+    return kebab.lower()
+
+
+def _format_hook_output(
+    event_name: str,
+    output: str,
+    status_message: str = "",
+    wrap_system_reminder: bool = True,
+) -> str:
+    """格式化 hook 输出为 Claude Code 兼容的 XML 标签格式
+
+    当 wrap_system_reminder=True（默认）：
+        外层: <system-reminder>...</system-reminder>
+        内层: <{kebab-case-event}-hook>...</{kebab-case-event}-hook>
+    当 wrap_system_reminder=False：
+        仅输出内层: <{kebab-case-event}-hook>...</{kebab-case-event}-hook>
+
+    当传入 status_message 时，在 <system-reminder> 和 <xxx-hook> 之间以纯文本形式插入状态描述。
+
+    与 Claude Code 实际格式对齐：
+    - <system-reminder> 是 Claude Code 通用系统注入容器
+    - <user-prompt-submit-hook> 等是 Claude Code 提示词中明说的 hook 反馈标签
+
+    🛡️ Stop 事件注入防幻觉：在消息末尾添加明确的「等待用户回复」指令，
+    避免 LLM 将 hook 注入的消息误认为用户已确认/同意，导致跳过确认环节。
+    """
+    tag = _event_to_tag(event_name)
+    parts: list[str] = []
+    if wrap_system_reminder:
+        parts.append("<system-reminder>")
+        if status_message:
+            parts.append(status_message)
+    parts.append(f"<{tag}-hook>")
+    parts.append(output)
+    parts.append(f"</{tag}-hook>")
+    if wrap_system_reminder:
+        # 🛡️ Stop 事件：追加「等待用户回复」指令，防止 LLM 将 hook 注入消息
+        # 误认为用户已确认。该标记在 <system-reminder> 内部，LLM 可见但明确
+        # 告知其系统身份，不污染用户消息流。
+        if event_name == "Stop":
+            parts.append("以上是系统自动注入的辅助信息，不是用户的输入。")
+        parts.append("</system-reminder>")
+    return "\n".join(parts)
+
+
+def _make_hook_message(event_name: str, output: str, status_message: str = "") -> Dict[str, Any]:
+    """构建一条 hook 消息 dict（带 _hook_event 标记和 timestamp）"""
+    import datetime as _dt
+    return {
+        "role": "user",
+        "content": _format_hook_output(event_name, output, status_message),
+        "_hook_event": event_name,
+        "timestamp": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _inject_hook_to_session(session, event_name: str, output: str, status_message: str = ""):
+    """将 hook 输出追加到 session.messages（只追加不删除，保证历史稳定）"""
+    if not session:
+        return
+    if not output or not output.strip():
+        return
+    msg = _make_hook_message(event_name, output, status_message)
+    session.messages.append(msg)
+    session._update_timestamp()
+
 
 def _extract_markdown_images(content: str) -> tuple[str, list[str]]:
     """
@@ -78,6 +162,8 @@ class ChatBackend(QObject):
     
     # 消息相关
     message_received = Signal(dict)  # 新消息
+    # 内部信号：hook 回调添加消息后触发 UI 刷新（跨线程安全）
+    _hook_messages_updated = Signal()
     stream_started = Signal()
     stream_chunk = Signal(str)  # 流式内容片段
     stream_finished = Signal(dict)  # 完成时的消息
@@ -92,7 +178,10 @@ class ChatBackend(QObject):
     
     # 错误
     error_occurred = Signal(str)
-    
+
+    # Auto-compact 请求（由 tool_executor 在 PostToolUse hook 中检测阈值触发）
+    auto_compact_requested = Signal(float)  # ratio
+
     # 上下文
     context_updated = Signal(int, int)  # token_count, limit
     
@@ -106,6 +195,8 @@ class ChatBackend(QObject):
     plugin_changed = Signal(dict)  # {"agents": int, "commands": bool, "themes": bool}
     # 后台线程请求主线程执行插件重载（内部信号）
     _hot_reload_requested = Signal(str, str)  # (插件名, 组件), ""=全量/空组件=全部组件
+    # _watch_loop 检测到新插件时，用此 sentinel 作为 plugin_name 标记走增量加载路径
+    _NEW_PLUGIN_SENTINEL = "__NEW__"
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -130,11 +221,24 @@ class ChatBackend(QObject):
         
         # 状态
         self._initialized = False
+
+        # 窗口标识（用于 per-window 隔离，如 hook 预设）
+        self._window_id: str = ""
+        
+        # per-window 工具权限控制器（由 main_widget 在 initialize 之前注入）
+        self._tool_permission_controller = None
+
+        # Auto-compact 防重复触发时间戳
+        self._last_auto_compact_time = 0.0
         
         # Gateway 组件
         self._gateway_manager = None
         self._gateway_engine: Optional[GatewayEngine] = None
         self._gateway_initialized = False
+
+        # ★ T3 修复：注册为活跃实例（插件热更新 plugin_changed 广播目标）。
+        # cleanup() 中移除，避免已关闭窗口的 backend 被广播（防泄漏）。
+        ChatBackend._active_instances.add(self)
     
     # ========== 属性访问 ==========
 
@@ -153,6 +257,37 @@ class ChatBackend(QObject):
     @property
     def tool_executor(self) -> ToolExecutor:
         return self._tool_executor
+
+    @property
+    def tool_permission_controller(self):
+        """per-window 工具权限控制器（主窗口注入,供 engine 读取）"""
+        return self._tool_permission_controller
+
+    def set_tool_permission_controller(self, controller):
+        """注入 per-window 工具权限控制器(必须在 initialize 之前调用)"""
+        self._tool_permission_controller = controller
+
+    def request_auto_compact(self, ratio: float):
+        """请求自动上下文压缩（带冷却防抖）
+
+        tool_executor 的 PostToolUse hook 检测到上下文使用比例超过阈值时，
+        调用此方法发射 auto_compact_requested 信号。
+        主窗口收到信号后触发 /compact --clear。
+
+        Args:
+            ratio: 当前 token 使用比例 (0.0 ~ 1.0)
+        """
+        now = time.time()
+        if now - self._last_auto_compact_time < _AUTO_COMPACT_COOLDOWN:
+            logger.info(
+                f"[ChatBackend] Auto-compact 触发被冷却抑制 "
+                f"(ratio={ratio:.1%}, 距上次={now - self._last_auto_compact_time:.0f}s)"
+            )
+            return
+        self._last_auto_compact_time = now
+
+        logger.info(f"[ChatBackend] Auto-compact 触发 (ratio={ratio:.1%})")
+        self.auto_compact_requested.emit(ratio)
     
     @property
     def agent_manager(self) -> AgentManager:
@@ -400,6 +535,32 @@ class ChatBackend(QObject):
         """
         self._subagent_model_resolver = resolver
 
+    def _on_hook_messages_changed(self):
+        """槽：hook 消息已添加到 session，通知 UI 刷新消息列表
+
+        通过 _hook_messages_updated 信号连接（跨线程安全），
+        确保在 hook 后台线程执行完毕后，UI 能及时显示 hook 输出。
+        """
+        if not getattr(self, "_ui_valid", True):
+            return
+
+        if not self._session_manager:
+            return
+
+        session = self.get_current_session()
+        if not session:
+            return
+
+        # 🛡️ 兜底：极少数遗留路径仍可能在注入之前 emit signal，
+        # 空消息触发 messages_updated 会让 UI 进入「等不到消息」状态。
+        # 直接跳过即可，调用方会在注入后再 emit 一次。
+        if not session.messages:
+            return
+
+        # 通知 UI 刷新消息列表
+        if self._chat_engine:
+            self._chat_engine._emit("messages_updated", list(session.messages))
+
     # ========== 插件系统初始化 ==========
 
     def _init_plugin_system(self):
@@ -439,6 +600,41 @@ class ChatBackend(QObject):
         except Exception as e:
             logger.error(f"[ChatBackend] PluginManager 初始化失败: {e}")
 
+    def _defer_non_critical_plugin_init(self, pm):
+        """非关键插件初始化：主题/LSP/热更新，延迟执行不阻塞 UI"""
+        # 使用 QTimer 延迟执行（backend 提供 _deferred_timer 供调用方关联到 Qt 事件循环）
+        from PySide6.QtCore import QTimer
+
+        def _do_deferred():
+            # 刷新主题
+            try:
+                self._reload_themes_from_plugins()
+            except Exception as e:
+                logger.error(f"[ChatBackend] 延迟主题刷新失败: {e}")
+
+            # 启动插件文件变更监听（热更新，仅启动一次）
+            try:
+                self._start_plugin_watcher()
+            except Exception as e:
+                logger.error(f"[ChatBackend] 延迟启动插件监听失败: {e}")
+
+            # 初始化 LSP 管理器（仅首次，多窗口共享单例）
+            # TODO(pyside6): 原项目用 get_lsp_manager() 工厂，pyside6 为 LspManager.get_instance()
+            try:
+                from app.core.lsp.lsp_manager import LspManager
+
+                lsp_mgr = LspManager.get_instance()
+                lsp_configs = pm.get_lsp_configs()
+                workdir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                lsp_mgr.initialize(workdir, lsp_configs)
+                logger.info(f"[ChatBackend] LspManager 延迟初始化完成，已注册 {len(getattr(lsp_mgr, '_clients', {}))} 个 LSP 服务器")
+                lsp_mgr.start_all_background()
+            except Exception as e:
+                logger.error(f"[ChatBackend] LSP 延迟初始化失败: {e}")
+
+        # 延迟 2 秒执行，让窗口首帧 + 用户交互先就绪
+        QTimer.singleShot(2000, _do_deferred)
+
     def _reload_themes_from_plugins(self):
         """插件系统初始化后，重新加载插件主题"""
         try:
@@ -455,9 +651,27 @@ class ChatBackend(QObject):
     # ========== 插件热更新（watchfiles） ==========
 
     _plugin_watcher_started = False  # 类级别标志，确保全局只启动一次
+    # ★ T3 修复：活跃 backend 实例集合（插件热更新广播目标）
+    # 根因：watcher 线程是类级单例（_plugin_watcher_started），只有首个启动
+    # watcher 的 backend 连接了 _hot_reload_requested → _on_hot_reload_requested
+    # 只 emit 该 backend 的 plugin_changed。宿主窗口关闭断开信号后，watcher
+    # 线程仍存活（其他窗口 refcount>0）、数据照常重载，但 emit 无接收者 →
+    # 所有窗口 UI 静默不刷新（全关重开才恢复）。
+    # 修复：_on_hot_reload_requested 广播到全部活跃 backend 的 plugin_changed。
+    _active_instances: set = set()  # ChatBackend 实例集合（__init__ 注册 / cleanup 移除）
+    # ★ 泄漏修复（P1）：watcher 闭包持有首个 backend 实例引用（self._hot_reload_requested /
+    # self.plugin_changed / self._identify_* 全部走实例成员），窗口关闭不停止则实例永不可回收。
+    # 用引用计数 + stop_event 实现"最后一个窗口关闭时停止 watcher"：
+    #   - refcount 在 _start_plugin_watcher 递增、cleanup 递减
+    #   - 归零时设置 stop_event → watch() 生成器退出 → 线程结束 → 闭包释放 → 实例可回收
+    #   - 新窗口启动时 refcount 从 0 递增会重新启动 watcher（stop_event 复位），热更新不丢失
+    _plugin_watcher_refcount = 0  # 活跃 backend 引用计数
+    _plugin_watcher_stop = None  # threading.Event：设置后 watch() 生成器退出
+    _plugin_watcher_thread = None  # 当前 watcher 线程（cleanup 归零时 join 确保退出）
 
     def _start_plugin_watcher(self):
-        """启动 watchfiles 插件文件变更监听（仅启动一次）"""
+        """启动 watchfiles 插件文件变更监听（引用计数 +1，首个 backend 启动）"""
+        ChatBackend._plugin_watcher_refcount += 1
         if ChatBackend._plugin_watcher_started:
             return
         ChatBackend._plugin_watcher_started = True
@@ -503,6 +717,11 @@ class ChatBackend(QObject):
 
         # 预计算插件路径 → 插件名映射（用于快速定位变更文件所属插件）
         plugin_prefixes = self._build_plugin_path_index()
+
+        # 上次全部窗口关闭后 stop_event 可能处于 set 状态（watch() 已退出），
+        # 此处重建新事件，支持 watcher 在下一个 backend 上重启（热更新不丢失）。
+        import threading as _threading
+        ChatBackend._plugin_watcher_stop = _threading.Event()
 
         import threading
 
@@ -570,6 +789,7 @@ class ChatBackend(QObject):
                     recursive=True,
                     debounce=2000,  # 2秒防抖
                     yield_on_timeout=False,
+                    stop_event=ChatBackend._plugin_watcher_stop,
                 ):
                     # changes: set of (Change, Path)
                     if not changes:
@@ -640,7 +860,35 @@ class ChatBackend(QObject):
                 logger.error(f"[ChatBackend] watchfiles 监听异常退出: {e}")
 
         t = threading.Thread(target=_watch_loop, daemon=True, name="plugin-watcher")
+        ChatBackend._plugin_watcher_thread = t
         t.start()
+
+    def _stop_plugin_watcher(self):
+        """backend 关闭时递减 watcher 引用计数；归零时停止 watchfiles 线程。
+
+        泄漏修复（P1）：watcher 闭包持有启动它的第一个 backend 实例引用
+        （self._hot_reload_requested / self.plugin_changed / self._identify_*），
+        若窗口关闭而线程不退出，该实例（及其整棵窗口对象树）永远无法被 GC。
+
+        - refcount > 0：仍有活跃窗口，维持 watcher（热更新继续工作）
+        - refcount == 0：设置 stop_event → watch() 生成器退出 → join 等待线程结束
+          → 闭包释放 → 首个 backend 实例可回收；同时复位标志，允许新窗口
+          重新启动 watcher（stop_event 在 _start_plugin_watcher 中重建），热更新不丢失。
+        """
+        ChatBackend._plugin_watcher_refcount = max(0, ChatBackend._plugin_watcher_refcount - 1)
+        if ChatBackend._plugin_watcher_refcount > 0:
+            return
+        stop = ChatBackend._plugin_watcher_stop
+        if stop is not None:
+            stop.set()
+        t = ChatBackend._plugin_watcher_thread
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=2.0)
+            except Exception:
+                pass
+        ChatBackend._plugin_watcher_thread = None
+        ChatBackend._plugin_watcher_started = False
 
     def _build_plugin_path_index(self) -> Dict[str, str]:
         """构建插件路径前缀 → 插件名的映射表
@@ -735,6 +983,93 @@ class ChatBackend(QObject):
                     return ROOT_FILE_COMPONENTS[first_seg]
         return ""
 
+    def _identify_all_affected_plugins(self, changes: list, plugin_prefixes: Dict[str, str]) -> set:
+        """从变更文件路径识别所有涉及的插件名集合
+
+        与 _identify_plugin_from_changes 共享路径匹配逻辑，但返回完整集合
+        而非在跨插件时返回 __ALL__。用于 watch_loop 在跨插件变更时
+        逐个插件增量重载。
+
+        Args:
+            changes: [(Change, path_str), ...]
+            plugin_prefixes: 插件路径 → 插件名 映射
+
+        Returns:
+            set[str]: 受影响的所有插件名集合
+        """
+        sorted_prefixes = sorted(plugin_prefixes.keys(), key=len, reverse=True)
+        found: set = set()
+        for _, change_path in changes:
+            cp = change_path.lower()
+            for prefix in sorted_prefixes:
+                if cp == prefix or cp.startswith(prefix + os.sep):
+                    found.add(plugin_prefixes[prefix])
+                    break
+        return found
+
+    # 组件优先级（用于在多组件批处理中决定先后顺序）
+    # agents 最先：它会影响 commands 和 hooks 同步
+    _COMPONENT_ORDER = {
+        "agents": 0,
+        "hooks": 1,
+        "commands": 2,
+        "themes": 3,
+        "skills": 4,
+        "mcp": 5,
+        "lsp": 6,
+        "ui": 7,
+    }
+
+    def _identify_all_components_from_changes(
+        self, changes: list, plugin_prefixes: Dict[str, str], plugin_name: str
+    ) -> set:
+        """从变更文件路径识别所有涉及的组件子目录（多组件批处理）
+
+        一次 watchfiles batch 中可能同时修改多个组件目录下的文件。
+        原 _identify_component_from_changes 只返回第一个组件，导致多组件
+        同时变更时只有一个被处理，其他被静默忽略，UI 不刷新。
+        本方法返回所有涉及的组件，让 watch_loop 拆分多次 emit。
+
+        Args:
+            changes: [(Change, path_str), ...]
+            plugin_prefixes: 插件路径 → 插件名 映射
+            plugin_name: 已识别出的插件名
+
+        Returns:
+            set[str]: 涉及的所有组件名；空 set 表示根目录/无法识别
+        """
+        # 找到该插件的路径前缀
+        plugin_path = None
+        for path, name in plugin_prefixes.items():
+            if name == plugin_name:
+                plugin_path = path
+                break
+        if not plugin_path:
+            return set()
+
+        KNOWN_COMPONENTS = {"agents", "hooks", "commands", "themes", "skills", "mcp", "lsp", "ui"}
+        # 插件根目录的关键文件 → 映射到对应组件
+        ROOT_FILE_COMPONENTS = {
+            ".mcp.json": "mcp",
+            ".lsp.json": "lsp",
+        }
+
+        components: set = set()
+        for _, change_path in changes:
+            cp = change_path.lower()
+            if cp == plugin_path:
+                continue  # 插件根目录本身变更，留给后续逻辑判断
+            if cp.startswith(plugin_path + os.sep):
+                rel = cp[len(plugin_path) + 1:]  # 去掉 "plugin_path\"
+                first_seg = rel.split(os.sep)[0] if os.sep in rel else rel
+                if first_seg in KNOWN_COMPONENTS:
+                    components.add(first_seg)
+                    continue
+                # 根目录的关键文件（如 .mcp.json）映射到对应组件
+                if first_seg in ROOT_FILE_COMPONENTS:
+                    components.add(ROOT_FILE_COMPONENTS[first_seg])
+        return components
+
     def _on_hot_reload_requested(self, plugin_name: str, component: str):
         """主线程中执行的插件热更新
 
@@ -748,6 +1083,20 @@ class ChatBackend(QObject):
             else:
                 result = self.reload_plugin_subsystems()
             self.plugin_changed.emit(result)
+
+            # ★ T3 修复：广播到所有活跃 backend 的 plugin_changed。
+            # watcher 由首个 backend 驱动，_on_hot_reload_requested 只在该实例的
+            # 槽上执行；若仅 emit 宿主实例的信号，宿主窗口关闭（信号断开）后其他
+            # 窗口的 UI 收不到刷新通知（热加载数据成功但列表不刷新）。广播后
+            # 每个活跃窗口的 backend 都通知自己的 UI 刷新。
+            for _b in list(ChatBackend._active_instances):
+                if _b is not self:
+                    # 窗口关闭竞态防护：backend 已 deleteLater 但未 cleanup 时
+                    # emit 可能触发 RuntimeError，跳过该实例不影响正常广播
+                    try:
+                        _b.plugin_changed.emit(result)
+                    except RuntimeError:
+                        pass
 
             # 重载完成后重建 watchfiles 路径索引，确保新注册的插件路径可被后续变更识别
             # 注意：不能提前重建（在 _watch_loop 的 else 分支），因为那时 pm.rescan() 还没执行
@@ -884,6 +1233,135 @@ class ChatBackend(QObject):
                        f"mcp={result['mcp']}")
         except Exception as e:
             logger.error(f"[ChatBackend] Failed to reload plugin '{plugin_name}': {e}")
+
+        return result
+
+    def _reload_new_plugin(self, plugin_name: str) -> dict:
+        """增量加载新增插件的所有组件，不重启已有子系统
+
+        与 _reload_single_plugin 的区别：
+        - 由 _watch_loop 检测到全新插件时调用（emit "__NEW__"）
+        - 只扫描这一个插件目录（避免全量 rescan）
+        - 只注册/启动该插件新增的 LSP 服务器（不碰已有的）
+        - 不触发全量 rescan 也就不触发全量 reload_plugin_subsystems
+
+        Args:
+            plugin_name: 新增插件名
+
+        Returns:
+            {"agents": int, "commands": bool, "hooks": bool, "themes": bool,
+             "skills": bool, "mcp": bool, "lsp": bool, "ui": bool}
+        """
+        result: dict = {
+            "agents": 0,
+            "commands": False,
+            "hooks": False,
+            "themes": False,
+            "skills": False,
+            "mcp": False,
+            "lsp": False,
+            "ui": False,
+        }
+
+        try:
+            from app.core.plugin_manager import PluginManager
+
+            pm = PluginManager.get_instance()
+            if not pm.is_initialized():
+                logger.warning("[ChatBackend] PluginManager not initialized, cannot reload")
+                return result
+
+            # 1. 只重新扫描这一个插件目录（不走全量 rescan）
+            pm.rescan_plugin(plugin_name)
+
+            plugin = pm.get_plugin(plugin_name)
+            if not plugin:
+                logger.warning(f"[ChatBackend] New plugin '{plugin_name}' not found after scan")
+                return result
+
+            comps = plugin.components
+            logger.info(f"[ChatBackend] 检测到新插件「{plugin_name}」，执行增量加载")
+
+            # 2. 智能体 + hooks
+            if comps.get("agents") and self._agent_manager:
+                result["agents"] = self._agent_manager.reload_plugin_agents(plugin_name)
+                result["hooks"] = True  # agents 组件包含 hooks 重载
+                # TODO(pyside6): 原项目用 reload_agent_commands()，pyside6 无此函数，
+                # 用等价的全量命令重载 reload_all_commands() 替代
+                try:
+                    from app.core.builtin_commands import reload_all_commands
+
+                    reload_all_commands()
+                    result["commands"] = True
+                except (ImportError, Exception) as e:
+                    logger.error(f"[ChatBackend] Failed to reload commands after agent change: {e}")
+
+            if comps.get("hooks") and not comps.get("agents") and self._agent_manager:
+                self._agent_manager.reload_plugin_hooks(plugin_name)
+                result["hooks"] = True
+
+            # 3. 命令
+            if comps.get("commands") and not result["commands"]:
+                try:
+                    from app.core.builtin_commands import reload_all_commands
+
+                    reload_all_commands()
+                    result["commands"] = True
+                except (ImportError, Exception) as e:
+                    logger.error(f"[ChatBackend] Failed to reload commands: {e}")
+
+            # 4. 主题
+            if comps.get("themes"):
+                try:
+                    from app.utils.config import update_theme_options
+                    from app.utils.theme_manager import theme_manager
+
+                    theme_manager.reload()
+                    update_theme_options()
+                    result["themes"] = True
+                except (ImportError, Exception) as e:
+                    logger.error(f"[ChatBackend] Failed to reload themes: {e}")
+
+            # 5. 技能 / MCP：懒加载，只需标记
+            # TODO(pyside6): 原项目此处调用 invalidate_skills_cache()，
+            # pyside6 无技能缓存（get_local_skills 懒加载），已省略
+            result["skills"] = bool(comps.get("skills"))
+            result["mcp"] = bool(comps.get("mcp"))
+
+            # 6. LSP：增量注册，不重启已有服务器
+            # TODO(pyside6): 原项目用 get_lsp_manager() 工厂，pyside6 为 LspManager.get_instance()
+            if comps.get("lsp"):
+                try:
+                    from app.core.lsp.lsp_manager import LspManager
+
+                    lsp_mgr = LspManager.get_instance()
+                    lsp_config = pm.get_plugin_lsp_config(plugin_name)
+                    if lsp_config:
+                        count = lsp_mgr.add_plugin_servers(plugin_name, lsp_config["config"])
+                        result["lsp"] = count > 0
+                    logger.info(f"[ChatBackend] Plugin '{plugin_name}' LSP 增量加载完成")
+                except Exception as e:
+                    logger.error(f"[ChatBackend] Plugin '{plugin_name}' LSP 增量加载失败: {e}")
+
+            # 7. UI 组件：增量加载，不重复加载已存在的插件
+            if comps.get("ui"):
+                try:
+                    from app.core.ui_plugin_registry import UIPluginRegistry
+
+                    UIPluginRegistry.get_instance().load_plugin(plugin_name, plugin.path)
+                    result["ui"] = True
+                    logger.info(f"[ChatBackend] Plugin '{plugin_name}' UI 组件已加载")
+                except Exception as e:
+                    logger.error(f"[ChatBackend] Plugin '{plugin_name}' UI 加载失败: {e}")
+
+            logger.info(
+                f"[ChatBackend] 新插件增量加载「{plugin_name}」完成: "
+                f"agents={result['agents']}, commands={result['commands']}, "
+                f"themes={result['themes']}, skills={result['skills']}, "
+                f"mcp={result['mcp']}, lsp={result['lsp']}, ui={result['ui']}"
+            )
+        except Exception as e:
+            logger.error(f"[ChatBackend] Failed to reload new plugin '{plugin_name}': {e}")
 
         return result
 
@@ -1151,7 +1629,17 @@ class ChatBackend(QObject):
         # 5. 清除 SessionManager（窗口独有的会话）
         self._session_manager = None
 
-        # 6. 清除 UI 有效性标志
+        # 6. 停止插件 watcher（引用计数归零时停止线程，释放闭包对首个 backend 的引用）
+        try:
+            self._stop_plugin_watcher()
+        except Exception as e:
+            logger.warning(f"[ChatBackend] cleanup plugin_watcher: {e}")
+
+        # ★ T3 修复：从活跃实例集合移除，已关闭窗口不再接收 plugin_changed 广播
+        # （类级集合持有多余引用也是泄漏源；broadcast 循环遍历时 discard 安全）。
+        ChatBackend._active_instances.discard(self)
+
+        # 7. 清除 UI 有效性标志
         self._ui_valid = False
 
         logger.info("[ChatBackend] 窗口资源清理完成")
@@ -1311,7 +1799,168 @@ class ChatBackend(QObject):
         return None
     
     # ========== 会话管理 ==========
-    
+
+    def build_memory_context_dict(self) -> Dict[str, Any]:
+        """构建 PreUserMessage hook 记忆上下文 — 预取条目记忆 + 关键文档
+
+        Returns:
+            包含条目记忆和关键文档的 dict
+        """
+        from pathlib import Path
+
+        ctx: Dict[str, Any] = {}
+        if not self._memory_manager:
+            return ctx
+
+        # 条目记忆
+        try:
+            entries = self._memory_manager.get_entry_memories(limit=100)
+            if entries:
+                ctx["entry_memories"] = [e.get("content", "") for e in entries]
+        except Exception:
+            pass
+
+        # 关键文档（含路径显示）
+        try:
+            wd_path = self._tool_executor.get_workdir() if self._tool_executor else ""
+            docs = self._memory_manager.get_key_documents(self._current_project)[:50]
+            if docs:
+                doc_items = []
+                for doc in docs:
+                    file_path = doc.get("file_path", "")
+                    file_name = doc.get("file_name", "")
+                    is_url = file_path and (file_path.startswith("http://") or file_path.startswith("https://"))
+                    is_wd = file_path == wd_path
+                    if not is_url and not is_wd and file_path and wd_path:
+                        try:
+                            display = str(Path(file_path).relative_to(Path(wd_path)))
+                        except ValueError:
+                            display = file_path
+                    elif is_url:
+                        display = file_path
+                    else:
+                        display = file_path
+                    doc_items.append(
+                        {
+                            "file_name": file_name,
+                            "display": display,
+                            "is_url": is_url,
+                            "is_wd": is_wd,
+                        }
+                    )
+                if doc_items:
+                    ctx["key_documents"] = doc_items
+        except Exception:
+            pass
+
+        return ctx
+
+    def _build_worktree_context_dict(self) -> Dict[str, Any]:
+        """构建 worktree + 路径使用建议上下文（PreUserMessage 每次触发时更新）
+
+        将原本在 SessionStart 中的动态内容（可能随分支切换变化）
+        移到 PreUserMessage，确保每次消息前都注入最新状态。
+
+        Returns:
+            包含 worktree 信息和路径建议的 dict（无项目时 project_root 为空字符串，
+            下游 hook 可据此跳过"项目根目录"显示而非把 os.getcwd() 误当项目根）
+        """
+        # 【修复】未设置项目工作目录时直接留空，不要回退到 os.getcwd()。
+        # 之前用 os.getcwd() 兜底，会让 hook（如 format_memory_context）把
+        # 当前进程工作目录误当成"项目根目录"显示出来，与"未配置就不显示"的设计不符。
+        project_root = self._tool_executor.get_workdir() if self._tool_executor else ""
+
+        ctx: Dict[str, Any] = {
+            "project_root": project_root,
+            "project_name": self._current_project or (os.path.basename(project_root) if project_root else ""),
+        }
+
+        # Worktree / git 分支信息（project_root 为空时 GitWorktreeDetector.get_repo_info 会返回 None）
+        try:
+            from app.utils.git_worktree import GitWorktreeDetector
+
+            if project_root:
+                repo_info = GitWorktreeDetector.get_repo_info(project_root)
+                if repo_info and repo_info.worktrees:
+                    ctx["worktree"] = {
+                        "repo_name": os.path.basename(repo_info.root),
+                        "current_branch": repo_info.current_branch,
+                        "workdir": project_root,
+                        "is_worktree": project_root != repo_info.root,
+                        "other_branches": [wt.branch for wt in repo_info.worktrees if not wt.is_current],
+                    }
+        except Exception:
+            pass
+
+        return ctx
+
+    def _build_session_context(self, state: str) -> Dict[str, Any]:
+        """构建 SessionStart hook 上下文 — 预取所有项目数据，hook 只做格式化
+
+        Args:
+            state: 会话状态（startup/resume/clear/compact）
+
+        Returns:
+            包含所有项目上下文数据的 dict
+        """
+        # 多窗口隔离：使用当前窗口的工作目录，不依赖进程级 os.getcwd()
+        # get_workdir() 返回 None 表示未设置根目录，统一用 "" 表示"无"
+        project_root = self._tool_executor.get_workdir() if self._tool_executor else ""
+        if project_root is None:
+            project_root = ""
+        ctx: Dict[str, Any] = {
+            "project_root": project_root,
+            "state": state,
+            "project_name": self._current_project or (os.path.basename(project_root) if project_root else ""),
+        }
+
+        # 团队模式：让 SessionStart hook 也能按 #team_member matcher 精确触发
+        # TODO(pyside6): 原项目用 chat_worker._check_team_member，pyside6 无此函数，
+        # 暂固定 False，团队 matcher 场景留待后续移植
+        try:
+            from app.core.workers.chat_worker import _check_team_member
+
+            ctx["is_team_member"] = _check_team_member(self)
+        except Exception:
+            ctx["is_team_member"] = False
+
+        # 当前窗口 ID：供团队上下文 hook 按成员定位角色（模板 agents 条目 → 角色描述）
+        ctx["window_id"] = getattr(self, "_window_id", "") or ""
+
+        # Worktree / git 分支信息（仅从缓存读取，由 _warm_git_cache 后台线程预热）
+        try:
+            from app.utils.git_worktree import GitWorktreeDetector
+
+            repo_info = GitWorktreeDetector._cache_get(GitWorktreeDetector._info_cache, project_root)
+            if repo_info and repo_info.worktrees:
+                ctx["worktree"] = {
+                    "repo_name": os.path.basename(repo_info.root),
+                    "current_branch": repo_info.current_branch,
+                    "workdir": project_root,
+                    "is_worktree": project_root != repo_info.root,
+                    "other_branches": [wt.branch for wt in repo_info.worktrees if not wt.is_current],
+                }
+        except Exception:
+            pass
+
+        return ctx
+
+    def _warm_git_cache(self, project_root: str):
+        """后台线程预热 git 缓存，避免 create_session 时同步执行 git 子进程（~1.1s）"""
+        if not project_root:
+            return
+        import threading
+
+        def _warm():
+            try:
+                from app.utils.git_worktree import GitWorktreeDetector
+
+                GitWorktreeDetector.get_repo_info(project_root)
+            except Exception:
+                pass
+
+        threading.Thread(target=_warm, daemon=True).start()
+
     def create_session(self, trigger_hook: bool = True) -> ChatSession:
         """创建新会话
         
@@ -1333,7 +1982,40 @@ class ChatBackend(QObject):
             )
         
         return session
-    
+
+    def trigger_session_event(self, state: str, extra_context: dict = None):
+        """触发 SessionStart hook，带会话状态
+
+        Args:
+            state: 会话状态，可选 startup/resume/clear/compact
+            extra_context: 额外上下文信息
+        """
+        if not self._hook_manager:
+            return
+        session = self.get_current_session()
+        ctx = self._build_session_context(state)
+        if session:
+            ctx["session_id"] = session.session_id  # Claude Code 兼容字段
+        if extra_context:
+            ctx.update(extra_context)
+        # TODO(pyside6): 原项目用 hook_manager._is_ui_thread() 决定 trigger_async，
+        # pyside6 无此函数；pyside6 trigger_event 默认 trigger_async=True 走后台
+        # 异步 + 回调回补，语义等价，直接采用默认异步
+        results = self._hook_manager.trigger_event(
+            "SessionStart",
+            context=ctx,
+            current_message="",
+        )
+        if session:
+            for r in results:
+                if r.success and r.output:
+                    # TODO(pyside6): 原项目 r.status_message，pyside6 HookExecutionResult
+                    # 无此字段，用 getattr 兜底
+                    _inject_hook_to_session(
+                        session, "SessionStart", r.output, getattr(r, "status_message", "")
+                    )
+            self._hook_messages_updated.emit()
+
     def get_current_session(self) -> Optional[ChatSession]:
         """获取当前会话"""
         return self._session_manager.get_current_session()

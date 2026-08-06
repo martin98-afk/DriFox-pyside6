@@ -435,6 +435,12 @@ class Settings(QConfig):
     llm_model_overrides = ConfigItem("LLM", "ModelOverrides", {})
     llm_selected_model = ConfigItem("LLM", "SelectedModel", "")
     llm_subagent_default_model = ConfigItem("LLM", "SubagentDefaultModel", "")
+    # 标题生成默认模型（用于 topic_summary，空字符串表示使用主模型）
+    llm_title_gen_default_model = ConfigItem("LLM", "TitleGenDefaultModel", "")
+    # 主智能体选择（单选，通过 inject_agent_identity hook 注入系统提示词）
+    llm_primary_agent = ConfigItem("LLM", "PrimaryAgent", "")
+    # 默认 OpenCode 免费配置是否已注入（防止用户删除后反复自动创建）
+    llm_default_opencode_injected = ConfigItem("LLM", "DefaultOpencodeInjected", False, BoolValidator())
     llm_enabled_skills = ConfigItem("LLM", "EnabledSkills", [
         "brainstorming", "writing-plans", "find-skills", "skill-creator", "git-commit", "minimax-image-understanding"
     ])
@@ -457,6 +463,25 @@ class Settings(QConfig):
         "UI", "ThemeStyle", "fallout",
         OptionsValidator(["fallout"]),
     )
+    ui_light_mode = ConfigItem("UI", "LightMode", True, BoolValidator())
+
+    # 工具区折叠显示（简洁模式）：工具调用/思考块集中在卡片顶部可滚动容器
+    ui_compact_tool_area = ConfigItem("UI", "CompactToolArea", True, BoolValidator())
+
+    # ========== 像素桌宠 ==========
+    pet_enabled = ConfigItem("UI", "PetEnabled", True, BoolValidator())
+    pet_size = OptionsConfigItem("UI", "PetSize", "small", OptionsValidator(["small", "medium", "large"]))
+
+    # ========== Tab 管理器 ==========
+    enable_tab_manager = ConfigItem("UI", "EnableTabManager", True, BoolValidator())
+    tab_panel_width = RangeConfigItem("UI", "TabPanelWidth", 250, RangeValidator(120, 500))
+    tab_panel_collapsed = ConfigItem("UI", "TabPanelCollapsed", False, BoolValidator())
+    tab_manager_geometry = ConfigItem("UI", "TabManagerGeometry", "")
+    window_always_on_top = ConfigItem("UI", "WindowAlwaysOnTop", False, BoolValidator())
+
+    # ========== 锁屏远程 ==========
+    # 开启后锁屏状态下也保持系统唤醒、屏幕常亮，便于手机远程操控与自动化持续运行
+    lock_screen_remote_enabled = ConfigItem("System", "LockScreenRemote", False, BoolValidator())
 
     # ========== 会话项目管理 ==========
     current_project = ConfigItem("Session", "CurrentProject", "默认项目")
@@ -514,9 +539,22 @@ class Settings(QConfig):
     gitee_enabled = ConfigItem("Gitee", "Enabled", True, BoolValidator())
     gitee_token = ConfigItem("Gitee", "Token", "a5dcb6e2e7776143b7a7e7685a1f33a3")
     gitee_owner = ConfigItem("Gitee", "Owner", "dingmama123141")
-    gitee_repo = ConfigItem("Gitee", "Repo", "canvas-mind-components")
-    gitee_path = ConfigItem("Gitee", "Path", "drifox")
-    gitee_branch = ConfigItem("Gitee", "Branch", "master")
+    # --- 用户 OAuth 绑定 ---
+    gitee_bound = ConfigItem("Gitee", "Bound", False, BoolValidator())
+    gitee_user_token = ConfigItem("Gitee", "UserToken", "")
+    gitee_user_refresh_token = ConfigItem("Gitee", "UserRefreshToken", "")
+    gitee_token_expires_at = ConfigItem("Gitee", "TokenExpiresAt", 0.0)
+    gitee_user_owner = ConfigItem("Gitee", "UserOwner", "")
+    gitee_user_repo = ConfigItem("Gitee", "UserRepo", "DriFox_uploads")
+    gitee_sync_remind = ConfigItem("Gitee", "SyncRemind", True, BoolValidator())
+
+    # OAuth 应用凭证（内置）
+    gitee_oauth_client_id = ConfigItem(
+        "Gitee", "OAuthClientID", "3efedde73e3c9e698b84a5f9ef781ad771059a01dd8fc839752cf0aed70037c2"
+    )
+    gitee_oauth_client_secret = ConfigItem(
+        "Gitee", "OAuthClientSecret", "73236836a816f2d2de6826b86e36bf9cddf8ff551290be2c4977b620a98c74c6"
+    )
 
     # ========== LSP 配置 ==========
     lsp_auto_diagnose = ConfigItem("LSP", "AutoDiagnose", False, BoolValidator())
@@ -527,15 +565,18 @@ class Settings(QConfig):
 
 
 def update_theme_options():
-    """从 ThemeManager 动态更新主题选项验证器"""
+    """从 ThemeManager 动态更新主题选项验证器
+
+    注意：此函数只更新验证器选项列表，**不重置当前值**。
+    即使当前值不在列表中（插件主题尚未加载），也不在此处回退。
+    由 _reload_themes_from_plugins() 中的安全网在插件主题加载完成后统一恢复。
+    """
     try:
         from app.utils.theme_manager import theme_manager
         themes = list(theme_manager.list_themes().keys())
         if themes:
             settings = Settings.get_instance()
             settings.ui_theme_style.validator.__init__(themes)
-            if settings.ui_theme_style.value not in themes:
-                settings.ui_theme_style.value = themes[0]
     except Exception as e:
         import logging
         logging.warning(f"[update_theme_options] failed: {e}")

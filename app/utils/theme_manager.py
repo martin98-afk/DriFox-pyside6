@@ -8,9 +8,11 @@
 - 参考技能加载模式设计（多层搜索 + 合并）
 """
 import os
+import re
 import weakref
 import yaml
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Callable
 
@@ -42,9 +44,24 @@ class ThemeManager:
     # ── 扫描加载 ──────────────────────────────────────────
 
     def _load_themes(self):
-        """加载所有主题：插件 + 内置 + 用户"""
+        """加载所有主题：系统 → 插件 → 用户（后加载覆盖前加载）
 
-        # 1. 插件主题（PluginManager 提供的插件主题路径，优先级最高）
+        插件主题通过两条路径加载：
+        a) 直接扫描插件目录（不依赖 PluginManager，确保 setup_ui 前即可用）
+        b) PluginManager 初始化后重新加载（仅已启用插件，覆盖 a)
+
+        加载顺序即优先级（后加载覆盖同名的前加载）：
+        系统主题 < 插件主题(直接扫描) < 插件主题(PluginManager) < 用户主题
+        """
+
+        # 1. 内置主题（打包在 exe 的 plugins/system/themes/，优先级最低）
+        self._load_from_dir(_BUILTIN_THEMES_DIR, is_builtin=True)
+
+        # 2. 插件主题 — 直接扫描插件目录（不依赖 PluginManager）
+        #    在 setup_ui() 之前即可加载插件主题，避免被重置
+        self._load_plugin_themes_directly()
+
+        # 3. 插件主题（PluginManager 提供，仅已启用插件，可覆盖 #2）
         try:
             from app.core.plugin_manager import PluginManager
             pm = PluginManager.get_instance()
@@ -54,16 +71,42 @@ class ThemeManager:
         except (ImportError, Exception):
             pass
 
-        # 2. 内置主题（打包在 exe 的 app/themes/，只读）
-        self._load_from_dir(_BUILTIN_THEMES_DIR, is_builtin=True)
-
-        # 3. 用户主题（~/.drifox/themes/，可写，优先级最高）
+        # 4. 用户主题（~/.drifox/themes/，可写，优先级最高）
         from app.utils.utils import get_app_data_dir
         user_dir = get_app_data_dir() / "themes"
         self._load_from_dir(user_dir, is_builtin=False)
 
         if not self._themes:
             logger.warning("[ThemeManager] 未加载到任何主题")
+
+    def _load_plugin_themes_directly(self):
+        """直接扫描所有插件目录下的 themes/ 文件夹
+
+        不依赖 PluginManager，确保在 setup_ui() 之前插件主题就已可用。
+        PluginManager 初始化后，_reload_themes_from_plugins() 会通过
+        get_theme_paths() 再次加载（仅已启用插件），同名主题会覆盖此处结果。
+        """
+        # 系统插件目录: plugins/
+        system_plugin_dir = Path(__file__).parent.parent.parent / "plugins"
+        if system_plugin_dir.is_dir():
+            for entry in sorted(system_plugin_dir.iterdir()):
+                if entry.is_dir():
+                    theme_dir = entry / "themes"
+                    if theme_dir.exists():
+                        self._load_from_dir(theme_dir, is_builtin=True)
+
+        # 用户插件目录: ~/.drifox/plugins/
+        try:
+            from app.utils.utils import get_app_data_dir
+            user_plugin_dir = get_app_data_dir() / "plugins"
+            if user_plugin_dir.is_dir():
+                for entry in sorted(user_plugin_dir.iterdir()):
+                    if entry.is_dir():
+                        theme_dir = entry / "themes"
+                        if theme_dir.exists():
+                            self._load_from_dir(theme_dir, is_builtin=True)
+        except Exception:
+            pass
 
     def _load_from_dir(self, base_dir: Path, is_builtin: bool):
         """从指定目录扫描加载主题"""
@@ -80,13 +123,28 @@ class ThemeManager:
                 # 单文件形式：xxx.yaml
                 self._load_yaml(entry, None, is_builtin)
 
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _parse_yaml_cached(path_str: str, mtime_ns: int) -> dict:
+        """按 (路径, mtime_ns) 缓存 YAML 解析结果（文件变化自动失效）。
+
+        缓存 key 含 mtime：主题文件被编辑保存后 mtime 变化 → 自动重新解析，
+        reload() 无需手动清缓存即可拿到新内容。只缓存纯净的解析结果，
+        元信息（_path/_dir/_is_builtin/_source）由调用方写入拷贝，不污染缓存。
+        """
+        with open(path_str, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
     def _load_yaml(self, yaml_path: Path, theme_dir: Optional[Path], is_builtin: bool):
-        """加载单个主题 YAML"""
+        """加载单个主题 YAML（带 mtime 缓存，同文件未变化不重复解析）"""
         try:
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-            if not data or not data.get("id"):
+            mtime_ns = yaml_path.stat().st_mtime_ns
+            parsed = self._parse_yaml_cached(str(yaml_path), mtime_ns)
+            if not parsed or not parsed.get("id"):
                 return
+            # 浅拷贝：下方写入 _path/_dir/_is_builtin/_source 元信息及
+            # _themes 存储均基于拷贝，缓存只保留纯净的 YAML 解析结果
+            data = dict(parsed)
 
             theme_id = data["id"]
 
@@ -157,6 +215,63 @@ class ThemeManager:
         theme = self._themes.get(theme_id)
         return bool(theme and not theme.get("_is_builtin", True))
 
+    # ── 浅色/深色模式检测 ──────────────────────────────
+
+    # 缓存：上次检测的 theme_id 和结果
+    _cached_light_check: tuple = (None, None)
+
+    def is_light_theme(self, theme_id: str = None) -> bool:
+        """判断指定主题（或当前主题）是否为浅色模式。
+
+        优先级：
+        1. 主题 YAML 显式声明 `mode: light` → True
+        2. 主题 YAML 显式声明 `mode: dark` → False
+        3. 自动检测：text_primary 的亮度 > 128 → 浅色模式
+
+        结果会被缓存（按 theme_id），主题切换时自动失效。
+        """
+        if theme_id is None:
+            theme_id = self.get_current_theme_id()
+
+        # 缓存命中
+        if self._cached_light_check[0] == theme_id:
+            return self._cached_light_check[1]
+
+        theme = self.get_theme(theme_id) or {}
+
+        # 1. 显式声明
+        mode = theme.get("mode")
+        if mode == "light":
+            self._cached_light_check = (theme_id, True)
+            return True
+        if mode == "dark":
+            self._cached_light_check = (theme_id, False)
+            return False
+
+        # 2. 自动检测：text_primary 亮度
+        colors = theme.get("colors", {})
+        text_primary = colors.get("text_primary", "#ffffff")
+
+        m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", text_primary)
+        if m:
+            r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        else:
+            # hex 格式
+            text_primary_hex = text_primary.lstrip("#")
+            if len(text_primary_hex) == 6:
+                r = int(text_primary_hex[0:2], 16)
+                g = int(text_primary_hex[2:4], 16)
+                b = int(text_primary_hex[4:6], 16)
+            else:
+                # fallback
+                r, g, b = 255, 255, 255
+
+        # 相对亮度公式 (感知亮度)
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        result = luminance < 128  # 暗文字 = 浅色模式
+        self._cached_light_check = (theme_id, result)
+        return result
+
     # ── 当前主题 ──────────────────────────────────────────
 
     def get_current_theme_id(self) -> str:
@@ -176,6 +291,25 @@ class ThemeManager:
         """获取当前主题的 colors 部分"""
         theme = self.get_current_theme()
         return theme.get("colors", {})
+
+    def get_theme_pet(self, theme_id: str) -> dict:
+        """获取主题的 pet 配置。"""
+        theme = self._themes.get(theme_id) or {}
+        pet_cfg = theme.get("pet") or {}
+        image_rel = pet_cfg.get("image")
+        if not image_rel:
+            return {}
+
+        theme_dir = self.get_theme_dir(theme_id)
+        if not theme_dir:
+            return {}
+
+        image_path = theme_dir / image_rel
+        if image_path.exists():
+            return {"image": image_path, "source": "theme"}
+
+        logger.warning(f"[ThemeManager] 主题 {theme_id} 声明的 pet 不存在: {image_path}，fallback 到内嵌默认")
+        return {}
 
     # ── 主题管理 ──────────────────────────────────────────
 
@@ -228,22 +362,91 @@ class ThemeManager:
 
         由 reload() 或外部触发（配置变更）调用。
         已失效的弱引用会被自动清理。
+
+        🛡️ 可见性过滤（T2-R7）：tab 内非 active 页窗口不执行全量 refresh_theme
+        （N 窗 × M 卡 findChildren + runJavaScript 成本），仅标记
+        _theme_needs_refresh 待刷；切回可见时由窗口自身补刷链路
+        （main_widget._on_tab_selected 检查 _theme_needs_refresh 后调用
+        _apply_runtime_ui_settings，见 main_widget.py:8064-8077 同机制）自动
+        补刷，不丢主题更新。可见窗口行为与原先完全一致（立即 refresh_theme）；
+        无补刷链路的 target 保守不跳过（全量刷新），避免主题更新永久丢失。
         """
         from app.utils.design_tokens import Colors
         Colors.refresh()
+
+        self.on_theme_changed()
 
         alive = []
         for ref in self._refresh_targets:
             widget = ref()
             if widget is None:
-                continue
+                continue  # 弱引用已失效，跳过
             alive.append(ref)
+            # 🛡️ 可见性过滤：仅跳过"tab 内非 active 页"窗口——自身隐藏 + 顶层
+            # 窗口可见 + 有 _theme_needs_refresh 补刷链路（main_widget 系窗口），
+            # 标记待刷；切回 tab 时由 _on_tab_selected 检查标志后调
+            # _apply_runtime_ui_settings（见 main_widget.py:8064-8077 同机制）
+            # 自动补刷，不丢主题更新。
+            #
+            # 边界对齐（devil-advocate 审查确认）：
+            # - 不用朴素 isVisible——TabManager 整体隐藏（最小化到托盘）时子窗口
+            #   isVisible 全为 False，朴素跳过无补刷链路导致主题不更新；故要求
+            #   顶层可见才跳过，与 _execute_batched_theme_refresh 的 _tab_active_win
+            #   语义对齐（顶层不可见时仍全量刷新）。
+            # - 无 _theme_needs_refresh 属性的 target（PixelPetWidget 等）保守不跳过
+            #   ——避免隐藏期间主题更新永久丢失（无补刷链路时跳过=不可恢复）。
+            try:
+                if (
+                    hasattr(widget, "isVisible")
+                    and not widget.isVisible()
+                    and hasattr(widget, "_theme_needs_refresh")
+                ):
+                    top_visible = False
+                    try:
+                        top = widget.window()
+                        top_visible = bool(top.isVisible()) if hasattr(top, "isVisible") else False
+                    except Exception:
+                        top_visible = False
+                    if top_visible:
+                        widget._theme_needs_refresh = True
+                        # P5b：dispatch_refresh 语义恒为纯主题变化，记录 scope="theme"
+                        #（切回 tab 补刷时精确只刷颜色，避免漏刷/过度刷新）
+                        widget._theme_needs_refresh_scope = "theme"
+                        logger.debug("[ThemeManager] dispatch_refresh: hidden tab target marked _theme_needs_refresh")
+                        continue
+            except Exception:
+                pass  # isVisible 异常（如已销毁的 C++ 对象）→ 按可见处理走原刷新路径
             try:
                 if hasattr(widget, "refresh_theme"):
                     widget.refresh_theme()
+                    # 刷新后清除待刷标志（与 batched 路径 main_widget.py:8148 对齐，
+                    # 避免残留 True 导致下次切回重复全量刷新）
+                    if hasattr(widget, "_theme_needs_refresh"):
+                        try:
+                            widget._theme_needs_refresh = False
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning(f"[ThemeManager] dispatch_refresh error: {e}")
         self._refresh_targets = alive
+
+    def on_theme_changed(self):
+        """主题切换后调用：清除浅色检测缓存。
+
+        图标适配由 _ThemeIconEngine 自动处理（QIconEngine.key 随主题变化），
+        无需手动清图标缓存。
+        """
+        self._cached_light_check = (None, None)
+        # 🐛 推进 ThemeRefreshCoordinator 版本号：使消息卡正文 CSS 变量注入
+        # 的幂等短路失效。此前 should_skip / on_theme_changed 从未被调用，
+        # 版本号恒为 0，导致 CodeWebViewer.refresh_theme 只在首次切换注入一次
+        # CSS 变量，之后所有主题切换正文/思考块颜色不刷新。
+        try:
+            from app.utils.theme_refresh import ThemeRefreshCoordinator
+
+            ThemeRefreshCoordinator.should_skip(self.get_current_theme_id())
+        except Exception:
+            pass
 
     def _invoke_reload_callbacks(self, error_label: str = "reload"):
         """遍历所有存活回调，自动清理已失效的弱引用"""
@@ -260,12 +463,28 @@ class ThemeManager:
         self._reload_callbacks = alive
 
     def reload(self):
-        """重新加载所有主题（修改文件后调用）"""
+        """重新加载所有主题（修改文件后调用）
+
+        比对当前活动主题在重载前后是否变化，只有当前主题确实被修改/删除
+        时才触发 UI 全量刷新（dispatch_refresh），避免热重载无关主题时
+        不必要地重绘整个界面。
+        """
+        # 重载前：保存当前主题的快照，用于后续比对
+        old_id = self.get_current_theme_id()
+        old_data = self.get_theme(old_id)
+
         self._themes.clear()
         self._load_themes()
-        # 分发刷新给所有注册 widget
-        self.dispatch_refresh()
-        # 兼容旧回调
+        # 清除浅色检测缓存
+        self._cached_light_check = (None, None)
+
+        # 重载后：获取新数据，判断当前主题是否真实变化
+        new_data = self.get_theme(old_id)
+        if new_data != old_data:
+            # 当前主题被修改/删除 → 全量刷新 UI
+            self.dispatch_refresh()
+
+        # 兼容旧回调（用于设置面板更新主题下拉列表等，无论当前主题是否变化都需要）
         self._invoke_reload_callbacks("reload")
 
     def apply_theme_style(self):

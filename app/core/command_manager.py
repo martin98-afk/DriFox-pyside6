@@ -43,6 +43,7 @@ class CommandParameter:
     param_type: str = "flag" # "flag" | "value" | "positional"
     required: bool = False   # 是否必填（选填参数在 UI 上显示为灰色/标记）
     value_options: list = field(default_factory=list)  # value 类型的可选值列表（硬编码）
+    mutex_group: str = ""    # 互斥组名，同组参数只能选其一（空字符串表示不参与互斥）
 
 
 class CommandType(Enum):
@@ -75,6 +76,8 @@ class CommandDefinition:
     prompt_text: str = ""        # PROMPT/AGENT 命令使用
     parameters: List[CommandParameter] = field(default_factory=list)  # 可交互参数列表
     shortcut: str = ""           # 快捷键，如 "Ctrl+Shift+B"
+    prompt_sections: Dict[str, Any] = field(default_factory=dict)  # 参数→提示词分段映射（按需加载）
+
 
     def to_display_dict(self) -> Dict[str, str]:
         """返回供 CommandCard 显示用的字典"""
@@ -266,6 +269,37 @@ class CommandManager:
 
         return result
 
+    @staticmethod
+    def parse_param_value(text: str, param_name: str) -> Optional[str]:
+        """从文本中提取 --key=value 参数的实际值
+
+        Args:
+            text: 输入文本（如 "/lsp-install --language=python --list"）
+            param_name: 参数名（如 "--language="）
+
+        Returns:
+            参数值（如 "python"），未找到返回 None
+
+        支持带引号的值：--model="Azure OpenAI:gpt-4o"
+        """
+        if not text or not param_name:
+            return None
+
+        clean_name = param_name.rstrip("=")
+        # 匹配 --key= 开头的参数值段
+        pattern = re.escape(clean_name) + r'=(\S+)'
+        m = re.search(pattern, text)
+        if not m:
+            return None
+
+        raw_val = m.group(1)
+        # 去掉尾部紧跟的 "、'、空格（处理 --key="value" 或 --key=value"）
+        raw_val = raw_val.rstrip('"\'')
+        # 如果值以引号开头，去掉首尾引号
+        if raw_val.startswith('"') or raw_val.startswith("'"):
+            raw_val = raw_val[1:].rstrip('"\'')
+        return raw_val
+
     def is_builtin_command(self, text: str) -> bool:
         """判断输入文本是否匹配某个已注册的内置命令"""
         name = self.parse_command_name(text)
@@ -292,6 +326,98 @@ class CommandManager:
         "prompt": CommandType.PROMPT,
         "agent": CommandType.AGENT,
     }
+
+    def select_prompt(self, command_name: str, remainder: str) -> Optional[str]:
+        """根据参数从 body 中过滤出匹配的段落，返回精简后的提示词
+
+        工作方式：
+        - prompt_sections 定义参数→标记 ID 的映射
+          - 扁平映射：{--list: "list", --all: "all"}
+          - 嵌套枚举映射：{--language=: {python: "lang-python", rust: "lang-rust"}}
+            此时从 remainder 中提取 --language= 的实际值，按值查表
+        - body 中用 `<!-- section:id -->` / `<!-- end -->` 标记段落
+        - 匹配的参数只取对应的标记段，不匹配的段被滤除
+        - 无 prompt_sections 时返回 None，调用方使用完整 body（向后兼容）
+
+        Args:
+            command_name: 命令名
+            remainder: 命令后的用户参数文本
+
+        Returns:
+            过滤后的提示词文本，或 None（无 prompt_sections / 无匹配）
+        """
+        entries = self._commands.get(command_name, {})
+        if not entries:
+            return None
+        cmd = _pick_first_entry(entries)
+        if not cmd.prompt_sections:
+            return None
+
+        active_params = self.parse_active_params(remainder)
+
+        # 构建参数 → mutex_group 映射
+        param_to_mg: Dict[str, str] = {}
+        for p in cmd.parameters:
+            if p.mutex_group:
+                param_to_mg[p.name] = p.mutex_group
+
+        # 找出要保留的标记 ID（按参数定义顺序，同组互斥）
+        matched_groups: set = set()
+        want_markers: set = set()
+
+        for param in cmd.parameters:
+            if param.name not in active_params:
+                continue
+            marker_raw = cmd.prompt_sections.get(param.name)
+            if not marker_raw:
+                continue
+            mg = param_to_mg.get(param.name, "")
+            if mg:
+                if mg in matched_groups:
+                    continue
+                matched_groups.add(mg)
+
+            # 支持嵌套枚举映射：{--language=: {python: "lang-python", ...}}
+            if isinstance(marker_raw, dict) and param.param_type == "value":
+                param_value = self.parse_param_value(remainder, param.name)
+                if param_value and param_value in marker_raw:
+                    want_markers.add(marker_raw[param_value])
+                # else: 值不匹配 → 跳过此参数（不添加任何 section）
+            else:
+                want_markers.add(str(marker_raw))
+
+        # 从 body 中过滤出需要的段落
+        # 即使 want_markers 为空也执行过滤——移除所有 section 标记块，只保留公共内容
+        # 修复：之前 want_markers 为空时 return None，导致传参但无匹配 section 时
+        # 完整 body（含所有 section）被发送给 AI
+        return self._build_filtered_body(cmd.prompt_text, want_markers)
+
+    @staticmethod
+    def _build_filtered_body(body: str, want_markers: set) -> str:
+        """从 body 保留公共内容 + 匹配的标记段，移除不匹配的段落"""
+        lines = body.splitlines()
+        result: List[str] = []
+        skip = False  # 是否跳过当前段
+
+        for line in lines:
+            s = line.strip()
+
+            # 段开始标记：<!-- section:id -->
+            if s.startswith("<!--") and "section:" in s:
+                section_id = s[len("<!--"):-len("-->")].strip()
+                section_id = section_id.removeprefix("section:").strip()
+                skip = section_id not in want_markers
+                continue  # 不输出标记行本身
+
+            # 段结束标记：<!-- end -->
+            if s == "<!-- end -->":
+                skip = False
+                continue  # 不输出标记行本身
+
+            if not skip:
+                result.append(line)
+
+        return "\n".join(result).strip()
 
     def execute(self, text: str,
                 preferred_display_type: Optional[str] = None) -> Optional[CommandResult]:

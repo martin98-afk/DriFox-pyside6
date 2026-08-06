@@ -165,11 +165,47 @@ class SessionRepository:
                 now,  # updated_at
             ))
 
+            if success:
+                # INSERT OR REPLACE = DELETE 旧行 + INSERT 新行，旧页全部进 freelist
+                # 高频率 save 叠加压缩 blob 大小波动，持续制造不可复用的空闲页。
+                # 检测 freelist 是否超过安全阈值（5000 页 ≈ 20MB），超过则增量回收
+                # 500 页（≈2MB），防止 freelist 滚雪球到 GB 级。
+                self._reclaim_freelist_if_needed()
+
             return success
 
         except Exception as e:
             logger.error(f"[SessionRepository] save_session 异常: {e}")
             return False
+
+    def _reclaim_freelist_if_needed(self, threshold_pages: int = 5000, reclaim_pages: int = 500):
+        """
+        空闲页超过阈值时增量回收，防止 freelist 滚雪球
+
+        INSERT OR REPLACE 的 DELETE→INSERT 路径将旧 blob 页全部释放进
+        freelist，高频率 save（每次对话回合 2 次）叠加 zstd 压缩后大小波动
+        （50KB~500KB）持续制造不可复用空闲页。用户截断/子任务清理等大型
+        DELETE 操作一次性释放数千页，必须及时回收。
+
+        每次最多回收 reclaim_pages 页（≈2MB @ 4KB page），避免阻塞 UI。
+        incremental_vacuum 仅在 auto_vacuum=INCREMENTAL 时实际回收，
+        否则静默跳过。
+
+        Args:
+            threshold_pages: freelist 超过此页数才触发回收（默认 5000 页 ≈ 20MB）
+            reclaim_pages:  单次回收最多页数（默认 500 页 ≈ 2MB）
+        """
+        try:
+            ok, rows = self._execute("PRAGMA freelist_count")
+            if not ok or not rows:
+                return
+            freelist = list(rows[0].values())[0] if isinstance(rows[0], dict) else rows[0]
+            if freelist < threshold_pages:
+                return
+            self._execute(f"PRAGMA incremental_vacuum({reclaim_pages})")
+        except Exception:
+            pass  # auto_vacuum 未启用时静默跳过，不阻塞保存流程
+
 
     def get(self, session_id: str) -> Optional[Dict]:
         """根据 ID 获取单个会话"""
@@ -205,6 +241,77 @@ class SessionRepository:
             logger.error(f"[SessionRepository] get_sessions 异常: {e}")
             return []
 
+    def get_all_lightweight(self, limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取所有会话的轻量列表（不含 messages），用于启动加载和历史列表展示。
+
+        避免 SELECT * 一次性反序列化全部 messages JSON（可达数十 MB），
+        仅在用户点击某个会话时按需加载 messages。
+        """
+        if not self.is_initialized:
+            return []
+
+        try:
+            # 🚀 只选轻量列表展示所需的字段，跳过 compaction_state/cache
+            # 等重量级 BLOB 列，减少 SQLite I/O 和传输开销。
+            success, rows = self._execute(
+                f"SELECT session_id, title, project, system_prompt, "
+                f"message_count, user_edited_title, worktree_path, "
+                f"preview, context_usage, created_at, updated_at, "
+                f"team_run_id, team_name, agent_name, team_members "
+                f"FROM {self.TABLE_NAME} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            if success:
+                return [self._row_to_session_lightweight(row) for row in rows]
+            return []
+        except Exception as e:
+            logger.error(f"[SessionRepository] get_all_lightweight 异常: {e}")
+            return []
+
+    def _row_to_session_lightweight(self, row) -> Dict:
+        """将数据库行转换为不含 messages 的轻量会话字典"""
+        if not row:
+            return {}
+
+        if hasattr(row, "keys"):
+            d = {k: row[k] for k in row.keys()}
+        elif isinstance(row, dict):
+            d = dict(row)
+        else:
+            return {}
+
+        # 🚀 性能优化：跳过 compaction_state/cache 的 zstd 解压+反序列化。
+        # 轻量列表展示中不使用这两个字段，全量加载在 get_session() 中才做。
+        # 省掉 500 条记录的 zstd 解压 + orjson.loads，可节省大量 CPU。
+        raw_title = d.get("title", "") or ""
+        return {
+            "session_id": d.get("session_id", ""),
+            "name": raw_title,
+            "title": raw_title,
+            "topic_summary": raw_title,
+            "project": d.get("project", "默认项目"),
+            "messages": [],  # 懒加载：不在启动时加载
+            "system_prompt": d.get("system_prompt", ""),
+            "compaction_state": {},
+            "compaction_cache": {},
+            "message_count": d.get("message_count", 0),
+            "preview": d.get("preview", "") or "",  # 从 DB 读取预览文本
+            "created_at": d.get("created_at", ""),
+            "updated_at": d.get("updated_at", ""),
+            "worktree_path": d.get("worktree_path", "") or "",
+            "context_usage": d.get("context_usage", 0),
+            # 团队元数据（方案 A 团队会话恢复基础，非团队会话为空串）
+            "team_run_id": d.get("team_run_id", "") or "",
+            "team_name": d.get("team_name", "") or "",
+            "agent_name": d.get("agent_name", "") or "",
+            # 团队成员快照（F3：JSON 字符串，恢复时找回无会话记录的手动成员）
+            "team_members": d.get("team_members", "") or "",
+            "last_time": d.get("updated_at", ""),
+            "saved_at": d.get("created_at", ""),
+            "user_edited_title": d.get("user_edited_title", False),
+        }
+
+
     def get_by_project(self, project: str, limit: int = 100) -> List[Dict]:
         """获取指定项目的会话列表"""
         if not self.is_initialized:
@@ -221,6 +328,38 @@ class SessionRepository:
         except Exception as e:
             logger.error(f"[SessionRepository] get_sessions_by_project 异常: {e}")
             return []
+
+    def get_by_team_run_id(self, run_id: str) -> List[Dict]:
+        """按团队 run_id 获取全部成员会话（轻量，不含 messages）。
+
+        恢复团队会话时使用：直接查 SQLite，绕开 HistoryManager 内存
+        _history_limit=500 的截断——团队会话可能因长期运行被挤出
+        内存前 500 条，导致恢复时按 run_id 收集不到部分成员。
+
+        Returns:
+            按 updated_at 倒序的轻量会话字典列表（含团队元数据字段）
+        """
+        if not self.is_initialized or not run_id:
+            return []
+
+        try:
+            # 与 get_all_lightweight 相同的轻量字段投影，避免反序列化重量级 BLOB
+            success, rows = self._execute(
+                f"SELECT session_id, title, project, system_prompt, "
+                f"message_count, user_edited_title, worktree_path, "
+                f"preview, context_usage, created_at, updated_at, "
+                f"team_run_id, team_name, agent_name, team_members "
+                f"FROM {self.TABLE_NAME} WHERE team_run_id = ? "
+                f"ORDER BY updated_at DESC",
+                (run_id,),
+            )
+            if success:
+                return [self._row_to_session_lightweight(row) for row in rows]
+            return []
+        except Exception as e:
+            logger.error(f"[SessionRepository] get_by_team_run_id 异常: {e}")
+            return []
+
 
     def get_projects(self) -> List[str]:
         """获取所有项目名称列表（含无会话但有关键文档/笔记的项目）

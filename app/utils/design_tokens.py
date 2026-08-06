@@ -51,6 +51,14 @@ def scale_font_size(size: int) -> int:
     return max(8, int(size) + FONT_SIZE_OPTIONS[get_ui_font_size_key()]["delta"])
 
 
+def scale_icon_size(size: int) -> int:
+    """图标大小随系统字体缩放
+
+    使用与字体相同的 delta 缩放量，保证图标与文字比例协调。
+    """
+    return max(8, int(size) + FONT_SIZE_OPTIONS[get_ui_font_size_key()]["delta"])
+
+
 def font_size_css(size: int) -> str:
     return f"font-size: {scale_font_size(size)}px;"
 
@@ -1245,6 +1253,63 @@ def get_card_style(alpha: int = 250) -> str:
 def get_scroll_style() -> str:
     """获取滚动区域样式字符串"""
     return CardStyles.scroll_area()
+
+
+def get_unified_scrollbar_style(width: int = 6) -> str:
+    """全局统一的滚动条样式 — 现代简约、薄而精致、主题感知
+
+    供各 widget 复用，消除 12+ 处的重复定义。
+    Args:
+        width: 滚动条宽度（像素），默认 6，有效范围 4-20。
+    """
+    # 限制宽度范围，防止异常输入产生退化样式
+    width = max(4, min(int(width), 20))
+    Colors.refresh()
+    return f"""
+        QScrollBar:vertical {{
+            background: transparent;
+            width: {width}px;
+            margin: 0;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {Colors.SCROLLBAR_HANDLE_BG};
+            border-radius: {width // 2}px;
+            min-height: 30px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background: {Colors.SCROLLBAR_HANDLE_HOVER_BG};
+            width: {width + 2}px;
+        }}
+        QScrollBar::handle:vertical:pressed {{
+            background: {Colors.SCROLLBAR_HANDLE_HOVER_BG};
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0;
+        }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+            background: none;
+        }}
+        QScrollBar:horizontal {{
+            background: transparent;
+            height: {width}px;
+            margin: 0;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {Colors.SCROLLBAR_HANDLE_BG};
+            border-radius: {width // 2}px;
+            min-width: 30px;
+        }}
+        QScrollBar::handle:horizontal:hover {{
+            background: {Colors.SCROLLBAR_HANDLE_HOVER_BG};
+            height: {width + 2}px;
+        }}
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+            width: 0;
+        }}
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+            background: none;
+        }}
+    """
 
 
 def get_content_bg_style() -> str:

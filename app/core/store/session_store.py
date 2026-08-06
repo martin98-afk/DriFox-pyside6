@@ -78,10 +78,18 @@ class SessionStore:
         """标记数据库正常关闭，下次启动跳过完整性检查"""
         try:
             from app.utils.utils import get_app_data_dir
+
             flag_path = Path(get_app_data_dir()) / cls._CLEAN_SHUTDOWN_FLAG
             flag_path.write_text("1", encoding="utf-8")
         except Exception:
             pass
+
+        # 增量回收剩余空闲页（需 auto_vacuum=INCREMENTAL 已激活）
+        instance = cls._instance
+        if instance is not None:
+            for _ in range(3):
+                if not instance.compact_database(max_pages=1000):
+                    break
 
     def _check_and_repair_database(self):
         """检查并修复损坏的 SQLite 数据库
@@ -174,6 +182,84 @@ class SessionStore:
         except Exception as e:
             logger.error(f"[SessionStore] 数据库修复失败: {e}")
 
+    def _check_auto_vacuum_status(self):
+        """检测 auto_vacuum=INCREMENTAL 是否对当前数据库真正生效
+
+        SQLite 限制: 已存在的数据库必须先 VACUUM 一次, INCREMENTAL 模式才会真正
+        开始跟踪历史 freelist. 如果未生效, 启动时打印一次性提示, 引导用户跑一次
+        VACUUM (例如执行 .drifox/_vacuum.py 脚本).
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        try:
+            success, result = self._db.execute_sql("PRAGMA auto_vacuum")
+            if not success or not result:
+                return
+            current = list(result[0].values())[0] if isinstance(result[0], dict) else str(result[0])
+            # SQLite PRAGMA auto_vacuum 返回整数: 0=NONE, 1=FULL, 2=INCREMENTAL
+            # Python sqlite3 driver 可能返回 int 2 而非字符串 'incremental'
+            if str(current).lower() == "incremental" or current == 2:
+                # 检查 freelist 是否还有很多 (> 50MB 提示用户首次 VACUUM)
+                success2, result2 = self._db.execute_sql("PRAGMA freelist_count")
+                if success2 and result2:
+                    freelist = list(result2[0].values())[0] if isinstance(result2[0], dict) else 0
+                    page_size = 4096
+                    success3, result3 = self._db.execute_sql("PRAGMA page_size")
+                    if success3 and result3:
+                        page_size = list(result3[0].values())[0] or 4096
+                    freelist_mb = freelist * page_size / 1024 / 1024
+                    if freelist_mb > 50:
+                        logger.warning(
+                            f"[SessionStore] auto_vacuum=INCREMENTAL 已启用, "
+                            f"但历史 freelist 累积 {freelist_mb:.0f}MB 尚未进入回收队列. "
+                            f"建议关闭软件后执行一次 VACUUM 启用 (例如: python .drifox/_vacuum.py)"
+                        )
+                    else:
+                        logger.info(f"[SessionStore] auto_vacuum=INCREMENTAL 已生效, 当前 freelist={freelist_mb:.1f}MB")
+            else:
+                logger.warning(
+                    f"[SessionStore] auto_vacuum={current} (期望 incremental). "
+                    f"INCREMENTAL 模式未生效, 不会自动回收空闲页."
+                )
+        except Exception as e:
+            logger.debug(f"[SessionStore] auto_vacuum 状态检测失败: {e}")
+
+    def compact_database(self, max_pages: int = 1000) -> bool:
+        """增量回收空闲页 (PRAGMA incremental_vacuum)
+
+        适合在应用退出时调用, 每次最多回收 max_pages 页 (默认 1000 页 ≈ 4MB).
+        比 VACUUM 友好的地方: 分批执行, 不会长时间阻塞数据库.
+
+        Returns:
+            bool: 是否成功执行 (auto_vacuum 未启用时返回 False)
+        """
+        if not self._db or not self._db.is_connected:
+            return False
+        try:
+            # 先检查 auto_vacuum 模式
+            success, result = self._db.execute_sql("PRAGMA auto_vacuum")
+            if not success or not result:
+                return False
+            current = list(result[0].values())[0] if isinstance(result[0], dict) else "none"
+            if current != "incremental":
+                logger.debug(f"[SessionStore] auto_vacuum={current}, 跳过 incremental_vacuum")
+                return False
+
+            self._db.execute_sql(f"PRAGMA incremental_vacuum({max_pages})")
+            # 回收后查询实际归还了多少
+            success2, result2 = self._db.execute_sql("PRAGMA freelist_count")
+            if success2 and result2:
+                remaining = list(result2[0].values())[0] if isinstance(result2[0], dict) else 0
+                logger.info(
+                    f"[SessionStore] 增量回收完成 (本批 {max_pages} 页), "
+                    f"剩余 freelist={remaining} 页 (≈{remaining * 4 / 1024:.1f}MB)"
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"[SessionStore] 增量回收失败: {e}")
+            return False
+
+
     def _init_schema(self):
         """初始化数据库和表结构"""
         if self._initialized:
@@ -187,6 +273,17 @@ class SessionStore:
                 # 使用 DatabaseManager（单例模式）
                 self._db = DatabaseManager()
                 self._db.connect(self._db_path)
+                # ========== 读取文件头真实的 auto_vacuum 值 ==========
+                # 必须在设置任何 PRAGMA 之前读取，否则读到的是当前连接的值而非文件头
+                _file_auto_vacuum = None
+                try:
+                    _ok, _rows = self._db.execute_sql("PRAGMA auto_vacuum")
+                    if _ok and _rows:
+                        _file_auto_vacuum = str(list(_rows[0].values())[0]).lower()
+                except Exception:
+                    _file_auto_vacuum = None
+                # ======================================================
+
 
                 # ========== 数据库完整性检查与自动修复 ==========
                 # 必须在连接之后执行，因为需要 DatabaseManager 实例来修复
@@ -198,6 +295,10 @@ class SessionStore:
                 self._db.execute_sql('PRAGMA synchronous=NORMAL')
                 self._db.execute_sql('PRAGMA cache_size=-64000')
                 self._db.execute_sql('PRAGMA temp_store=MEMORY')
+                # 先设连接级 INCREMENTAL（若文件头已是 INCREMENTAL 则直接生效；
+                # 若文件头是 NONE，后续一次性 VACUUM 后永久写入）
+                self._db.execute_sql('PRAGMA auto_vacuum=INCREMENTAL')
+
                 # ======================================================
 
                 # 创建会话表
@@ -273,6 +374,12 @@ class SessionStore:
                 self._migrate_remove_canvas_id()
                 self._migrate_add_user_edited_title_column()
                 self._migrate_add_worktree_path_column()
+                self._migrate_add_preview_column()
+                self._migrate_add_context_usage_column()
+                self._migrate_add_api_context_columns()
+                self._migrate_add_team_columns()
+                self._migrate_add_team_members_column()
+
 
                 # 初始化子模块
                 self._session_repo = SessionRepository(self._db)
@@ -281,6 +388,24 @@ class SessionStore:
                 self._subagent_log_repo = SubAgentLogRepository(self._db)
                 self._input_history_repo = InputHistoryRepository(self._db)
                 self._input_history_repo.create_table()
+
+                # 一次性激活：若文件头 auto_vacuum 不是 INCREMENTAL，执行 VACUUM 永久写入
+                # (必须在所有建表/迁移完成后执行，确保 VACUUM 基于完整 schema 重建)
+                if _file_auto_vacuum and _file_auto_vacuum != "incremental":
+                    logger.info(
+                        f"[SessionStore] 文件头 auto_vacuum={_file_auto_vacuum}, "
+                        f"执行一次性 VACUUM 永久激活 INCREMENTAL..."
+                    )
+                    try:
+                        self._db.execute_sql("PRAGMA auto_vacuum=INCREMENTAL")
+                        self._db.execute_sql("VACUUM")
+                        logger.info("[SessionStore] INCREMENTAL 模式已永久激活")
+                    except Exception as _e:
+                        logger.warning(f"[SessionStore] 首次激活 INCREMENTAL 失败: {_e}")
+
+                # 检测 auto_vacuum 是否对当前数据库生效
+                self._check_auto_vacuum_status()
+
 
                 self._initialized = True
                 logger.info("[SessionStore] 初始化完成（仓储模式）")
@@ -379,6 +504,101 @@ class SessionStore:
         except Exception as e:
             logger.warning(f"[SessionStore] worktree_path 列迁移失败(可能已存在): {e}")
 
+    def _migrate_add_preview_column(self):
+        """迁移：添加 preview 列（如果不存在）
+
+        preview 存储会话预览文本（最后一条用户消息的前 50 字符），
+        使历史列表加载时无需反序列化完整 messages JSON。
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        try:
+            columns = self._db.get_table_info(self.TABLE_NAME)
+            col_names = [c.get("name", "") for c in columns]
+            if "preview" not in col_names:
+                logger.info("[SessionStore] 迁移：添加 preview 列")
+                self._db.execute_sql(f"ALTER TABLE {self.TABLE_NAME} ADD COLUMN preview TEXT DEFAULT ''")
+                # 迁移后回填现有会话的 preview（从 messages 中提取）
+                self._db.execute_sql(f"UPDATE {self.TABLE_NAME} SET preview = '' WHERE preview IS NULL")
+                logger.info("[SessionStore] preview 列迁移完成")
+        except Exception as e:
+            logger.warning(f"[SessionStore] preview 列迁移失败(可能已存在): {e}")
+
+    def _migrate_add_context_usage_column(self):
+        """迁移：添加 context_usage 列（如果不存在）
+
+        context_usage 存储会话消息的估算 token 总数，
+        使图表插件可直接读取聚合值，无需反序列化 messages JSON 再估算。
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        try:
+            columns = self._db.get_table_info(self.TABLE_NAME)
+            col_names = [c.get("name", "") for c in columns]
+            if "context_usage" not in col_names:
+                logger.info("[SessionStore] 迁移：添加 context_usage 列")
+                self._db.execute_sql(f"ALTER TABLE {self.TABLE_NAME} ADD COLUMN context_usage INTEGER DEFAULT 0")
+                logger.info("[SessionStore] context_usage 列迁移完成")
+        except Exception as e:
+            logger.warning(f"[SessionStore] context_usage 列迁移失败(可能已存在): {e}")
+
+    def _migrate_add_api_context_columns(self):
+        """迁移：添加 last_api_prompt_tokens / last_api_message_count 列
+
+        持久化 API 返回的精确上下文占用值，供历史会话加载时校准显示。
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        for col in ("last_api_prompt_tokens", "last_api_message_count"):
+            try:
+                columns = self._db.get_table_info(self.TABLE_NAME)
+                col_names = [c.get("name", "") for c in columns]
+                if col not in col_names:
+                    logger.info(f"[SessionStore] 迁移：添加 {col} 列")
+                    self._db.execute_sql(f"ALTER TABLE {self.TABLE_NAME} ADD COLUMN {col} INTEGER DEFAULT 0")
+            except Exception as e:
+                logger.warning(f"[SessionStore] {col} 列迁移失败(可能已存在): {e}")
+
+    def _migrate_add_team_columns(self):
+        """迁移：添加团队元数据列 team_run_id / team_name / agent_name（如果不存在）
+
+        为团队会话一键恢复（方案 A）打基础：标识会话属于哪个团队运行、
+        哪个团队名、由哪个 agent 角色产出。三列均为 TEXT 默认空串，
+        老库 ALTER ADD COLUMN 非破坏性；非团队会话保持空串。
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        for col in ("team_run_id", "team_name", "agent_name"):
+            try:
+                columns = self._db.get_table_info(self.TABLE_NAME)
+                col_names = [c.get("name", "") for c in columns]
+                if col not in col_names:
+                    logger.info(f"[SessionStore] 迁移：添加 {col} 列")
+                    self._db.execute_sql(f"ALTER TABLE {self.TABLE_NAME} ADD COLUMN {col} TEXT DEFAULT ''")
+                    logger.info(f"[SessionStore] {col} 列迁移完成")
+            except Exception as e:
+                logger.warning(f"[SessionStore] {col} 列迁移失败(可能已存在): {e}")
+
+    def _migrate_add_team_members_column(self):
+        """迁移：添加团队成员快照列 team_members（如果不存在）
+
+        🛡️ F3（T2-P3 第 2 层）：恢复团队会话不依赖当前 team.json（历史 run 的
+        team.json 会被新 run 覆盖），成员快照随会话落库。JSON 字符串（成员
+        agent 列表），老库 ALTER ADD COLUMN 非破坏性；非团队会话保持空串。
+        """
+        if not self._db or not self._db.is_connected:
+            return
+        try:
+            columns = self._db.get_table_info(self.TABLE_NAME)
+            col_names = [c.get("name", "") for c in columns]
+            if "team_members" not in col_names:
+                logger.info("[SessionStore] 迁移：添加 team_members 列")
+                self._db.execute_sql(f"ALTER TABLE {self.TABLE_NAME} ADD COLUMN team_members TEXT DEFAULT ''")
+                logger.info("[SessionStore] team_members 列迁移完成")
+        except Exception as e:
+            logger.warning(f"[SessionStore] team_members 列迁移失败(可能已存在): {e}")
+
+
     @property
     def is_initialized(self) -> bool:
         return self._initialized and self._db is not None and self._db.is_connected
@@ -408,6 +628,22 @@ class SessionStore:
         if self._session_repo:
             return self._session_repo.get_all(limit, offset)
         return []
+
+    def get_sessions_lightweight(self, limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取会话轻量列表（不含 messages），启动时使用避免加载大量消息数据"""
+        if self._session_repo:
+            return self._session_repo.get_all_lightweight(limit, offset)
+        return []
+
+    def get_sessions_by_team_run_id(self, run_id: str) -> List[Dict]:
+        """按团队 run_id 获取全部成员会话（轻量，不含 messages）。
+
+        恢复团队会话时使用，绕开 HistoryManager 内存 _history_limit 截断。
+        """
+        if self._session_repo:
+            return self._session_repo.get_by_team_run_id(run_id)
+        return []
+
 
     def delete_session(self, session_id: str) -> bool:
         """删除会话"""

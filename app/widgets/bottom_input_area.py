@@ -1,12 +1,15 @@
 # 大模型输入框
 import math
 import os
+import random
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QMimeData
+from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QMimeData, QEventLoop
 from PySide6.QtGui import (
     QInputMethodEvent,
     QKeyEvent,
@@ -30,6 +33,28 @@ from app.utils.fluent_shim import TextEdit, TransparentToolButton
 
 from app.utils.utils import get_font_family_css
 from app.utils.design_tokens import Colors, font_size_css
+from loguru import logger
+
+# ======== 输入框 placeholder 定时轮播 tips ========
+PLACEHOLDER_TIPS = [
+    "拖拽文件到输入框即可快速分析",
+    "Shift+Enter 换行，Enter 发送",
+    "输入框为空时按 ↑/↓ 切换历史输入",
+    "输入 @ 快速引用项目文件",
+    "输入 / 查看内建指令、技能与智能体",
+    "Ctrl+N 新建对话，Ctrl+L 清空会话",
+    "Ctrl+Z 撤销 / Ctrl+Shift+Z 重做",
+    "点击顶部项目名切换/新建/归档项目",
+    "点击顶部模型名快速切换模型",
+    "右上角「新建窗口」并发处理多任务",
+    "「分支」按钮复制会话到新窗口",
+    "右下角展开历史会话卡片继续对话",
+    "粘贴图片自动保存，发送前就绪",
+    "历史会话自动保存，关闭不丢失",
+]
+
+# 轮播间隔（毫秒）
+_PLACEHOLDER_ROTATE_INTERVAL_MS = 15000
 
 
 class SendableTextEdit(TextEdit):
@@ -55,9 +80,18 @@ class SendableTextEdit(TextEdit):
         self._initializing = True
         self._glow_effect = None
 
+        # 🛡️ R1：粘贴图片异步保存的进行中集合（threading.Event，发送前等待就绪）
+        self._pending_image_saves: list = []
+        self._pending_saves_lock = threading.Lock()
+        # 防重入：嵌套 QEventLoop 等待期间用户再次触发发送（递归进入 wait）
+        self._waiting_image_saves: bool = False
+        # 并发信号量：限制 PNG 编码线程数（大图 64MB 驻留 × N 线程，R1-R2）
+        self._paste_save_semaphore = threading.Semaphore(2)
+
         self._setup_glow_effect()
         self._apply_input_style()
-        self.setPlaceholderText("给 DriFox 发送消息，Enter 发送")
+        # placeholder 仅用 tips 轮播，不用通用提示语
+        self.setPlaceholderText(random.choice(PLACEHOLDER_TIPS))
         self.setAcceptRichText(False)
         self.setLineWrapMode(TextEdit.WidgetWidth)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -112,6 +146,15 @@ class SendableTextEdit(TextEdit):
         self._at_trigger_pos = -1  # @ 触发位置
         self._ime_composing = False  # IME 输入法组合状态
 
+        # detail 参数同步防抖（参考 / 命令触发节流：合并快速敲键 + IME 保护）
+        # 值选择模式（枚举列表）每次 textChanged 都会触发 _sync_detail_params →
+        # update_active_params → _refresh_value_list 重建全部 widget。打拼音时
+        # 每敲一个字母 textChanged 就触发一次重建，打断输入法且浪费性能。
+        # 统一 100ms 防抖：快速敲键期间只执行最后一次过滤/渲染。
+        self._detail_sync_timer = QTimer(self)
+        self._detail_sync_timer.setSingleShot(True)
+        self._detail_sync_timer.timeout.connect(self._on_detail_sync_timeout)
+
         # 卡片选中项：供 execute() 按选中类型执行
         self._card_selected_name: Optional[str] = None
         self._card_selected_type: Optional[str] = (
@@ -143,6 +186,12 @@ class SendableTextEdit(TextEdit):
         self._setting_history_text: bool = False  # 正在 _set_history_text 中，阻止 _on_text_changed 误触发 reset
         self._suppress_slash_trigger: bool = False  # 切换历史时临时阻止 / 触发
 
+        # placeholder 定时随机切换 tips
+        self._placeholder_tip_timer = QTimer(self)
+        self._placeholder_tip_timer.setInterval(_PLACEHOLDER_ROTATE_INTERVAL_MS)
+        self._placeholder_tip_timer.timeout.connect(self._rotate_placeholder_tip)
+        self._placeholder_tip_timer.start()
+
         # 使用 QTimer.singleShot(0, ...) 在事件循环启动后重置初始化标志
         QTimer.singleShot(0, self._finish_initialization)
 
@@ -171,11 +220,17 @@ class SendableTextEdit(TextEdit):
     def _finish_initialization(self):
         """初始化完成后重置标志，允许高度调整"""
 
+    def _rotate_placeholder_tip(self):
+        """定时随机切换 placeholder tips (QTimer 15s 触发 random.choice)"""
+        if not self.toPlainText():
+            self.setPlaceholderText(random.choice(PLACEHOLDER_TIPS))
+
     def set_command_card(self, card):
         """注入命令卡片引用（由 main_widget 创建并注册）"""
         self._command_card_ref = card
         card.commandSelected.connect(self._on_command_selected)
         card.parameterSelected.connect(self._on_parameter_selected)
+        card.parameterDeselected.connect(self._on_parameter_deselected)
         card.parameterValueSelected.connect(self._on_param_value_selected)
         card.dismissed.connect(self._on_card_dismissed)
 
@@ -534,6 +589,15 @@ class SendableTextEdit(TextEdit):
     def _on_parameter_selected(self, param_name: str, param_type: str):
         """参数项被选中（来自 CommandCard.parameterSelected）"""
         self.insert_parameter_text(param_name, param_type)
+        # 插入文本后显式同步参数显隐，确保互斥规则立即生效
+        self._sync_detail_params()
+
+    def _on_parameter_deselected(self, param_name: str, param_type: str):
+        """已激活参数被再次点击（来自 CommandCard.parameterDeselected）
+
+        从输入框中移除该参数并同步卡片激活态。
+        """
+        self.remove_parameter_text(param_name, param_type)
 
     def _on_param_value_selected(self, value: str):
         """值选择完成（来自 CommandCard.parameterValueSelected）
@@ -549,6 +613,30 @@ class SendableTextEdit(TextEdit):
         # 确定要插入的值（含空格时自动加双引号）
         inserted_value = f'"{value}"' if " " in value else value
 
+        # 替换模式：查找光标前最近的 --xxx= 模式，把 = 后的部分输入替换为选中值
+        # 这样用户在 --model=gpt 后选中 "Azure OpenAI:gpt-4o" 时，
+        # 结果是 --model="Azure OpenAI:gpt-4o" 而不是 --model=gpt"Azure OpenAI:gpt-4o"
+        import re
+
+        eq_matches = list(re.finditer(r"--[\w-]+=", before_cursor))
+        if eq_matches:
+            last_eq = eq_matches[-1]
+            eq_end = last_eq.end()
+            partial_input = before_cursor[eq_end:]  # = 到光标之间的部分输入
+
+            if partial_input:
+                cursor = self.textCursor()
+                # 选中 partial_input 并替换为完整值
+                cursor.setPosition(eq_end)
+                cursor.setPosition(cursor_pos, QTextCursor.KeepAnchor)
+                cursor.insertText(inserted_value)
+                cursor.insertText(" ")
+                self.setTextCursor(cursor)
+                self.setFocus(Qt.OtherFocusReason)
+                # 值插入后同步参数显隐（如 --model= 选择完成后）
+                self._sync_detail_params()
+                return
+
         # 检查光标前是否已有 --key=value（用户手动输入后按 Tab 确认）
         # 同时检查原始值和带引号版本
         if value in before_cursor or inserted_value in before_cursor:
@@ -562,6 +650,8 @@ class SendableTextEdit(TextEdit):
         cursor.insertText(" ")
         self.setTextCursor(cursor)
         self.setFocus(Qt.OtherFocusReason)
+        # 值插入后同步参数显隐（如 --model= 选择完成后）
+        self._sync_detail_params()
 
     def _find_partial_param(self, text: str, param_name: str, cursor_pos: int = None):
         """在输入文本中查找参数名的部分匹配（优先光标附近）
@@ -631,6 +721,8 @@ class SendableTextEdit(TextEdit):
                 cursor.insertText(f"{param_name}")
             self.setTextCursor(cursor)
             self.setFocus(Qt.OtherFocusReason)
+            # 参数插入后立即同步卡片显隐（含互斥逻辑）
+            self._sync_detail_params()
             return
 
         # 无部分匹配 → 在光标处追加
@@ -649,6 +741,75 @@ class SendableTextEdit(TextEdit):
             cursor.insertText(f"{prefix}{param_name}")
         self.setTextCursor(cursor)
         self.setFocus(Qt.OtherFocusReason)
+        # 参数插入后立即同步卡片显隐（含互斥逻辑）
+        self._sync_detail_params()
+
+    def remove_parameter_text(self, param_name: str, param_type: str):
+        """从输入框文本中移除指定参数（点击已固化参数时调用）
+
+        与 insert_parameter_text 对称：点击已激活参数时反向删除。
+        - flag: 匹配 `--param-name` 整段并删除
+        - value: 匹配 `--param-name=value` 或 `--param-name="value"` 整段并删除
+          （值含空格时会被引号包裹，按需识别）
+        - positional: 无操作
+
+        删除范围包含该参数段前的一个空格（若有），保留参数位置；
+        光标位置按其在删除段前/中/后智能调整。
+        删除后调用 _sync_detail_params 触发卡片激活态同步。
+        """
+        import re
+
+        if param_type == "positional":
+            return
+
+        text = self.toPlainText()
+        if not text:
+            return
+
+        clean_name = param_name.rstrip("=")
+        # value 类型：参数名 + = + 值（带引号整段 OR 无空格的非引号值）
+        # flag 类型：仅参数名
+        # 末尾用 (?=\s|$) 防止误吞 --with-contexts 这类更长前缀
+        if param_type == "value":
+            pattern = r"\s*" + re.escape(clean_name) + r"""=(?:"[^"]*"|[^\s"]*)(?=\s|$)"""
+        else:
+            pattern = r"\s*" + re.escape(clean_name) + r"(?=\s|$)"
+
+        m = re.search(pattern, text)
+        if not m:
+            return
+
+        start, end = m.start(), m.end()
+        new_text = text[:start] + text[end:]
+
+        # 保留参数后一个空格，避免删除参数后重新进入命令补全列表状态
+        # 如 "/cmd --model=xxx" → "/cmd "（而非 "/cmd"）
+        if new_text and not new_text.endswith(" "):
+            new_text += " "
+
+        # 光标位置智能调整：前/中/后 三段
+        old_pos = self.textCursor().position()
+        if old_pos <= start:
+            new_pos = old_pos
+        elif old_pos >= end:
+            new_pos = old_pos - (end - start)
+        else:
+            new_pos = start
+
+        self.setPlainText(new_text)
+        # setPlainText 重置光标到位置 0，导致 textChanged→_on_slash_trigger_check
+        # 误判为"无空格→列表模式"并启动节流定时器，100ms 后发射 slashTriggered("")
+        # 进而 show_card 调用 _reset_detail_mode 破坏 detail 模式。
+        # 需要立即取消这个过期的节流。
+        self._cancel_slash_throttle()
+        cursor = self.textCursor()
+        cursor.setPosition(max(0, new_pos))
+        self.setTextCursor(cursor)
+        self.setFocus(Qt.OtherFocusReason)
+        # 用正确的光标位置重新评估 / 状态
+        self._on_slash_trigger_check()
+        # 删除后同步卡片显隐（set_active(False) 即取消固化打勾）
+        self._sync_detail_params()
 
     def _sync_detail_params(self):
         """同步 detail 模式的参数显隐：从输入文本提取已存在参数 → 更新卡片
@@ -805,7 +966,30 @@ class SendableTextEdit(TextEdit):
                 and self._history_list[idx].get("text", "") != self.toPlainText()
             ):
                 self._reset_history_mode(clear_attachments=True)
-        # detail 模式参数同步
+        # detail 模式参数同步（防抖：合并快速敲键，参考 / 命令触发节流）
+        # IME 组合进行中（打拼音）跳过同步，避免每次敲键重建值列表打断输入法；
+        # 提交后（preedit 清空）textChanged 再次触发，走防抖后正常同步。
+        self._schedule_detail_sync()
+
+    def _schedule_detail_sync(self):
+        """detail 参数同步防抖调度（参考命令卡片列表刷新方式）
+
+        - IME 组合中（打拼音）直接跳过：每敲一个拼音字母 textChanged 都会
+          触发，若每次重建值列表 widget 会打断输入法。提交后 preedit 清空，
+          textChanged 再次触发，此时正常走防抖同步。
+        - 非组合时统一 100ms 防抖：快速敲键期间合并为最后一次过滤/渲染。
+        """
+        if self._ime_composing:
+            return
+        self._detail_sync_timer.stop()
+        self._detail_sync_timer.start(100)
+
+    def _on_detail_sync_timeout(self):
+        """detail 参数同步防抖超时：执行真正的同步"""
+        # 防抖窗口内若进入 IME 组合（如拼音刚敲下），跳过本次同步，
+        # 等提交后的 textChanged 再触发一轮防抖。
+        if self._ime_composing:
+            return
         self._sync_detail_params()
 
     def _adjust_height_to_content(self):
@@ -920,7 +1104,33 @@ class SendableTextEdit(TextEdit):
         """发送按钮点击事件"""
         if not self.toPlainText().strip():
             return
+        # 🛡️ R1：发送前等待粘贴图片异步保存完成（附件路径就绪）；
+        # 超时未就绪 → 阻止发送并提示（避免正常环境静默丢图）
+        if not self._wait_pending_image_saves():
+            self._warn_image_save_pending()
+            return
         self.toggle_send_button(False)
+        self.sendMessageRequested.emit()
+
+    def _on_enter_send(self):
+        """Enter 键发送：始终触发发送流程
+
+        与按钮点击不同，Enter 键不检查停止模式，直接发射 sendMessageRequested。
+        main_widget 的 _on_send_clicked 内部会处理：
+        - 命令（/xxx）→ 不打断流式直接执行
+        - 非命令 + 流式中 → 先停止再发送新消息
+        """
+        if not self.toPlainText().strip():
+            return
+        # 🛡️ R1：发送前等待粘贴图片异步保存完成（附件路径就绪）；
+        # 超时未就绪 → 阻止发送并提示（避免正常环境静默丢图）
+        if not self._wait_pending_image_saves():
+            self._warn_image_save_pending()
+            return
+        # 如果当前在发送模式（非流式），切换到停止模式表示正在请求
+        if not getattr(self, "_is_stop_mode", False):
+            self.toggle_send_button(False)
+        # 直接发送请求，由 main_widget 内部逻辑处理命令/停止
         self.sendMessageRequested.emit()
 
     def _on_stop_click(self):
@@ -1037,7 +1247,7 @@ class SendableTextEdit(TextEdit):
             if event.modifiers() & Qt.ShiftModifier:
                 super().keyPressEvent(event)  # 换行
             else:
-                self._on_send_click()
+                self._on_enter_send()
                 event.accept()
         elif event.key() == Qt.Key_Up:
             if self._history_index >= 0 or not self.toPlainText():
@@ -1109,7 +1319,10 @@ class SendableTextEdit(TextEdit):
                     tmp_dir.mkdir(parents=True, exist_ok=True)
                     name = f"paste_{uuid.uuid4().hex[:8]}.png"
                     path = str(tmp_dir / name)
-                    img.save(path)
+                    # 🛡️ R1：PNG 编码+写盘移出主线程（大截图同步 save 100-500ms
+                    # 冻结 UI）。UI 立即返回：附件芯片 + [[basename]] 占位符照常
+                    # 插入；发送前 _wait_pending_image_saves 保证文件就绪。
+                    self._save_paste_image_async(img, path)
                     file_paths.append(path)
 
             if file_paths:
@@ -1129,6 +1342,90 @@ class SendableTextEdit(TextEdit):
                 super().insertFromMimeData(source)
             except Exception:
                 pass
+
+    def _save_paste_image_async(self, img: QImage, path: str) -> None:
+        """粘贴图片后台保存（PNG 编码+写盘移出主线程，避免大图粘贴冻结 UI）
+
+        - QImage 隐式共享（implicit sharing）跨线程安全：主线程不再使用 img
+        - 保存失败静默降级并记日志，与原先同步 img.save 失败行为一致
+          （原代码不检查 save 返回值，失败时路径仍加入附件、文件缺失）
+        - 保存完成后 set() 对应 Event，供发送前 _wait_pending_image_saves 等待
+        """
+        ev = threading.Event()
+        with self._pending_saves_lock:
+            self._pending_image_saves.append(ev)
+
+        def _do_save():
+            try:
+                # 并发信号量：限制 PNG 编码线程数（大图内存驻留 × 线程数上限）
+                with self._paste_save_semaphore:
+                    img.save(path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[InputArea] 粘贴图片保存失败: {path}: {e}")
+            finally:
+                ev.set()
+                with self._pending_saves_lock:
+                    try:
+                        self._pending_image_saves.remove(ev)
+                    except ValueError:
+                        pass
+
+        threading.Thread(
+            target=_do_save, daemon=True, name="drifox-paste-image-save"
+        ).start()
+
+    def _wait_pending_image_saves(self, timeout: float = 5.0) -> bool:
+        """发送前等待粘贴图片保存完成（保证附件路径就绪）
+
+        QEventLoop + QTimer 驱动等待：等待期间 UI 事件循环正常运转（不冻结），
+        用户仍可交互。正常情况（保存早已完成）立即返回 True；极端情况
+        （粘贴后立即发送）最多等待 timeout 秒。
+
+        Returns:
+            True = 全部就绪；False = 超时（附件可能未就绪，调用方应阻止发送）。
+
+        🛡️ 防重入：嵌套 QEventLoop 中用户再次触发发送会递归进入本方法，
+        `_waiting_image_saves` 标志阻止递归（外层 wait 已覆盖同一批附件）。
+        """
+        if getattr(self, "_waiting_image_saves", False):
+            return True
+        with self._pending_saves_lock:
+            pending = [ev for ev in self._pending_image_saves if not ev.is_set()]
+        if not pending:
+            return True
+
+        self._waiting_image_saves = True
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                with self._pending_saves_lock:
+                    pending = [ev for ev in self._pending_image_saves if not ev.is_set()]
+                if not pending:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                loop = QEventLoop()
+                QTimer.singleShot(int(min(0.05, remaining) * 1000), loop.quit)
+                loop.exec_()
+        finally:
+            self._waiting_image_saves = False
+
+    def _warn_image_save_pending(self) -> None:
+        """粘贴图片保存超时未就绪 → 阻止发送并提示（R1-C2：避免正常环境静默丢图）"""
+        try:
+            from app.utils.fluent_shim import InfoBar, InfoBarPosition
+            from app.widgets.tab_manager_window import TabManagerWindow
+
+            InfoBar.warning(
+                "图片仍在保存",
+                "粘贴的大图正在后台保存，请稍候再发送",
+                parent=TabManagerWindow.get_instance() or self.window() or self,
+                duration=3000,
+                position=InfoBarPosition.BOTTOM,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[InputArea] 图片保存等待超时（提示失败，静默跳过发送）")
 
     def _setup_glow_effect(self):
         """设置输入卡片发光效果 — 挂载到父卡片而非输入框自身"""

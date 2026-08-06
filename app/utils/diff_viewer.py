@@ -7,13 +7,15 @@ Git Diff 差异对比模块
 """
 import orjson as json
 import difflib
+import os
 import re
+import tempfile
 
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from loguru import logger
 from PySide6.QtWidgets import QDialog, QHBoxLayout
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
@@ -1778,6 +1780,53 @@ class ToolPayloadHtmlGenerator:
     </script>
 </body>
 </html>"""
+
+
+# 不执行，或 loadFinished 不触发）不可靠。差异报告（大 diff 经 Pygments
+# 高亮后膨胀数倍）很容易超限，表现为按钮回调报 "openFile/switchView is
+# not defined"、文件列表点击无响应。统一改用临时文件 + setUrl 加载，
+# 无大小限制且行为一致。
+def _write_temp_html(html: str) -> Optional[str]:
+    """把 HTML 写入系统临时文件，返回路径；失败返回 None"""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".html", prefix="drifox_diff_", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html)
+        return path
+    except Exception as e:
+        logger.warning(f"[DiffViewer] 写入临时 HTML 失败: {e}")
+        return None
+
+
+def _cleanup_temp_files(tmp_files: Optional[List[str]]) -> None:
+    """清理临时 HTML 文件列表"""
+    if not tmp_files:
+        return
+    for p in tmp_files[:]:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
+    tmp_files.clear()
+
+
+def _load_html_to_webview(webview: QWebEngineView, html_content: str, tmp_files: Optional[List[str]] = None) -> None:
+    """把差异 HTML 加载进 webview（临时文件 + setUrl，规避 setHtml 大小限制）
+
+    Args:
+        webview: 目标 QWebEngineView
+        html_content: 完整 HTML 报告
+        tmp_files: 调用方持有的临时文件列表（追加新文件、供后续清理）；为 None 时使用 setHtml
+    """
+    html = html_content or ""
+    if tmp_files is not None:
+        path = _write_temp_html(html)
+        if path is not None:
+            tmp_files.append(path)
+            webview.setUrl(QUrl.fromLocalFile(path))
+            return
+    # 临时文件写入失败（或调用方不管理临时文件）→ 回退 setHtml
+    webview.setHtml(html)
 
 
 class DiffViewerWindow:

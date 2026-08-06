@@ -5,7 +5,7 @@ QFluentWidgets → PySide6 原生组件兼容层（过渡）
 所有 qfluentwidgets 组件被替换为 PySide6 原生实现。
 **目标：逐个文件替换后最终移除本模块。**
 """
-from PySide6.QtCore import Qt, QSize, QObject, QEvent, QEasingCurve, QVariantAnimation, QRectF, QRect, QPropertyAnimation, Property, QPointF, Signal as Signal
+from PySide6.QtCore import Qt, QSize, QObject, QEvent, QEasingCurve, QVariantAnimation, QRectF, QRect, QPropertyAnimation, Property, QPointF, QPoint, Signal as Signal
 from PySide6.QtGui import QIcon, QColor, QFont, QPainter, QPixmap, QAction, QPainterPath
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QFrame, QHBoxLayout, QVBoxLayout,
@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
     QDialog, QMessageBox, QScrollArea, QTabBar, QSizePolicy,
     QStackedWidget, QApplication, QSlider, QLineEdit,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
 )
+from enum import Enum
 from loguru import logger
 
 # 注册 Qt 资源系统（编译自 icons/icons.qrc）
@@ -21,6 +23,19 @@ import app.utils.icons_rc  # noqa: F401
 
 
 # ============ 基础组件 ============
+
+def _load_icon_from_fs(name):
+    """从 icons/ 目录直接加载（不依赖编译资源，发布环境可移除）"""
+    import os
+    icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "icons")
+    for candidate in (f"{name}.svg", f"{name.lower()}.svg", f"{name.capitalize()}.svg"):
+        path = os.path.join(icons_dir, candidate)
+        if os.path.exists(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
+    return QIcon()
+
 
 class FluentIcon:
     """FluentIcon 替代：使用内置 QIcon
@@ -30,7 +45,10 @@ class FluentIcon:
     """
     @staticmethod
     def _find_icon(name):
-        """从本地资源系统查找图标（不区分大小写，支持中文别名）"""
+        """从本地资源系统查找图标（不区分大小写，支持中文别名）
+
+        查找顺序：资源系统(:/icons/) → icons/ 目录文件(文件系统回退) → 中文别名 → PNG 回退
+        """
         # 中文文件名 → 英文概念映射（icons/ 目录中部分 SVG 为中文名）
         _CN_ALIAS = {
             "delete": "删除",
@@ -41,6 +59,12 @@ class FluentIcon:
             "terminal": "工具",
             "image": "成功",
             "pause": "停止",
+            "history": "历史对话",
+            "return": "撤销",
+            "more": "更多",
+            "new": "新建",
+            "sync": "同步",
+            "setting": "配置管理",
         }
         # Qt 资源系统是大小写敏感的，逐一尝试
         candidates = [name, name.lower(), name.capitalize()]
@@ -54,10 +78,31 @@ class FluentIcon:
             icon = QIcon(f":/icons/{alias}.svg")
             if not icon.isNull():
                 return icon
+            icon = QIcon(f":/icons/{alias.lower()}.svg")
+            if not icon.isNull():
+                return icon
+        # 文件系统回退：icons/ 目录（开发环境下新图标未重编译资源时兜底）
+        for c in candidates:
+            icon = _load_icon_from_fs(c)
+            if not icon.isNull():
+                return icon
         # PNG 回退
         icon = QIcon(f":/icons/{name.lower()}.png")
         if not icon.isNull():
             return icon
+        return QIcon()
+
+    @staticmethod
+    def _load_from_fs(name):
+        """从 icons/ 目录直接加载（不依赖编译资源，发布环境可移除）"""
+        import os
+        icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "icons")
+        for candidate in (f"{name}.svg", f"{name.lower()}.svg", f"{name.capitalize()}.svg"):
+            path = os.path.join(icons_dir, candidate)
+            if os.path.exists(path):
+                icon = QIcon(path)
+                if not icon.isNull():
+                    return icon
         return QIcon()
 
     # 常用图标（按使用频率排列）
@@ -86,6 +131,19 @@ class FluentIcon:
     HELP = _find_icon("help")
     MENU = _find_icon("menu")
     APPLICATION = _find_icon("app")
+    # ── P0 移植缺口图标（Fluent System Icons 20px regular）──
+    LINK = _find_icon("Link")               # 链接
+    MESSAGE = _find_icon("Message")         # 消息（信封）
+    SHARE = _find_icon("Share")             # 分享
+    HISTORY = _find_icon("history")         # 历史（→ 历史对话.svg 兜底）
+    BOOK = _find_icon("Book")               # 书
+    HEART = _find_icon("Heart")             # 心
+    ZOOM = _find_icon("Zoom")               # 放大镜
+    CHAT = _find_icon("Chat")               # 聊天气泡
+    ALIGNMENT = _find_icon("Alignment")     # 文本对齐
+    SHOPPING_CART = _find_icon("ShoppingCart")  # 购物车
+    RETURN = _find_icon("return")           # 返回/撤销（→ 撤销.svg 兜底）
+    BROOM = _find_icon("Broom")             # 清扫
 
     @staticmethod
     def icon():
@@ -202,6 +260,203 @@ class InfoBarIcon:
     ERROR = "error"
 
 
+class InfoLevel(Enum):
+    """角标等级"""
+    INFOAMTION = 'Info'
+    SUCCESS = 'Success'
+    ATTENTION = 'Attension'
+    WARNING = "Warning"
+    ERROR = "Error"
+
+
+class InfoBadgePosition(Enum):
+    """角标相对目标控件的位置（P0 移植缺口：main_widget 用 LEFT）"""
+    TOP_RIGHT = 0
+    BOTTOM_RIGHT = 1
+    RIGHT = 2
+    TOP_LEFT = 3
+    BOTTOM_LEFT = 4
+    LEFT = 5
+    NAVIGATION_ITEM = 6
+
+
+class InfoBadgeManager(QObject):
+    """角标位置管理器 — 监听目标控件 move/resize 自动跟随"""
+
+    managers = {}
+
+    def __init__(self, target, badge):
+        super().__init__()
+        self.target = target
+        self.badge = badge
+        self.target.installEventFilter(self)
+
+    def eventFilter(self, obj, e):
+        if obj is self.target:
+            if e.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+                self.badge.move(self.position())
+        return super().eventFilter(obj, e)
+
+    @classmethod
+    def register(cls, name):
+        def wrapper(Manager):
+            if name not in cls.managers:
+                cls.managers[name] = Manager
+            return Manager
+        return wrapper
+
+    @classmethod
+    def make(cls, position, target, badge):
+        if position not in cls.managers:
+            raise ValueError(f'`{position}` is an invalid animation type.')
+        return cls.managers[position](target, badge)
+
+    def position(self):
+        return QPoint()
+
+
+@InfoBadgeManager.register(InfoBadgePosition.TOP_RIGHT)
+class _TopRightInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        pos = self.target.geometry().topRight()
+        return QPoint(pos.x() - self.badge.width() // 2, pos.y() - self.badge.height() // 2)
+
+
+@InfoBadgeManager.register(InfoBadgePosition.RIGHT)
+class _RightInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        x = self.target.geometry().right() - self.badge.width() // 2
+        y = self.target.geometry().center().y() - self.badge.height() // 2
+        return QPoint(x, y)
+
+
+@InfoBadgeManager.register(InfoBadgePosition.BOTTOM_RIGHT)
+class _BottomRightInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        pos = self.target.geometry().bottomRight()
+        return QPoint(pos.x() - self.badge.width() // 2, pos.y() - self.badge.height() // 2)
+
+
+@InfoBadgeManager.register(InfoBadgePosition.TOP_LEFT)
+class _TopLeftInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        return QPoint(self.target.x() - self.badge.width() // 2, self.target.y() - self.badge.height() // 2)
+
+
+@InfoBadgeManager.register(InfoBadgePosition.BOTTOM_LEFT)
+class _BottomLeftInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        pos = self.target.geometry().bottomLeft()
+        return QPoint(pos.x() - self.badge.width() // 2, pos.y() - self.badge.height() // 2)
+
+
+@InfoBadgeManager.register(InfoBadgePosition.LEFT)
+class _LeftInfoBadgeManager(InfoBadgeManager):
+    def position(self):
+        x = self.target.x() - self.badge.width() // 2
+        y = self.target.geometry().center().y() - self.badge.height() // 2
+        return QPoint(x, y)
+
+
+class InfoBadge(QLabel):
+    """信息角标（P0 移植缺口：main_widget:2901 InfoBadge.attension）
+
+    圆形圆角角标，支持 InfoBadge.attension(num, parent=..., target=..., position=...) 用法。
+    构造签名兼容 qfluentwidgets：
+        InfoBadge(parent, level)
+        InfoBadge(text, parent, level)
+        InfoBadge(num, parent, level)
+    """
+    def __init__(self, text="", parent=None, level=InfoLevel.ATTENTION):
+        super().__init__(parent=parent)
+        self.level = InfoLevel.INFOAMTION
+        self.manager = None
+        self.lightBackgroundColor = None
+        self.darkBackgroundColor = None
+        self.setLevel(level)
+        font = self.font()
+        font.setPointSize(9)
+        self.setFont(font)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        if isinstance(text, str):
+            self.setText(text)
+        else:
+            self.setNum(text)
+
+    def setLevel(self, level):
+        self.level = level
+        self.setProperty('level', level.value)
+        self.update()
+
+    def setCustomBackgroundColor(self, light, dark):
+        self.lightBackgroundColor = QColor(light)
+        self.darkBackgroundColor = QColor(dark)
+        self.update()
+
+    def paintEvent(self, e):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._backgroundColor())
+        r = self.height() / 2
+        painter.drawRoundedRect(self.rect(), r, r)
+        super().paintEvent(e)
+
+    def _backgroundColor(self):
+        isDark = isDarkTheme()
+        if self.lightBackgroundColor:
+            return self.darkBackgroundColor if isDark else self.lightBackgroundColor
+        if self.level == InfoLevel.INFOAMTION:
+            return QColor(157, 157, 157) if isDark else QColor(138, 138, 138)
+        if self.level == InfoLevel.SUCCESS:
+            return QColor(108, 203, 95) if isDark else QColor(15, 123, 15)
+        if self.level == InfoLevel.ATTENTION:
+            return QColor(0, 120, 212)  # 强调色（仿 themeColor 默认蓝）
+        if self.level == InfoLevel.WARNING:
+            return QColor(255, 244, 206) if isDark else QColor(157, 93, 0)
+        return QColor(255, 153, 164) if isDark else QColor(196, 43, 28)
+
+    @classmethod
+    def make(cls, text, parent=None, level=InfoLevel.INFOAMTION, target=None,
+             position=InfoBadgePosition.TOP_RIGHT):
+        w = cls(text, parent, level)
+        w.adjustSize()
+        if target:
+            w.manager = InfoBadgeManager.make(position, target, w)
+            w.move(w.manager.position())
+        return w
+
+    @classmethod
+    def info(cls, text, parent=None, target=None, position=InfoBadgePosition.TOP_RIGHT):
+        return cls.make(text, parent, InfoLevel.INFOAMTION, target, position)
+
+    @classmethod
+    def success(cls, text, parent=None, target=None, position=InfoBadgePosition.TOP_RIGHT):
+        return cls.make(text, parent, InfoLevel.SUCCESS, target, position)
+
+    @classmethod
+    def attension(cls, text, parent=None, target=None, position=InfoBadgePosition.TOP_RIGHT):
+        """注意角标（qfluentwidgets 官方拼写为 attension，非 attention）"""
+        return cls.make(text, parent, InfoLevel.ATTENTION, target, position)
+
+    @classmethod
+    def warning(cls, text, parent=None, target=None, position=InfoBadgePosition.TOP_RIGHT):
+        return cls.make(text, parent, InfoLevel.WARNING, target, position)
+
+    @classmethod
+    def error(cls, text, parent=None, target=None, position=InfoBadgePosition.TOP_RIGHT):
+        return cls.make(text, parent, InfoLevel.ERROR, target, position)
+
+    @classmethod
+    def custom(cls, text, light, dark, parent=None, target=None,
+               position=InfoBadgePosition.TOP_RIGHT):
+        w = cls.make(text, parent, target=target, position=position)
+        w.setCustomBackgroundColor(light, dark)
+        return w
+
+
 class PrimaryPushButton(QPushButton):
     """主操作按钮 - 蓝色主题"""
     def __init__(self, text="", parent=None):
@@ -246,6 +501,39 @@ class PushButton(QPushButton):
             }
             QPushButton:pressed {
                 background-color: rgba(128, 128, 128, 0.32);
+            }
+            QPushButton:disabled {
+                color: palette(mid);
+            }
+        """)
+
+
+class TransparentPushButton(PushButton):
+    """透明按钮 — 去边框透明版（P0 移植缺口：tab_panel 用）
+
+    兼容 qfluentwidgets PushButton 的三种构造签名：
+        TransparentPushButton(parent)
+        TransparentPushButton(text, parent, icon)
+        TransparentPushButton(icon, text, parent)
+    """
+    def __init__(self, text="", parent=None, icon=None):
+        # 兼容 (icon, text, parent) 签名：icon 可能是 QIcon / FluentIcon 成员(QIcon)
+        if isinstance(text, (QIcon, FluentIcon)) and not isinstance(text, str):
+            icon, text, parent = text, parent, icon
+        super().__init__(text, parent, icon)
+        self.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                color: palette(buttonText);
+                border-radius: 4px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(128, 128, 128, 0.15);
+            }
+            QPushButton:pressed {
+                background-color: rgba(128, 128, 128, 0.28);
             }
             QPushButton:disabled {
                 color: palette(mid);
@@ -621,6 +909,35 @@ class SingleDirectionScrollArea(QScrollArea):
         """)
 
 
+class ScrollArea(QScrollArea):
+    """透明滚动区域（P0 移植缺口：插件用）
+
+    提供与 qfluentwidgets ScrollArea 兼容的透明背景 + enableTransparentBackground API。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+        """)
+        self.viewport().setStyleSheet("background: transparent;")
+
+    def enableTransparentBackground(self):
+        """使滚动区域与内容背景透明"""
+        self.setStyleSheet("QScrollArea{border: none; background: transparent}")
+        if self.widget():
+            self.widget().setStyleSheet("QWidget{background: transparent}")
+
+
 class MessageBox(QDialog):
     """消息对话框"""
 
@@ -958,6 +1275,11 @@ class ExpandSettingCard(SettingCard):
         self._expand_icon.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._update_expand_icon()
         self.hBoxLayout.addWidget(self._expand_icon)
+        # 兼容别名：qfluentwidgets ExpandSettingCard 的 expandButton（可点击按钮）。
+        # shim 版展开交互走 mouseReleaseEvent 点击卡片空白处，_expand_icon 仅作
+        # 视觉指示；部分子类（如 HookListSettingCard._update_button_position）用
+        # expandButton 作为布局位置锚点，提供别名避免 AttributeError。
+        self.expandButton = self._expand_icon
 
     def addWidget(self, widget, stretch=0, alignment=Qt.AlignmentFlag.AlignLeft):
         """添加 widget 到展开图标左侧，确保展开图标始终在右侧"""
@@ -1069,8 +1391,113 @@ class SegmentedWidget(QTabBar):
             self.setCurrentIndex(idx)
 
 
-class BodyLabel(QLabel):
+class Pivot(QWidget):
+    """Pivot 横向标签页切换控件（routeKey 驱动，信号发射 routeKey）
+
+    兼容 qfluentwidgets Pivot 契约：
+    - Pivot(header) 实例化（header 为可选标题/父窗口参数）
+    - addItem(routeKey, text, icon=None, onClick=None)
+    - setCurrentItem(routeKey) 高亮当前项
+    - currentItemChanged = Signal(str)：发射 routeKey（非显示文本，供路由跳转）
+    """
+
+    currentItemChanged = Signal(str)  # routeKey
+
+    def __init__(self, header=None, parent=None):
+        # 兼容两种调用：Pivot(header) / Pivot(parent)
+        if isinstance(header, QWidget) and parent is None:
+            parent = header
+            header = None
+        super().__init__(parent)
+        self._header = header
+        self._route_keys: list = []
+        self._buttons: dict = {}
+        self._current: str = ""
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self.setStyleSheet("""
+            Pivot QPushButton {
+                background: transparent;
+                border: none;
+                padding: 6px 14px;
+                color: palette(text);
+                border-bottom: 2px solid transparent;
+            }
+            Pivot QPushButton:checked {
+                color: #0078d4;
+                border-bottom: 2px solid #0078d4;
+            }
+            Pivot QPushButton:hover {
+                background: palette(alternate-base);
+                border-radius: 4px;
+            }
+        """)
+
+    def addItem(self, routeKey: str, text: str = None, icon=None, onClick=None):
+        """添加一个 pivot 项
+
+        Args:
+            routeKey: 路由键（setCurrentItem/currentItemChanged 使用）
+            text: 显示文本（为 None 时使用 routeKey）
+            icon: QIcon 或 None
+            onClick: 点击回调（可选）
+        """
+        if text is None:
+            text = routeKey
+        btn = QPushButton(text, self)
+        if icon is not None:
+            btn.setIcon(icon)
+        btn.setCheckable(True)
+        btn.clicked.connect(lambda: self.setCurrentItem(routeKey))
+        if onClick is not None:
+            btn.clicked.connect(onClick)
+        self._route_keys.append(routeKey)
+        self._buttons[routeKey] = btn
+        self._layout.addWidget(btn)
+        if not self._current:
+            self.setCurrentItem(routeKey)
+        return btn
+
+    def setCurrentItem(self, routeKey: str):
+        """按 routeKey 高亮当前项并发射 currentItemChanged（仅变化时）"""
+        if routeKey not in self._buttons:
+            return
+        if self._current == routeKey:
+            # 仍同步选中状态（如按钮被直接点击）
+            for k, b in self._buttons.items():
+                b.setChecked(k == routeKey)
+            return
+        old = self._current
+        self._current = routeKey
+        for k, b in self._buttons.items():
+            b.setChecked(k == routeKey)
+        if old != routeKey:
+            self.currentItemChanged.emit(routeKey)
+
+    def currentItem(self) -> str:
+        """返回当前 routeKey"""
+        return self._current
+
+
+class FluentLabelBase(QLabel):
+    """标签基类（供插件 isinstance 判断统一字体处理）
+
+    兼容 qfluentwidgets 的 FluentLabelBase：所有标签类继承此基类，
+    插件通过 isinstance(child, FluentLabelBase) 识别文字标签统一设置字体。
+    """
+
+    def __init__(self, text="", parent=None):
+        # 兼容：第一个参数是 parent widget 而非文本
+        if isinstance(text, QWidget) and parent is None:
+            parent = text
+            text = ""
+        super().__init__(text, parent)
+
+
+class BodyLabel(FluentLabelBase):
     """正文标签"""
+
     def __init__(self, text="", parent=None):
         if isinstance(text, QWidget) and parent is None:
             parent = text
@@ -1299,7 +1726,7 @@ class SpinBox(QSpinBox):
         self.setStyleSheet(SpinBoxStyles.spin_box())
 
 
-class StrongBodyLabel(QLabel):
+class StrongBodyLabel(FluentLabelBase):
     """强调正文标签"""
     def __init__(self, text="", parent=None):
         # 兼容：第一个参数是 parent widget 而非文本
@@ -1335,7 +1762,7 @@ class ToolButton(QPushButton):
 
 # ============ 额外组件 ============
 
-class CaptionLabel(QLabel):
+class CaptionLabel(FluentLabelBase):
     """说明文字标签"""
     def __init__(self, text="", parent=None):
         if isinstance(text, QWidget) and parent is None:
@@ -1459,6 +1886,67 @@ class ConfigValidator:
 
     def correct(self, value):
         return value
+
+
+class BoolValidator(ConfigValidator):
+    """布尔值验证器（P1 配置体系）"""
+    def validate(self, value):
+        return isinstance(value, bool)
+
+    def correct(self, value):
+        return bool(value)
+
+
+class OptionsValidator(ConfigValidator):
+    """选项枚举验证器（P1 配置体系）"""
+    def __init__(self, options):
+        self.options = options
+
+    def validate(self, value):
+        return value in self.options
+
+    def correct(self, value):
+        return value if value in self.options else (self.options[0] if self.options else value)
+
+
+class RangeValidator(ConfigValidator):
+    """数值范围验证器（P1 配置体系）"""
+    def __init__(self, min_, max_):
+        self.min = min_
+        self.max = max_
+
+    def validate(self, value):
+        try:
+            return self.min <= value <= self.max
+        except TypeError:
+            return False
+
+    def correct(self, value):
+        try:
+            if value < self.min:
+                return self.min
+            if value > self.max:
+                return self.max
+        except TypeError:
+            pass
+        return value
+
+
+class OptionsConfigItem(ConfigItem):
+    """选项配置项（P1 配置体系，映射 ConfigItem）"""
+    def __init__(self, key, default, options, restart=False, validator=None):
+        super().__init__(key, default)
+        self.options = options
+        self.restart = restart
+        self.validator = validator or OptionsValidator(options)
+
+
+class RangeConfigItem(ConfigItem):
+    """数值范围配置项（P1 配置体系，映射 ConfigItem）"""
+    def __init__(self, key, default, min_, max_, restart=False, validator=None):
+        super().__init__(key, default)
+        self.restart = restart
+        self.validator = validator or RangeValidator(min_, max_)
 
 
 class LineEdit(QLineEdit):
@@ -1701,6 +2189,132 @@ class MessageBoxBase(QDialog):
 
     def exec(self):
         return super().exec()
+
+
+class MaskDialogBase(QDialog):
+    """带半透明遮罩的对话框基类（P0 移植缺口：原项目 10 处用）
+
+    仿 qfluentwidgets MaskDialogBase 纯 PySide6 实现：
+    - 半透明遮罩（windowMask，黑/白色半透明）
+    - 居中圆角卡片（widget，QFrame）
+    - 可拖拽（widget 空白处按下拖动）
+    - 点击遮罩关闭开关（setClosableOnMaskClicked）
+    - 阴影（setShadowEffect）与遮罩颜色（setMaskColor）
+
+    子类用法（参考原项目 common_dialogs.py / memory_card.py）：
+        super().__init__(parent)
+        self.setShadowEffect(60, (0, 10), QColor(0, 0, 0, 100))
+        self.setClosableOnMaskClicked(True)
+        self.setDraggable(True)
+        self.setMaskColor(QColor(0, 0, 0, 76))
+        self.widget.setObjectName("myDialog")
+        self.widget.setStyleSheet(...)
+        layout = QVBoxLayout(self.widget); ...
+        self.widget.setFixedSize(400, 240)
+        # 居中：子类实现 _center_widget 并在 resizeEvent 中调用
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self._isClosableOnMaskClicked = False
+        self._isDraggable = False
+        self._dragPos = QPoint()
+        self._hBoxLayout = QHBoxLayout(self)
+        self.windowMask = QWidget(self)
+
+        # dialog box in the center of mask, all widgets take it as parent
+        self.widget = QFrame(self, objectName='centerWidget')
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # 铺满父窗口（parent 为 None 时回退到屏幕可用区域大小）
+        if parent is not None:
+            self.setGeometry(0, 0, parent.width(), parent.height())
+        else:
+            screen = QApplication.primaryScreen()
+            geo = screen.availableGeometry() if screen else QRect(0, 0, 800, 600)
+            self.setGeometry(0, 0, geo.width(), geo.height())
+
+        c = 0 if isDarkTheme() else 255
+        self.windowMask.resize(self.size())
+        self.windowMask.setStyleSheet(f'background:rgba({c}, {c}, {c}, 0.6)')
+        self._hBoxLayout.addWidget(self.widget)
+        self.setShadowEffect()
+
+        self.window().installEventFilter(self)
+        self.windowMask.installEventFilter(self)
+        self.widget.installEventFilter(self)
+
+    def setShadowEffect(self, blurRadius=60, offset=(0, 10), color=QColor(0, 0, 0, 100)):
+        """为卡片 widget 添加阴影"""
+        shadowEffect = QGraphicsDropShadowEffect(self.widget)
+        shadowEffect.setBlurRadius(blurRadius)
+        shadowEffect.setOffset(*offset)
+        shadowEffect.setColor(color)
+        self.widget.setGraphicsEffect(None)
+        self.widget.setGraphicsEffect(shadowEffect)
+
+    def setMaskColor(self, color):
+        """设置遮罩颜色（QColor，含 alpha）"""
+        self.windowMask.setStyleSheet(f"""
+            background: rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})
+        """)
+
+    def showEvent(self, e):
+        """淡入动画"""
+        opacityEffect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(opacityEffect)
+        opacityAni = QPropertyAnimation(opacityEffect, b'opacity', self)
+        opacityAni.setStartValue(0)
+        opacityAni.setEndValue(1)
+        opacityAni.setDuration(200)
+        opacityAni.setEasingCurve(QEasingCurve.Type.InSine)
+        opacityAni.finished.connect(lambda: self.setGraphicsEffect(None))
+        opacityAni.start()
+        super().showEvent(e)
+
+    def done(self, code):
+        """关闭（简化：无淡出动画，直接关闭）"""
+        self.setGraphicsEffect(None)
+        QDialog.done(self, code)
+
+    def isClosableOnMaskClicked(self):
+        return self._isClosableOnMaskClicked
+
+    def setClosableOnMaskClicked(self, isClosable):
+        self._isClosableOnMaskClicked = isClosable
+
+    def setDraggable(self, draggable):
+        self._isDraggable = draggable
+
+    def isDraggable(self):
+        return self._isDraggable
+
+    def resizeEvent(self, e):
+        self.windowMask.resize(self.size())
+
+    def eventFilter(self, obj, e):
+        if obj is self.window():
+            if e.type() == QEvent.Type.Resize:
+                self.resize(e.size())
+        elif obj is self.windowMask:
+            if e.type() == QEvent.Type.MouseButtonRelease and e.button() == Qt.MouseButton.LeftButton \
+                    and self.isClosableOnMaskClicked():
+                self.reject()
+        elif obj is self.widget and self.isDraggable():
+            if e.type() == QEvent.Type.MouseButtonPress and e.button() == Qt.MouseButton.LeftButton:
+                if not self.widget.childrenRegion().contains(e.pos()):
+                    self._dragPos = e.pos()
+                    return True
+            elif e.type() == QEvent.Type.MouseMove and not self._dragPos.isNull():
+                pos = self.widget.pos() + e.pos() - self._dragPos
+                pos.setX(max(0, min(pos.x(), self.width() - self.widget.width())))
+                pos.setY(max(0, min(pos.y(), self.height() - self.widget.height())))
+                self.widget.move(pos)
+                return True
+            elif e.type() == QEvent.Type.MouseButtonRelease:
+                self._dragPos = QPoint()
+
+        return super().eventFilter(obj, e)
 
 
 # ============ 工具函数 ============

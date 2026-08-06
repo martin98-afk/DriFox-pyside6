@@ -13,6 +13,14 @@ from html import escape
 
 from app.utils.design_tokens import scale_font_size, _get_global_font, Colors
 from app.utils.utils import get_font_family_css
+from pygments import highlight as _pyg_highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import get_lexer_for_filename, get_lexer_by_name, TextLexer
+
+# 行内 diff 专用 formatter（缓存）：按风格切换，nowrap 不包裹 <pre>，noclasses 输出内联 color 的 token <span>
+_DIFF_FORMATTER_CACHE: dict = {"style": None, "formatter": None}
+# 行内 diff 高亮风格（与 message_card.py 同步，由 set_diff_highlight_style 切换）
+_current_diff_style = "dracula"
 
 # 预编译正则表达式（模块级别缓存，避免重复编译）
 _CODE_BLOCK_PATTERN = re.compile(r"```[\w]*\n")
@@ -1035,3 +1043,712 @@ def format_timestamp(ts: str) -> str:
     if len(ts) > 5:
         return ts[-5:]
     return ts
+
+# ===== P2 补齐（从原项目同步）=====
+
+    def _cell(kind, ln, sign, code_html, empty=False):
+        if empty:
+            return (
+                '<div class="diff-line diff-seg-empty">'
+                '<span class="line-num">&nbsp;</span>'
+                '<span class="line-sign"></span>'
+                '<span class="line-code">&nbsp;</span></div>'
+            )
+        cls = "diff-del" if kind == "del" else "diff-add"
+        return (
+            f'<div class="diff-line {cls}">'
+            f'<span class="line-num">{ln}</span>'
+            f'<span class="line-sign">{sign}</span>'
+            f'<span class="line-code">{code_html}</span></div>'
+        )
+
+    rows = []
+    _prev_blank = False  # 折叠连续空上下文行，只保留一条细分隔线
+    for seg in segments:
+        if isinstance(seg, list):
+            _prev_blank = False
+            dels = [p for p in seg if p["kind"] == "del"]
+            adds = [p for p in seg if p["kind"] == "add"]
+            pair = min(len(dels), len(adds))
+
+            # === 双模式差异段 ===
+            # .diff-seg-col（单列默认）：所有删除先、所有新增后（带词级高亮）
+            # .diff-seg-paired（双列 split-view）：左右对照的配对行
+            rows.append('<div class="diff-segment">')
+
+            # ── 单列视图：所有删除行先、所有新增行后（带词级高亮） ──
+            # 先把配对行的词级高亮 HTML 算好缓存到 paired_htmls，
+            # 再分两段输出：先 del 全打，再 add 全打——避免 del/add 交替时
+            # 既要保持 "del→add" 配对又得来回切上下文。
+            # TODO(refactor): 抽出 paired-row 渲染辅助函数与双列分支共用，避免再出"忘了同步"回归
+            rows.append('<div class="diff-seg-col">')
+            paired_htmls = []
+            for k in range(pair):
+                od, oa = dels[k], adds[k]
+                old_html, new_html = _highlighted_word_diff_html(od["text"], oa["text"], od["lexer"])
+                paired_htmls.append((od, old_html, oa, new_html))
+
+            # 1) 所有删除行
+            for k in range(pair):
+                od, old_html, _, _ = paired_htmls[k]
+                rows.append(_cell("del", od["old_ln"], "-", old_html))
+            for k in range(pair, len(dels)):
+                od = dels[k]
+                rows.append(_cell("del", od["old_ln"], "-", _highlight_code_line(od["text"], od["lexer"])))
+
+            # 2) 所有新增行
+            for k in range(pair):
+                _, _, oa, new_html = paired_htmls[k]
+                rows.append(_cell("add", oa["new_ln"], "+", new_html))
+            for k in range(pair, len(adds)):
+                oa = adds[k]
+                rows.append(_cell("add", oa["new_ln"], "+", _highlight_code_line(oa["text"], oa["lexer"])))
+            rows.append("</div>")
+
+            # ── 双列视图：配对行（旧左新右），带词级高亮 ──
+            rows.append('<div class="diff-seg-paired">')
+            for k in range(pair):
+                od, oa = dels[k], adds[k]
+                old_html, new_html = _highlighted_word_diff_html(od["text"], oa["text"], od["lexer"])
+                rows.append('<div class="diff-seg-row">')
+                rows.append(_cell("del", od["old_ln"], "-", old_html))
+                rows.append(_cell("add", oa["new_ln"], "+", new_html))
+                rows.append("</div>")
+            for k in range(pair, len(dels)):
+                od = dels[k]
+                rows.append('<div class="diff-seg-row">')
+                rows.append(_cell("del", od["old_ln"], "-", _highlight_code_line(od["text"], od["lexer"])))
+                rows.append(_cell("add", "", "", "", empty=True))
+                rows.append("</div>")
+            for k in range(pair, len(adds)):
+                oa = adds[k]
+                rows.append('<div class="diff-seg-row">')
+                rows.append(_cell("del", "", "", "", empty=True))
+                rows.append(_cell("add", oa["new_ln"], "+", _highlight_code_line(oa["text"], oa["lexer"])))
+                rows.append("</div>")
+            rows.append("</div>")  # /.diff-seg-paired
+
+            rows.append("</div>")  # /.diff-segment
+        elif seg["kind"] == "file":
+            _prev_blank = False
+            rows.append(
+                f'<div class="diff-line diff-file-header diff-meta">'
+                f'<span class="line-num">&nbsp;</span>'
+                f'<span class="line-sign"></span>'
+                f'<span class="line-code" style="color: #8b949e; font-weight: 600;">{escape(seg["text"])}</span></div>'
+            )
+        elif seg["kind"] == "hunk":
+            _prev_blank = False
+            rows.append(
+                f'<div class="diff-line diff-hunk diff-meta">'
+                f'<span class="line-num">&nbsp;</span>'
+                f'<span class="line-sign"></span>'
+                f'<span class="line-code">{escape(seg["text"])}</span></div>'
+            )
+        elif seg["kind"] == "truncated":
+            _prev_blank = False
+            rows.append(
+                f'<div class="diff-line diff-truncated diff-meta">'
+                f'<span class="line-num">&nbsp;</span>'
+                f'<span class="line-sign"></span>'
+                f'<span class="line-code">⋯ 省略 {shown} 行 ⋯</span></div>'
+            )
+        else:  # ctx
+            # 空白上下文行（源文件里的空行）折叠成一条紧凑细分隔线，避免单列模式下
+            # 段落差异之间出现 bulky 的空行。连续多个空行只保留第一条。
+            if seg["text"].strip() == "":
+                if _prev_blank:
+                    continue
+                _prev_blank = True
+                rows.append(
+                    '<div class="diff-line diff-ctx diff-ctx-blank">'
+                    '<span class="line-num">&nbsp;</span>'
+                    '<span class="line-sign"></span>'
+                    '<span class="line-code">&nbsp;</span></div>'
+                )
+                continue
+            _prev_blank = False
+            rows.append(
+                f'<div class="diff-line diff-ctx">'
+                f'<span class="line-num">{seg["new_ln"] if seg["new_ln"] > 0 else ""}</span>'
+                f'<span class="line-sign"></span>'
+                f'<span class="line-code">{_highlight_code_line(seg["text"], seg["lexer"])}</span></div>'
+            )
+
+    return "".join(rows)
+
+
+# 内建工具图标映射（按模块×操作类型分类 → SVG 图标文件名）
+_TOOL_ICON_MAP = {
+    # 文件工具 - 读取
+    "read": "read",
+    "todoread": "todo",
+    # 文件工具 - 写入/编辑
+    "write": "编辑",
+    "edit": "编辑",
+    "multi_edit": "编辑",
+    "todowrite": "todo",
+    # 文件工具 - 搜索/扫描
+    "grep": "Search",
+    "glob": "Search",
+    "list": "folder",
+    "scan_repo": "Search",
+    "stage_files": "Search",
+    # 终端/后台命令
+    "bash": "shell",
+    "bg_start": "shell",
+    "bg_stop": "shell",
+    "bg_logs": "shell",
+    "bg_list": "shell",
+    # 网络工具
+    "websearch": "websearch",
+    "webfetch": "websearch",
+    # 子智能体任务
+    "subagent_para": "设置-subagent",
+    "subagent_status": "设置-subagent",
+    "subagent_dag": "设置-subagent",
+    # 技能工具
+    "skill": "技能",
+    "list_skills": "技能",
+    # 提问工具
+    "question": "question",
+    # 诊断工具
+    "get_diagnostics": "工具",
+    # 截图工具
+    "screenshot": "裁剪",
+    "mouse": "鼠标",
+    "keyboard": "233键盘-线性",
+    # LSP 工具（默认 = 工具图标；具体 operation 由 _get_tool_icon 解析）
+    "lsp": "工具",
+    # CodeGraph 代码智能
+    "codegraph_explore": "Search",
+    # 团队协作工具
+    "team_send_message": "邮件-发送",
+    "team_list_members": "团队",
+    # 上传文件
+    "upload_file": "upload-file",
+}
+
+# 工具名 → 中文显示名
+_TOOL_CN_NAME_MAP = {
+    "read": "读取",
+    "todoread": "查看待办",
+    "write": "写入",
+    "edit": "编辑",
+    "multi_edit": "批量编辑",
+    "todowrite": "更新待办",
+    "grep": "搜索",
+    "glob": "匹配",
+    "list": "列出文件",
+    "scan_repo": "扫描仓库",
+    "stage_files": "标记文件",
+    "bash": "执行命令",
+    "bg_start": "后台启动",
+    "bg_stop": "后台停止",
+    "bg_logs": "后台日志",
+    "bg_list": "后台列表",
+    "websearch": "网页搜索",
+    "webfetch": "抓取网页",
+    "subagent_para": "分发任务",
+    "subagent_status": "查询任务状态",
+    "subagent_dag": "分发工作流",
+    "skill": "加载技能",
+    "list_skills": "列出技能",
+    "question": "提问",
+    "get_diagnostics": "诊断",
+    "screenshot": "截图",
+    "mouse": "鼠标",
+    "keyboard": "键盘",
+    "lsp": "LSP",
+    "codegraph_explore": "代码探索",
+    "team_send_message": "发送邮件",
+    "team_list_members": "团队成员",
+    "upload_file": "上传文件",
+}
+
+
+# LSP 工具 operation → 图标（SVG 图标名）
+_LSP_OPERATION_ICON_MAP = {
+    "diagnostics": "工具",
+    "documentSymbols": "Search",
+    "goToDefinition": "Search",
+    "findReferences": "Search",
+    "hover": "question",
+    "listServers": "folder",
+}
+
+
+
+
+def _get_diff_formatter():
+    """获取当前 diff 高亮 formatter，随主题风格切换重建"""
+    style = _current_diff_style
+    if _DIFF_FORMATTER_CACHE["style"] != style:
+        _DIFF_FORMATTER_CACHE["style"] = style
+        _DIFF_FORMATTER_CACHE["formatter"] = HtmlFormatter(nowrap=True, style=style, noclasses=True)
+    return _DIFF_FORMATTER_CACHE["formatter"]
+
+
+_TEXT_LEXER = TextLexer()
+_DIFF_LEXER_CACHE: dict = {}
+# 防御上限：扩展名种类有限（<64），超限整体清空防膨胀
+_DIFF_LEXER_CACHE_MAX = 64
+
+# 扩展名 → pygments lexer 别名（get_lexer_for_filename 找不到时的兜底）
+_EXT_LEXER_MAP = {
+    ".py": "python",
+    ".pyi": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".less": "less",
+    ".json": "json",
+    ".jsonc": "json",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".cs": "csharp",
+    ".rb": "ruby",
+    ".php": "php",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
+    ".fish": "bash",
+    ".sql": "sql",
+    ".xml": "xml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".conf": "ini",
+    ".lua": "lua",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".swift": "swift",
+    ".r": "r",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".dart": "dart",
+    ".vue": "vue",
+    ".dockerfile": "docker",
+    ".mk": "makefile",
+    ".cmake": "cmake",
+    ".tf": "hcl",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".erl": "erlang",
+    ".hs": "haskell",
+    ".scala": "scala",
+    ".groovy": "groovy",
+    ".ps1": "powershell",
+    ".bat": "batch",
+}
+
+
+
+def _get_diff_lexer(path: str):
+    """根据文件路径推断 lexer，按扩展名缓存，避免重复构造（构造开销大）"""
+    if not path or path == "/dev/null":
+        return _TEXT_LEXER
+    key = os.path.splitext(path)[1].lower() or path
+    cached = _DIFF_LEXER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    lex = _TEXT_LEXER
+    try:
+        lex = get_lexer_for_filename(path)
+    except Exception:
+        alias = _EXT_LEXER_MAP.get(key)
+        if alias:
+            try:
+                lex = get_lexer_by_name(alias)
+            except Exception:
+                lex = _TEXT_LEXER
+    if len(_DIFF_LEXER_CACHE) >= _DIFF_LEXER_CACHE_MAX:
+        _DIFF_LEXER_CACHE.clear()  # 防御膨胀：超限整体清空
+    _DIFF_LEXER_CACHE[key] = lex
+    return lex
+
+
+
+def _get_tool_cn_name(tool_name: str) -> str:
+    """获取工具的中文显示名"""
+    # MCP 工具：返回服务名
+    if tool_name.startswith("mcp__"):
+        return "__".join(tool_name.split("__")[2:]) if len(tool_name.split("__")) > 2 else "MCP"
+    if tool_name == "mcp_list_servers":
+        return "MCP列表"
+    return _TOOL_CN_NAME_MAP.get(tool_name, tool_name)
+
+
+
+def _get_tool_icon(tool_name: str, tool_args: dict = None) -> str:
+    """[已弃用] 根据工具名查找图标（保留兼容，返回图标文件名）
+
+    新代码请使用 _get_tool_icon_name + _get_tool_icon_html 组合。
+    """
+    return _get_tool_icon_name(tool_name, tool_args)
+
+
+
+def _get_tool_icon_html(icon_name: str, size: int = 18) -> str:
+    """生成工具图标的 HTML <img> 标签（主题感知）
+
+    根据当前主题选择 qrc:/icons 或 qrc:/icons_light 前缀。
+    """
+    try:
+        from app.utils.theme_manager import theme_manager
+
+        prefix = "qrc:/icons_light" if theme_manager.is_light_theme() else "qrc:/icons"
+    except Exception:
+        prefix = "qrc:/icons"
+    return f'<img src="{prefix}/{icon_name}.svg" style="width:{size}px;height:{size}px;pointer-events:none;" />'
+
+
+
+def _get_tool_icon_name(tool_name: str, tool_args: dict = None) -> str:
+    """根据工具名（必要时结合 tool_args）查找图标文件名（不含扩展名）
+
+    普通工具直接查 _TOOL_ICON_MAP；
+    LSP 工具按 operation 参数切换图标。
+    """
+    if tool_name == "lsp" and tool_args:
+        operation = tool_args.get("operation", "")
+        if operation in _LSP_OPERATION_ICON_MAP:
+            return _LSP_OPERATION_ICON_MAP[operation]
+    return _TOOL_ICON_MAP.get(tool_name, "工具")
+
+
+
+def _highlight_code_line(text: str, lexer) -> str:
+    """对单行代码做语法高亮，返回带内联 color 的 HTML（nowrap，无 <pre> 包裹）
+
+    注意：Pygments 在 nowrap 模式下会在输出末尾追加一个 "\\n"。词级差异会把每个
+    词段单独高亮后拼接，若保留该换行，整行会被切碎、出现多余空白与异常换行。
+    这里统一剥掉末尾换行（高亮的都是单行/单词段，不含真实换行）。
+    """
+    if lexer is None or lexer is _TEXT_LEXER:
+        return escape(text)
+    try:
+        return _pyg_highlight(text, lexer, _get_diff_formatter()).rstrip("\n")
+    except Exception:
+        return escape(text)
+
+
+
+def _highlighted_word_diff_html(old_text: str, new_text: str, lexer) -> tuple:
+    """词级差异高亮（背景叠加）+ 每段语法高亮，返回 (old_html, new_html)
+
+    在原有词级差异（.word-del/.word-add 背景叠加）基础上，对每个词段再做
+    Pygments 着色，使"改了什么"和"语法结构"同时可见。
+    """
+    if len(old_text) + len(new_text) > 2000:
+        return _highlight_code_line(old_text, lexer), _highlight_code_line(new_text, lexer)
+    old_tokens = _WORD_RE.findall(old_text) or [old_text]
+    new_tokens = _WORD_RE.findall(new_text) or [new_text]
+    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+    old_parts = []
+    new_parts = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            old_parts.append(_highlight_code_line("".join(old_tokens[i1:i2]), lexer))
+            new_parts.append(_highlight_code_line("".join(new_tokens[j1:j2]), lexer))
+        elif tag == "delete":
+            old_parts.append(f'<span class="word-del">{_highlight_code_line("".join(old_tokens[i1:i2]), lexer)}</span>')
+        elif tag == "insert":
+            new_parts.append(f'<span class="word-add">{_highlight_code_line("".join(new_tokens[j1:j2]), lexer)}</span>')
+        elif tag == "replace":
+            old_parts.append(f'<span class="word-del">{_highlight_code_line("".join(old_tokens[i1:i2]), lexer)}</span>')
+            new_parts.append(f'<span class="word-add">{_highlight_code_line("".join(new_tokens[j1:j2]), lexer)}</span>')
+    return "".join(old_parts), "".join(new_parts)
+
+
+# 预编译正则表达式（模块级别缓存，避免重复编译）
+_CODE_BLOCK_PATTERN = re.compile(r"```[\w]*\n")
+_CODE_BLOCK_FINAL_PATTERN = re.compile(r"```")
+# 匹配 HTML 代码块标签
+_HTML_CODE_BLOCK_PATTERN = re.compile(r"<(pre|code)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+# HTML 标签清理正则（避免每次调用 re.sub）
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+# UUID 模式（用于提取 task_id）
+_UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+# Null 字符清理（编译一次，多次使用）
+_NULL_CHAR = "\x00"  # 避免 str.replace 被重复调用
+
+
+
+def _normalize_option_item(opt) -> dict:
+    """将选项条目规范化为 dict 格式
+
+    兼容 LLM 传参的各种格式：
+    - dict: {"label": "...", "description": "..."}
+    - str:  "选项文本"
+    - 其他: 转为字符串
+    """
+    if isinstance(opt, dict):
+        label = opt.get("label", "")
+        if not label:
+            for key in ("name", "text", "value", "title"):
+                label = opt.get(key, "")
+                if label:
+                    break
+        if not label:
+            for v in opt.values():
+                if isinstance(v, str) and v:
+                    label = v
+                    break
+            if not label:
+                label = str(opt)
+        return {"label": label, "description": opt.get("description", "")}
+    elif isinstance(opt, str):
+        return {"label": opt, "description": ""}
+    else:
+        return {"label": str(opt), "description": ""}
+
+
+
+def _normalize_question_item(q) -> dict:
+    """将 question 条目规范化为 dict 格式
+
+    兼容 LLM 传参的各种格式：
+    - dict: {"question": "...", "options": [...], "multiple": ...}
+    - str:  "问题文本"
+    - 其他: 转为字符串
+    """
+    if isinstance(q, dict):
+        return q
+    elif isinstance(q, str):
+        return {"question": q, "options": [], "multiple": False}
+    else:
+        return {"question": str(q), "options": [], "multiple": False}
+
+
+
+def _parse_question_result(result: str) -> dict:
+    """解析 question 工具的回答字符串，提取每个问题的选中选项和自定义回答
+
+    回答格式（来自 question_floating_widget._build_and_emit_answer）:
+        问题「问题文本」的回答：
+        【选项1】；【选项2】；自定义文本
+        ---
+        问题「问题2」的回答：
+        【选项A】
+
+    返回: {question_text: {"selected": [label, ...], "custom": str or None}}
+    """
+    if not result:
+        return {}
+
+    text = _unescape_newlines(result)
+    answers = {}
+
+    for section in re.split(r"\n---\n", text):
+        m = _QRESULT_SECTION_RE.match(section.strip())
+        if not m:
+            continue
+        q_text = m.group(1).strip()
+        answer_text = m.group(2).strip()
+
+        # 提取 【label】 格式的选中选项
+        selected = _QRESULT_SELECTED_RE.findall(answer_text)
+
+        # 自定义文本 = 移除 【label】 和分隔符后的剩余文本
+        custom_text = _QRESULT_SELECTED_RE.sub("", answer_text)
+        # 移除中英文分号分隔符
+        custom_text = custom_text.replace("；", "").replace(";", "").strip()
+        # 过滤掉仅含省略号或空白的假自定义文本
+        if custom_text and custom_text != "...":
+            custom = custom_text
+        else:
+            custom = None
+
+        answers[q_text] = {"selected": selected, "custom": custom}
+
+    return answers
+
+
+
+def _parse_questions_field(questions_raw) -> list:
+    """解析 questions 字段，兼容 list / str / None
+
+    当 message_content 序列化截断后，questions 可能变成一个 JSON 字符串
+    而非 list，此处统一还原为规范化 list[dict]。
+    """
+    if not questions_raw:
+        return []
+
+    if isinstance(questions_raw, list):
+        return [_normalize_question_item(q) for q in questions_raw]
+
+    if isinstance(questions_raw, str):
+        # 尝试 JSON 解析（完整或截断的 JSON 字符串）
+        try:
+            parsed = json.loads(questions_raw)
+            if isinstance(parsed, list):
+                return [_normalize_question_item(q) for q in parsed]
+            elif isinstance(parsed, dict):
+                return [_normalize_question_item(parsed)]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # JSON 解析失败（可能被截断），作为单个问题展示原始文本
+        return [{"question": questions_raw, "options": [], "multiple": False}]
+
+    return [{"question": str(questions_raw), "options": [], "multiple": False}]
+
+
+# 预编译：匹配 "问题「xxx」的回答：" 格式
+_QRESULT_SECTION_RE = re.compile(r"问题「(.+?)」的回答：\n?(.*)", re.DOTALL)
+# 预编译：匹配 【label】 格式的选中项
+_QRESULT_SELECTED_RE = re.compile(r"【(.+?)】")
+
+
+
+def _render_question_block(tool_args: dict, result: str = None) -> str:
+    """将 question 工具渲染为 bash 风格的终端块
+
+    渲染规则：
+    - 终端头: ❓ question: 第一个问题文本（预览）
+    - 终端体: 逐个展示问题 → 选项列表 → 用户回答
+    - 选项标记: 选中 ● / 未选中 ○（多选时用 ◉ / ○）
+    - 自定义回答: 单独以 ✎ 自定义: xxx 显示
+
+    兼容多种参数格式（list / str / 旧格式单 question 字段）。
+    """
+    _gf = _get_global_font()
+
+    # 获取问题列表（兼容新旧格式 + 字符串类型）
+    questions_raw = tool_args.get("questions", [])
+    if not questions_raw and "question" in tool_args:
+        questions_raw = [
+            {
+                "question": str(tool_args.get("question", "")),
+                "options": tool_args.get("options", []),
+                "multiple": tool_args.get("multiple", False),
+            }
+        ]
+    normalized = _parse_questions_field(questions_raw)
+    if not normalized:
+        return ""
+
+    # 解析用户回答
+    answer_map = _parse_question_result(result) if result else {}
+
+    # 构建终端体文本
+    lines = []
+    for q in normalized:
+        q_text = q.get("question", "")
+        options = q.get("options", [])
+        multiple = q.get("multiple", False)
+        suffix = " (多选)" if multiple else ""
+        answer_info = answer_map.get(q_text, {})
+        selected_labels = answer_info.get("selected", [])
+        custom_text = answer_info.get("custom")
+
+        # 问题文本行
+        lines.append(f"❓ {q_text}{suffix}")
+
+        # 选项列表
+        if options:
+            lines.append("")
+            unselected_marker = "○"
+            selected_marker = "◉" if multiple else "●"
+            for opt in options:
+                opt = _normalize_option_item(opt)
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+                is_selected = label in selected_labels
+                marker = selected_marker if is_selected else unselected_marker
+                if desc:
+                    lines.append(f"  {marker} {label}  —  {desc}")
+                else:
+                    lines.append(f"  {marker} {label}")
+            lines.append("")
+
+        # 用户回答：只有自定义输入才单独显示（选中的选项已用实心标记）
+        if custom_text:
+            lines.append(f"  ✎ 自定义: {custom_text}")
+        if not selected_labels and not custom_text and not options:
+            # 无选项且无回答时，显示原始 result
+            if result:
+                lines.append(f"  ✎ 回答: {_unescape_newlines(result)}")
+        lines.append("")
+
+    body_text = "\n".join(lines).rstrip()
+
+    # 终端头预览（第一个问题文本）
+    first_q = normalized[0].get("question", "")
+    q_preview = first_q[:80] + ("…" if len(first_q) > 80 else "")
+
+    return f"""
+    <div class="terminal-block" style="background:rgba(13,17,23,0.40);border:1px solid rgba(48,54,61,0.25);border-radius:8px;overflow:hidden;margin:0;">
+        <div style="padding:6px 12px;background:rgba(22,27,34,0.40);border-bottom:1px solid rgba(48,54,61,0.25);color:#8b949e;font-family:'{_gf}',Consolas,monospace;font-size:{scale_font_size(12)}px;">
+            <span style="color:#FFA500;">❓</span> <span style="color:#c9d1d9;">question: {escape(q_preview)}</span>
+        </div>
+        <pre style="margin:0;padding:10px 12px;background:rgba(13,17,23,0.40);color:#c9d1d9;font-family:'{_gf}',Consolas,monospace;font-size:{scale_font_size(13)}px;line-height:1.5;white-space:pre-wrap;word-break:break-all;overflow-x:auto;">{escape(body_text)}</pre>
+    </div>"""
+
+
+
+def _render_tool_status_badge(success: bool) -> str:
+    """生成工具执行状态的 HTML 徽章（显示在图标右上角）"""
+    if success is None:
+        return ""
+    bg = "#4CAF50" if success else "#F44336"
+    return f'<span class="tool-status-badge" style="position:absolute;top:-2px;right:-2px;width:7px;height:7px;border-radius:50%;background:{bg};z-index:2;box-shadow:0 1px 2px rgba(0,0,0,0.35);"></span>'
+
+
+
+def _to_rel_path(path: str) -> str:
+    """将绝对路径转为相对项目根目录的路径（便于预览展示）"""
+    if not path or not os.path.isabs(path):
+        return path
+    try:
+        cwd = os.getcwd()
+        # normpath 统一分隔符后再比较
+        if os.path.normpath(path).startswith(os.path.normpath(cwd)):
+            rel = os.path.relpath(path, cwd)
+            return rel.replace("\\", "/")
+    except (ValueError, OSError):
+        pass
+    return path
+
+
+# 参数展示型工具 — 渲染为紧凑单行卡片（无折叠、无 body、无工具结果）
+_INLINE_TOOLS = frozenset(
+    {
+        "read",
+        "todoread",
+        "grep",
+        "glob",
+        "list",
+        "scan_repo",
+        "stage_files",
+        "get_diagnostics",
+    }
+)
+
+
+
+def set_diff_highlight_style(style_name: str):
+    """设置 diff 高亮风格并清除缓存"""
+    global _current_diff_style
+    if style_name != _current_diff_style:
+        _current_diff_style = style_name
+        _DIFF_FORMATTER_CACHE["style"] = None
+
+

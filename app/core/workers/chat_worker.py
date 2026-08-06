@@ -386,7 +386,918 @@ class OpenAIChatWorker(QThread):
                     continue
                 self._api_messages_cache.append(api_msg)
 
+    def _inject_pending_team_mail(self, session_messages_target: List = None) -> None:
+        """注入 TeamManager 待处理团队邮件为 TeamMail hook 消息（团队链路）
+
+        在每次 _make_api_call 前调用：主动检查 TeamManager 邮箱中的待处理任务
+        邮件（不依赖 QFileSystemWatcher 信号派发），注入为带 _hook_event="TeamMail"
+        标记的用户消息，让 LLM 感知团队成员发来的任务。
+
+        ⚠️ T23 语义：仅在有下一轮 API 调用的循环内注入（退出路径无 API 调用
+        即自然不注入），避免注入的邮件成为孤儿（进入消息列表但 LLM 永不响应，
+        随后被收尾逻辑误标 done 导致丢失）。邮件保持 pending，由流结束后的
+        非流式 _process_team_task 正常处理。
+
+        Args:
+            session_messages_target: 若传入则同时追加到此列表，确保 worker
+                结束时随 current_session_messages 一起持久化。
+        """
+        try:
+            backend = getattr(self.tool_executor, "_backend", None)
+            if not backend:
+                return
+            window_id = getattr(backend, "_window_id", None)
+            if not window_id:
+                return
+
+            from app.core.team_manager import TeamManager
+
+            tm = TeamManager.get_instance()
+            pending = tm.get_pending_tasks(window_id)
+            if not pending:
+                return
+            mail = pending[0]
+            tm.mark_mail_running(mail["id"], window_id)
+
+            from app.core.backend import _format_hook_output
+
+            task_desc = mail.get("body", mail.get("subject", ""))
+            from_agent = mail.get("from_agent", "?")
+            from_window = mail.get("from_window", "?")
+            sender_id = f"{from_agent}@{from_window}"
+            content = (
+                f"📨 **来自 [{sender_id}] 的任务邮件：**\n\n"
+                f"{task_desc}\n\n"
+                f"（以上是系统自动注入的团队成员任务邮件，请根据上下文酌情处理）"
+            )
+            hook_content = _format_hook_output("TeamMail", content, wrap_system_reminder=False)
+            msg = {"role": "user", "content": hook_content, "_hook_event": "TeamMail"}
+
+            self._append_to_api_cache([msg])
+            self._current_session_messages.append(msg)
+            if session_messages_target is not None:
+                session_messages_target.append(msg)
+
+            logger.info(f"[TeamMail] Worker 注入团队邮件: #{mail['id']} from [{sender_id}]")
+        except Exception as e:
+            logger.debug(f"[TeamMail] 注入待处理团队邮件失败: {e}")
+
     @property
+
+    # ===== P2 补齐（从原项目同步）=====
+
+    def _cancel_with_stop_hook(self, current_messages: List[Dict], current_session_messages: List[Dict]) -> None:
+        """取消时保存 partial 响应并触发 Stop hook 后发射 finished 信号
+
+        统一处理 3 处取消路径的重复逻辑：
+        保存 partial → 触发 Stop hook → 发射 finished_with_messages
+
+        注意：取消路径**不消费 Stop hook 注入的消息**。理由：
+        - 用户主动取消时不应被 hook 强制续命
+        - 但仍触发 Stop hook，让 hook 知道 assistant 被取消了
+        - 重置 _stop_hook_active 状态，避免影响下一轮对话
+        """
+        partial_sequence = self._build_response_message_sequence()
+        if partial_sequence:
+            current_messages.extend(partial_sequence)
+            current_session_messages.extend(partial_sequence)
+            # 🛡️ 清理 orphaned tool_calls：取消时 partial assistant 消息含 tool_calls
+            # 但无对应 tool 结果，在持久化前清理，避免下次 API 调用触发 2013 错误
+            # 和重复的自动修复开销
+            current_messages, _ = self._fix_tool_result_order(current_messages)
+            if current_session_messages is not current_messages:
+                current_session_messages, _ = self._fix_tool_result_order(current_session_messages)
+            self._current_session_messages = list(current_session_messages)
+            self.full_response = "".join(self._response_chunks)
+            # ====== Stop hook：取消退出前触发 ======
+            # 取消时传递 reason="cancelled"，让 hook 能感知取消场景
+            self._trigger_worker_hook(
+                "Stop",
+                current_messages,
+                current_session_messages,
+                extra_context={
+                    "stop_hook_active": self._stop_hook_active,
+                    "last_assistant_message": self.full_response,
+                    "reason": "cancelled",
+                },
+            )
+            # 取消路径：丢弃 block_reason，不强制续命
+            self._stop_hook_active = False
+            # 虽然信号可能已被断开，但事件总线仍可能接收
+            self._emit_with_callback("finished_with_messages", self.finished_with_messages, current_session_messages)
+
+        # 🛡️ 取消路径排空 _hook_message_queue 中的 TeamMail 残留（F1 P0-2）：
+        # _inject_team_mail_as_hook 推送的邮件 hook 若在取消前未被 worker 消费
+        # （worker 正阻塞在 API 调用中），会残留到下一个对话被 _inject_pending_hook_messages
+        # 重复消费 → "停止后立即触发相同对话"的次链路。取消 = 用户主动中止，
+        # 残留的 TeamMail hook 属于被取消的上下文，直接丢弃；非 TeamMail 条目
+        # （SubAgentFinished 等通知）保留放回，供下一对话正常消费（通知语义不变）。
+        try:
+            backend = getattr(self.tool_executor, "_backend", None)
+            q = getattr(backend, "_hook_message_queue", None) if backend else None
+            if q is not None:
+                leftover = []
+                while True:
+                    try:
+                        leftover.append(q.get_nowait())
+                    except queue.Empty:
+                        break
+                for item in leftover:
+                    if item.get("_hook_event") != "TeamMail":
+                        q.put(item)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[HookManager] Cancel path drain TeamMail hook queue failed: {e}")
+
+    @property
+
+    def _check_results_auto_compact(self, results: list, backend) -> None:
+        """检查 hook 结果中是否有 auto-compact 触发信号
+
+        从各 hook 返回的 JSON 解析 auto_compact 字段，
+        有信号则调用 backend.request_auto_compact。
+
+        Args:
+            results: trigger_event 返回的 HookExecutionResult 列表
+            backend: ChatBackend 实例
+        """
+        if not results:
+            return
+        for r in results:
+            if not r.success or not r.output:
+                continue
+            try:
+                data = json.loads(r.output)
+                if isinstance(data, dict) and data.get("auto_compact"):
+                    ratio = float(data.get("ratio", 0.0))
+                    backend.request_auto_compact(ratio)
+                    return  # 只触发一次
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+    @staticmethod
+
+    def _compute_tool_call_signature(tool_calls: List[Dict]) -> str:
+        """
+        计算一轮 tool_calls 的稳定签名。
+
+        排序后再 hash，避免 list 顺序差异导致误判。
+        arguments 是字符串，标准化空白后再用：
+        - 去除 JSON token（`{}` `,` `:` `"`）周围的装饰性空格
+        - 但保留字符串 value 内部的空格（如 "hello world"）
+        """
+        import hashlib
+        import re
+
+        def _normalize_json_whitespace(s: str) -> str:
+            # 去掉所有空白（包含换行）后重新插入：
+            # 1. JSON token 周围不留空格
+            # 2. 字符串 value 内部保留原始字符（只把连续空白压成单空格）
+            # 简化版：把所有空白压成单空格，再去掉 `,` `:` `{` `}` `[` `]` 前后的空格
+            # 用状态机判断是否在字符串内部太复杂，这里采用保守策略：
+            # 先尝试用 json 解析，解析成功则重 dump 规范化；失败则退到"压缩连续空白"。
+            try:
+                import json
+
+                obj = json.loads(s)
+                return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                # 退化：去掉所有空白（包括换行/制表）
+                return re.sub(r"\s+", "", s)
+
+        parts = []
+        for tc in tool_calls:
+            func = tc.get("function") or {}
+            name = (func.get("name") or "").strip()
+            args = (func.get("arguments") or "").strip()
+            args = _normalize_json_whitespace(args)
+            parts.append(f"{name}|{args}")
+        parts.sort()
+        canonical = "\n".join(parts)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+
+    def _detect_repetitive_tool_loop(messages: List[Dict]) -> Optional[Dict]:
+        """
+        检测消息列表中最近 N 轮的 assistant tool_calls 是否完全一致（即陷入循环）。
+
+        Qwen/DashScope 服务端会拒绝"连续多轮相同 (name, arguments) 的工具调用"。
+        同样的请求序列重试仍会被拒，所以必须在客户端主动检测并终止。
+
+        判断标准（与 qwen 服务端语义对齐）：
+        - 比较**内容**：`tool_name` + `arguments`（注意：不是 tool_call_id，id 每轮新生成）
+        - 比较**轮次**：连续 N 轮 assistant 消息中，如果 tool_calls 签名（按 name+args 排序后
+          拼接的 sha256）完全相同 → 触发循环
+        - 中间插入任何**不同的** tool_call → 重置计数（不要求与上一轮完全相同才算重复）
+
+        Args:
+            messages: 即将发给 API 的完整消息列表（已 consolidate）
+
+        Returns:
+            None 表示未检测到循环；
+            Dict 表示检测到循环，含 {"rounds": int, "signature": str,
+                                       "tool_calls": List[Dict]} 用于构造友好提示。
+        """
+        threshold = OpenAIChatWorker._TOOL_LOOP_THRESHOLD
+
+        # 从后往前扫，收集最近的 assistant 消息（含 tool_calls 的）
+        recent_assistants: List[Dict] = []
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls:
+                # 普通文本消息不算轮次，跳过（继续往前找）
+                continue
+            recent_assistants.append(msg)
+            if len(recent_assistants) >= threshold:
+                break
+
+        if len(recent_assistants) < threshold:
+            return None
+
+        # 计算每个 assistant 消息的签名：sorted([(name, normalized_args)]) 的 sha256
+        signatures = []
+        for msg in recent_assistants:
+            sig = OpenAIChatWorker._compute_tool_call_signature(msg.get("tool_calls") or [])
+            signatures.append(sig)
+
+        # 检查最近 threshold 轮是否完全一致
+        if len(set(signatures)) == 1:
+            tool_calls = recent_assistants[0].get("tool_calls") or []
+            return {
+                "rounds": threshold,
+                "signature": signatures[0],
+                "tool_calls": tool_calls,
+            }
+
+        return None
+
+    @staticmethod
+
+    def _extract_block_reason(output: str) -> Optional[str]:
+        """从 hook 输出中提取 block reason（用于 Stop hook 强制续命）
+
+        优先级（hookify 实际用法 → Claude Code 官方规范 → 兜底）：
+        1. JSON `reason` 字段（hookify 默认）
+        2. JSON `stopReason` 字段（Claude Code 官方）
+        3. JSON `additionalContext` 字段
+        4. raw output 兜底
+
+        Args:
+            output: hook 原始输出字符串
+
+        Returns:
+            提取出的 block reason，None 表示无可用内容
+        """
+        if not output or not output.strip():
+            return None
+
+        # 尝试解析 JSON
+        try:
+            data = json.loads(output)
+            if isinstance(data, dict):
+                # 优先级 1: hookify 风格
+                if data.get("reason"):
+                    return str(data["reason"])
+                # 优先级 2: Claude Code 官方
+                if data.get("stopReason"):
+                    return str(data["stopReason"])
+                # 优先级 3: additionalContext
+                if data.get("additionalContext"):
+                    return str(data["additionalContext"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        # 优先级 4: raw output 兜底
+        return output
+
+
+    def _extract_thought_signature(tc) -> Optional[str]:
+        """从 OpenAI 兼容的 tool_call delta/对象中提取 Gemini thought_signature。
+
+        Gemini OpenAI 兼容端点在 tool_call 上返回 extra_content.google.thought_signature。
+        由于 openai SDK 的 BaseModel 配置了 extra='allow'，该字段会被保留在 model_extra，
+        可通过 getattr 直接读取。无则返回 None。
+        """
+        ec = getattr(tc, "extra_content", None)
+        if not ec or not isinstance(ec, dict):
+            return None
+        google = ec.get("google")
+        if not isinstance(google, dict):
+            return None
+        sig = google.get("thought_signature")
+        return sig if sig else None
+
+
+    def _inject_pending_hook_messages(
+        self, session_messages_target: List = None, include_team_mail: bool = True
+    ) -> None:
+        """消费 backend 队列中的 PostToolUse 等 hook 消息并注入到 API 缓存。
+
+        在每次 _make_api_call 前调用，确保 LLM 能感知 hook 输出。
+        队列中只有 tool_executor 触发的事件（PostToolUse/prompt），预对话事件
+        已由 engine.py 直接注入 session.messages，不经过队列。
+        不做去重——每条 PostToolUse 对应一次独立的工具调用，都应保留。
+
+        同时主动检查 TeamManager 中的待处理团队邮件并注入（include_team_mail=True）。
+        QFileSystemWatcher 信号在流式高频回调下可能被事件循环延迟派发，
+        此处不依赖信号，每轮 API 调用前直接读取邮箱目录，确保及时注入。
+
+        Args:
+            session_messages_target: 若传入则同时追加到此列表，
+                确保 worker 结束时随 current_session_messages 一起持久化。
+            include_team_mail: 是否注入 TeamManager 待处理邮件。
+                ★ 修复 T23：退出前最后一次调用（对话即将结束、不再有下一轮
+                API）必须传 False——此时注入的邮件会成为孤儿（进入消息列表但
+                LLM 永远不会响应），随后被收尾逻辑误标 done 导致丢失。
+                邮件保持 pending，由流结束后的 _check_and_process_pending
+                走非流式 _process_team_task 正常处理。
+        """
+        try:
+            backend = getattr(self.tool_executor, "_backend", None)
+            if not backend:
+                return
+            q = getattr(backend, "_hook_message_queue", None)
+            if q is None:
+                return
+
+            msgs = []
+            while True:
+                try:
+                    msgs.append(q.get_nowait())
+                except queue.Empty:
+                    break
+
+            if msgs:
+                self._append_to_api_cache(msgs)
+                self._current_session_messages.extend(msgs)
+                if session_messages_target is not None:
+                    session_messages_target.extend(msgs)
+                logger.debug(f"[HookManager] Injected {len(msgs)} hook msgs from queue")
+
+            # 🆕 主动检查团队待处理邮件（不依赖 QFileSystemWatcher）
+            if not include_team_mail:
+                return
+            window_id = getattr(backend, "_window_id", None)
+            if window_id:
+                from app.core.team_manager import TeamManager
+
+                tm = TeamManager.get_instance()
+                pending = tm.get_pending_tasks(window_id)
+                if pending:
+                    mail = pending[0]
+                    tm.mark_mail_running(mail["id"], window_id)
+
+                    from app.core.backend import _format_hook_output
+
+                    task_desc = mail.get("body", mail.get("subject", ""))
+                    from_agent = mail.get("from_agent", "?")
+                    from_window = mail.get("from_window", "?")
+                    sender_id = f"{from_agent}@{from_window}"
+                    content = (
+                        f"📨 **来自 [{sender_id}] 的任务邮件：**\n\n"
+                        f"{task_desc}\n\n"
+                        f"（以上是系统自动注入的团队成员任务邮件，请根据上下文酌情处理）"
+                    )
+                    hook_content = _format_hook_output("TeamMail", content, wrap_system_reminder=False)
+                    msg = {"role": "user", "content": hook_content, "_hook_event": "TeamMail"}
+
+                    self._append_to_api_cache([msg])
+                    self._current_session_messages.append(msg)
+                    if session_messages_target is not None:
+                        session_messages_target.append(msg)
+
+                    logger.info(f"[TeamMail] Worker 注入团队邮件: #{mail['id']} from [{sender_id}]")
+        except Exception as e:
+            logger.debug(f"[HookManager] Failed to inject pending hook msgs: {e}")
+
+
+    def _inject_pending_pretool_messages(self, session_messages_target: List = None) -> None:
+        """消费 backend 的 PreToolUse 消息队列，在 tool result 之前注入。
+
+        与 _inject_pending_hook_messages 使用不同的队列，确保 PreToolUse
+        在 tool result 之前、PostToolUse 在 tool result 之后出现。
+        """
+        try:
+            backend = getattr(self.tool_executor, "_backend", None)
+            if not backend:
+                return
+            q = getattr(backend, "_pre_tool_message_queue", None)
+            if q is None:
+                return
+
+            msgs = []
+            while True:
+                try:
+                    msgs.append(q.get_nowait())
+                except queue.Empty:
+                    break
+
+            if msgs:
+                self._append_to_api_cache(msgs)
+                self._current_session_messages.extend(msgs)
+                if session_messages_target is not None:
+                    session_messages_target.extend(msgs)
+                logger.debug(f"[HookManager] Injected {len(msgs)} pretool msgs from queue")
+        except Exception as e:
+            logger.debug(f"[HookManager] Failed to inject pending pretool msgs: {e}")
+
+
+    def _is_gemini_model(self) -> bool:
+        """当前 worker 是否为 Gemini 模型（需特殊处理 thought_signature）。"""
+        try:
+            if detect_provider_family(self.llm_config) == "gemini":
+                return True
+        except Exception:
+            pass
+        # 兜底：模型名含 gemini（如 models/gemini-3-flash-preview 的 startswith 判断会漏）
+        try:
+            model = str((self.llm_config or {}).get("模型名称", "") or "").lower()
+            if "gemini" in model:
+                return True
+        except Exception:
+            pass
+        return False
+
+
+    def _make_assistant_msg(self, content, model_name, reasoning_content, timestamp):
+        """构建 assistant 消息 dict（消除 3 处重复构造）"""
+        msg = {"role": "assistant", "timestamp": timestamp}
+        if content:
+            msg["content"] = content
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
+        if model_name:
+            msg["model_name"] = model_name
+        return msg
+
+
+    def _requires_reasoning_content(self) -> bool:
+        """thinking 模式下，兼容要求 tool-call assistant 保留 reasoning_content 字段的 provider。
+
+        deepseek 系模型（含 opencode.ai 等中转平台承载的 deepseek-v4 系列）在
+        thinking mode 下要求 tool_calls assistant 消息必须携带 reasoning_content
+        字段（可为空串），否则上游 Console 报 400。
+        """
+        if self.llm_config.get("思考模式") is not True:
+            return False
+        family = detect_provider_family(self.llm_config)
+        if family == "deepseek":
+            return True
+        # opencode 等中转平台承载 deepseek 系模型时（模型名以 deepseek 开头），
+        # 上游协议与官方 Console 一致，同样需要 reasoning_content 回传
+        model = str(self.llm_config.get("模型名称", "") or "").lower()
+        return model.startswith("deepseek")
+
+
+    def _restore_partial_content_backup(self):
+        """
+        恢复协议错误重试时备份的流式内容。
+
+        当 is_retryable_protocol 清空了 _response_content_blocks 但重试全部失败后，
+        恢复备份让 run() 的 except 块能构建包含已接收内容的 partial 消息，避免内容丢失。
+        """
+        backup = getattr(self, "_partial_content_backup", None)
+        if not backup:
+            return
+        # 只有在当前 _response_content_blocks 为空时才恢复（避免覆盖重试成功后的新内容）
+        if not self._response_content_blocks:
+            self._response_content_blocks = backup.get("content_blocks", []) or []
+        if not self._response_chunks:
+            self._response_chunks = list(backup.get("response_chunks", []) or [])
+        self._partial_content_backup = None
+
+    @staticmethod
+
+    def _trigger_worker_hook(
+        self,
+        event_name: str,
+        current_messages: List[Dict],
+        current_session_messages: List[Dict],
+        extra_context: Dict = None,
+    ) -> Optional[str]:
+        """在 worker 线程中同步触发 hook 并将输出追加到消息流（只追加不删除）
+
+        Args:
+            event_name: hook 事件名（PreAssistantMessage/PostAssistantMessage/Stop 等）
+            current_messages: 正在构建的 API 消息列表（in-place 追加）
+            current_session_messages: 会话消息列表（in-place 追加）
+            extra_context: 注入到 hook context 的额外字段
+
+        Returns:
+            block_reason: 如果 hook 决策为 BLOCK，返回提取出的 block 内容
+                （来自 hookify 风格 JSON 的 reason/stopReason 字段，或 raw output）；
+                否则返回 None。Stop hook 用此实现"强制续命"机制。
+        """
+        from app.core.backend import _make_hook_message
+
+        try:
+            backend = getattr(self.tool_executor, "_backend", None)
+            if not backend or not backend.hook_manager:
+                return None
+
+            workdir = None
+            if backend.tool_executor:
+                workdir = backend.tool_executor.get_workdir()
+            if not workdir:
+                import os as _os
+
+                workdir = _os.getcwd()
+
+            # 获取 session_id
+            _session_id = ""
+            try:
+                _session = backend.get_current_session() if hasattr(backend, "get_current_session") else None
+                if _session:
+                    _session_id = _session.session_id or ""
+            except Exception:
+                pass
+
+            ctx = {
+                "project_root": workdir,
+                "session_id": _session_id,  # Claude Code 兼容字段
+                # 【新增】让 hook 能识别当前执行角色（与 subagent_worker._build_hook_context 对齐）
+                "current_role": "primary",
+                "is_subagent_call": False,
+                # 团队上下文：当前窗口是否是团队成员
+                "is_team_member": _check_team_member(backend),
+            }
+
+            # PreAssistantMessage / PostAssistantMessage：注入上下文使用量信息
+            # 让 hook（如 context_auto_compact）能检测当前 token 占比
+            if event_name in ("PreAssistantMessage", "PostAssistantMessage"):
+                try:
+                    from app.core.model_capabilities import resolve_context_limit
+
+                    token_count = count_messages_tokens(current_messages)
+                    token_limit = 0
+                    llm_config = getattr(self, "llm_config", None)
+                    if llm_config:
+                        token_limit = resolve_context_limit(llm_config)
+                    ctx["token_count"] = token_count
+                    ctx["token_limit"] = token_limit
+                    if token_count > 0 and token_limit > 0:
+                        ctx["token_ratio"] = token_count / token_limit
+                    else:
+                        ctx["token_ratio"] = 0.0
+                except Exception:
+                    pass
+
+            if extra_context:
+                ctx.update(extra_context)
+
+            # 获取当前用户消息作为 current_message
+            current_message_text = ""
+            for msg in reversed(current_session_messages):
+                if msg.get("role") == "user":
+                    from app.core.message_content import content_to_text
+
+                    current_message_text = content_to_text(msg.get("content", ""))
+                    break
+
+            # 记录 trigger_event 前的队列大小，用于后续精确 drain
+            # 只排出本轮同步执行中入队的消息，不误伤其他路径（如 SubAgentFinished）放入的消息
+            _q = getattr(backend, "_hook_message_queue", None)
+            qsize_before = _q.qsize() if _q is not None else 0
+
+            results = backend.hook_manager.trigger_event(
+                event_name,
+                context=ctx,
+                current_message=current_message_text,
+                trigger_async=False,
+            )
+
+            # 🛡️ 精确排出 _hook_message_queue：同步执行路径中 _execute_hook 也会调用
+            # on_hook_finished 回调将输出入队，但同步返回值已由下方 results 循环直接
+            # 注入消息列表。若不排出，_inject_pending_hook_messages 会在下一轮循环顶部
+            # 从队列取出再注入一次，导致重复（尤其是 PROMPT 类型 hook）。
+            # ★ 修复：只排出本轮 trigger_event 新增的消息，不误伤其他路径放入的消息
+            #   （如 SubAgentFinished，由主线程通过 _inject_subagent_completion_into_stream 放入）
+            # 注意：PostToolUse 等事件由 tool_executor 的同步路径触发并通过队列传递，
+            # 不经过 _trigger_worker_hook，不受此排出影响。
+            if _q is not None:
+                qsize_after = _q.qsize()
+                to_drain = qsize_after - qsize_before
+                for _ in range(to_drain):
+                    try:
+                        _q.get_nowait()
+                    except Exception:
+                        break
+                if to_drain > 0:
+                    logger.debug(
+                        f"[HookManager] Drained {to_drain} msg(s) from hook queue"
+                        f" after sync trigger_event({event_name})"
+                    )
+
+            # 收集所有 hook 结果中的 block reason（按 hook 顺序，最后一个覆盖前面的）
+            block_reason: Optional[str] = None
+            for r in results:
+                # 只有标记为 add_to_context 的 hook 输出才注入消息列表
+                # Stop 事件也使用正常的 hook 消息注入（不再依赖 block 决策来决定续命），
+                # 通过检测是否有消息被注入到消息列表来决定是否继续工具迭代。
+                if r.success and r.output and r.add_to_context:
+                    msg = _make_hook_message(event_name, r.output, r.status_message)
+                    current_messages.append(msg)
+                    current_session_messages.append(msg)
+                    self._current_session_messages.append(msg)
+                    # 追加到 API 缓存
+                    self._append_to_api_cache([msg])
+
+                    logger.debug(
+                        f"[HookManager] Worker hook injected: {event_name}, message: {msg.get('content', '')[:100]}..."
+                    )
+
+                # 检查 BLOCK 决策（Claude Code Stop hook 强制续命机制）
+                # HookDecision.BLOCK 来自 hook_manager.py，对应：
+                #   - command hook exit code 2
+                #   - JSON 输出 {"decision": "block", ...}
+                # 仅 Stop 事件实际消费该决策；其他事件也透传，由调用方决定
+                try:
+                    from app.core.hook_manager import HookDecision
+
+                    if r.decision == HookDecision.BLOCK:
+                        reason = self._extract_block_reason(r.output)
+                        if reason:
+                            block_reason = reason
+                            logger.info(f"[HookManager] Worker hook BLOCK: {event_name} reason_len={len(reason)}")
+                except ImportError:
+                    pass
+
+            # 检查 auto-compact 触发信号（context_auto_compact hook 的输出）
+            # 将 results 中 JSON 的 auto_compact 信号转发给 backend
+            if event_name == "PreAssistantMessage":
+                self._check_results_auto_compact(results, backend)
+
+            return block_reason
+
+        except Exception as e:
+            logger.error(f"[HookManager] Worker hook exception: {event_name} - {e}")
+            return None
+
+
+    def _truncate_repetitive_tool_calls(messages: List[Dict], threshold: int) -> List[Dict]:
+        """
+        从消息列表中移除**所有**连续重复的工具调用轮次，只保留第 1 轮。
+
+        循环检测触发后调用，清理消息历史中的重复工具调用，
+        避免下次发消息时再次触发循环检测或被服务端拒绝。
+
+        策略：
+        1. 从末尾往前找所有含 tool_calls 的 assistant 消息，计算签名
+        2. 找出从末尾开始的**完整连续相同签名区间**（可能超过 threshold 轮）
+        3. 保留第 1 轮（assistant + tool 结果）作为正常调用记录
+        4. 移除第 2~N 轮的重复 assistant + tool 消息
+        5. **保留重复区间之后的所有消息**（如用户刚发的新消息）
+        6. 在清理点插入一条 assistant 终止提示（让模型下次换方法）
+
+        Args:
+            messages: 会话消息列表（含重复工具调用轮次）
+            threshold: 循环检测阈值（即至少重复了多少轮）
+
+        Returns:
+            清理后的消息列表（不再包含重复轮次，但保留后续消息）
+        """
+        # 1. 从后往前收集所有含 tool_calls 的 assistant 消息（index, signature）
+        assistants: List[tuple] = []  # [(index, signature), ...] 从后往前
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                sig = OpenAIChatWorker._compute_tool_call_signature(msg.get("tool_calls") or [])
+                assistants.append((i, sig))
+
+        if len(assistants) < threshold:
+            return messages  # 不足阈值，不需要清理
+
+        # 2. 找出从末尾开始的完整连续相同签名区间
+        last_sig = assistants[0][1]
+        run_length = 0
+        for _idx, sig in assistants:
+            if sig == last_sig:
+                run_length += 1
+            else:
+                break
+
+        if run_length < threshold:
+            return messages  # 连续相同轮次不足阈值
+
+        # 3. assistants[run_length - 1] 是第 1 个重复轮次（最靠前的那个）
+        first_round_assistant_idx = assistants[run_length - 1][0]
+
+        # 4. 找到第 1 轮的 tool 结果结束位置（即需要保留的前缀边界）
+        prefix_end = first_round_assistant_idx + 1
+        while prefix_end < len(messages) and messages[prefix_end].get("role") == "tool":
+            prefix_end += 1
+
+        # 5. 找到最后一个重复轮次的 tool 结果结束位置（即后续消息的起始点）
+        last_round_assistant_idx = assistants[0][0]
+        tail_start = last_round_assistant_idx + 1
+        while tail_start < len(messages) and messages[tail_start].get("role") == "tool":
+            tail_start += 1
+
+        # 6. 组装：[前缀含第1轮] + [后续消息（如用户的新消息）]
+        # 不插入任何提示消息，让模型自然地从清理后的历史继续
+        sanitized = list(messages[:prefix_end])
+        sanitized.extend(messages[tail_start:])
+
+        return sanitized
+
+
+    def _try_inject_vision_content(
+        self, tool_results, current_messages, session_messages: Optional[List[Dict]] = None
+    ) -> bool:
+        """
+        截图/read 图片工具结果在视觉模型 → 将图片以 base64 注入到最后一个用户消息。
+
+        触发条件：
+        1. 本轮工具执行结果中有成功的 screenshot 工具，或
+        2. 有成功的 read 工具且读取的是图片文件（返回了 image_data）
+        3. 当前模型支持视觉（supports_vision=True）
+
+        注入方式：
+        在最后一条 user 消息的 content 中追加 image_url 块（multimodal list 格式）。
+        这样 LLM 在下一轮 API 调用时就能看到图片内容。
+        支持同轮注入多张图片（如同时截图 + 读取图片）。
+
+        同时也会注入到 session_messages（如果传入），确保注入的图片在会话历史中持久化，
+        跨多轮对话不会丢失。
+
+        Returns:
+            bool: True 表示成功注入了图片（调用方应跳过后续的 _append_to_api_cache）
+        """
+        if not tool_results or not current_messages:
+            return False
+
+        # 检查模型是否支持视觉
+        model_name = str(self.llm_config.get("模型名称", "") or "")
+        caps = get_model_capabilities(model_name)
+        if not caps.get("supports_vision"):
+            # 不支持视觉的模型：在已构建的 tool 消息 content 追加提示，防止模型幻觉
+            _non_vision_tools = set()
+            for r in tool_results:
+                if not isinstance(r, dict) or not r.get("success"):
+                    continue
+                tn = r.get("name", "")
+                if tn == "screenshot":
+                    _non_vision_tools.add(tn)
+                elif tn == "read" and isinstance(r.get("image_data"), dict) and r["image_data"].get("data"):
+                    _non_vision_tools.add(tn)
+            if _non_vision_tools:
+                _nv_hint = (
+                    "\n\n<system-reminder>\n"
+                    "Tool executed successfully, but this model does not support vision. "
+                    "You cannot see images. Only describe what you know from the text.\n"
+                    "</system-reminder>"
+                )
+                for msg in current_messages:
+                    if msg.get("role") == "tool" and msg.get("name") in _non_vision_tools:
+                        existing = msg.get("content", "")
+                        if isinstance(existing, str) and _nv_hint not in existing:
+                            msg["content"] = existing + _nv_hint
+                if session_messages is not None:
+                    for msg in session_messages:
+                        if msg.get("role") == "tool" and msg.get("name") in _non_vision_tools:
+                            existing = msg.get("content", "")
+                            if isinstance(existing, str) and _nv_hint not in existing:
+                                msg["content"] = existing + _nv_hint
+            return False
+
+        # ---- 收集所有可注入的图片 data_uri ----
+        import base64
+
+        data_uris = []
+
+        for r in tool_results:
+            if not isinstance(r, dict) or not r.get("success"):
+                continue
+            tool_name = r.get("name", "")
+
+            if tool_name == "screenshot":
+                # 从 raw_content（原始 ToolResult.content）提取路径
+                raw = r.get("raw_content")
+                img_path = None
+                if isinstance(raw, dict):
+                    img_path = raw.get("absolute_path") or raw.get("path")
+                if not img_path:
+                    content = r.get("content", "")
+                    if isinstance(content, dict):
+                        img_path = content.get("absolute_path") or content.get("path")
+                    elif isinstance(content, str):
+                        if content.startswith("{") and "absolute_path" in content:
+                            import ast
+
+                            try:
+                                d = ast.literal_eval(content)
+                                if isinstance(d, dict):
+                                    img_path = d.get("absolute_path") or d.get("path")
+                            except (ValueError, SyntaxError):
+                                pass
+                        if not img_path:
+                            m = re.search(r"路径[：:]\s*(\S+\.\w+)", content)
+                            if m:
+                                img_path = m.group(1)
+                if img_path and os.path.isfile(img_path):
+                    try:
+                        with open(img_path, "rb") as f:
+                            img_data = base64.b64encode(f.read()).decode("utf-8")
+                        ext = os.path.splitext(img_path)[1].lower()
+                        mime_map = {
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".gif": "image/gif",
+                            ".webp": "image/webp",
+                            ".bmp": "image/bmp",
+                        }
+                        mime = mime_map.get(ext, "image/png")
+                        data_uris.append(f"data:{mime};base64,{img_data}")
+                    except Exception as e:
+                        logger.warning(f"[Vision] Failed to read screenshot {img_path}: {e}")
+
+            elif tool_name == "read":
+                # 从 image_data 字段获取已编码的图片数据
+                img_data = r.get("image_data")
+                if isinstance(img_data, dict):
+                    mime = img_data.get("mime", "image/png")
+                    data = img_data.get("data", "")
+                    if data:
+                        data_uris.append(f"data:{mime};base64,{data}")
+                        logger.debug(f"[Vision] read 图片注入: mime={mime}, base64_len={len(data)}")
+
+        if not data_uris:
+            return False
+
+        # ---- 图片大小检查：超过 5MB 的自动压缩，防止 API 400 (media exceeds size limit) ----
+        # 根因：4K 屏截图 PNG 可达 5-12MB，base64 后 7-16MB，超过 MiniMax 等 API 的 10MB 限制。
+        # PyInstaller 环境下因缺少 PIL 等可选库，PNG 略大，更易触发。
+        compressed_count = 0
+        for i, du in enumerate(data_uris):
+            b64_part = du.split(",", 1)[1] if "," in du else ""
+            if len(b64_part) > 5 * 1024 * 1024:  # 5MB 阈值（留余量给 API 10MB 限制）
+                compressed = compress_data_uri(du)
+                if compressed != du:
+                    data_uris[i] = compressed
+                    compressed_count += 1
+        if compressed_count:
+            logger.info(f"[Vision] 已压缩 {compressed_count}/{len(data_uris)} 张图片以避免 API 大小限制")
+
+        # ---- 用 hook 注入模式插入一条 user 消息承载图片 ----
+        # 根因：之前将图片注入到旧 user message，LLM 无法将图片与工具调用关联。
+        # LLM 调用 read/screenshot 后看到工具结果是文本描述，认为"任务未完成"，
+        # 继续循环调用工具。即使图片已注入旧消息，LLM 也不把它视为工具调用结果。
+        # 修复方案：新建一条 user 消息用标准 image_url 格式承载图片，采用与 hook
+        # 相同的注入模式（仅加入 API 缓存和 session_messages，不加 current_messages），
+        # 避免被 UI 渲染为多余卡片，同时让 LLM 以常规方式看到图片。
+        tool_names_str = ", ".join(r.get("name", "") for r in tool_results if isinstance(r, dict) and r.get("success"))
+        vision_content: List[Dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"<system-reminder>\n"
+                    f"The following image(s) were obtained via {tool_names_str}. "
+                    "Please analyze the visual content directly.\n"
+                    f"</system-reminder>"
+                ),
+            },
+        ]
+        for du in data_uris:
+            vision_content.append({"type": "image_url", "image_url": {"url": du}})
+
+        vision_msg: Dict = {
+            "role": "user",
+            "content": vision_content,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_hook_event": "vision_inject",
+        }
+
+        # hook 注入模式：与 _inject_pending_hook_messages 一致的流程
+        # 1) API 缓存（LLM 可见） 2) _current_session_messages（持久化）
+        # 3) session_messages（UI 回调） 4) current_messages（后续轮次可见）
+        self._append_to_api_cache([vision_msg])
+        self._current_session_messages.append(vision_msg)
+        if session_messages is not None:
+            session_messages.append(dict(vision_msg))
+        current_messages.append(vision_msg)
+
+        logger.info(
+            f"[Vision] Injected {len(data_uris)} image(s) via hook pattern for {model_name} (tools: {tool_names_str})"
+        )
+
+        # 重建 API 缓存：current_messages 已被修改（含 image_url），
+        # 但 _api_messages_cache 仍是旧版本（无图片）。
+        # 此处立即重建完整缓存，确保后续 append 操作在正确基线上增量更新。
+        try:
+            self._api_messages_cache = messages_to_api(
+                current_messages, supports_vision=self._supports_vision, is_gemini=self._is_gemini_model(),
+                requires_reasoning_content=self._requires_reasoning_content()
+            )
+            self._api_messages_built = True
+        except Exception as cache_e:
+            logger.warning(f"[Vision] Failed to rebuild API cache: {cache_e}")
+            self._api_messages_cache = None
+            self._api_messages_built = False
+        return True  # 重建了完整缓存，调用方应跳过 _append_to_api_cache
+
     def event_bus(self) -> WorkerEventBus:
         """获取事件总线实例"""
         return self._event_bus
@@ -795,6 +1706,9 @@ class OpenAIChatWorker(QThread):
                     msg_count=len(current_messages),
                     api_cache=len(self._api_messages_cache) if self._api_messages_cache else 0,
                     session_count=len(current_session_messages))
+
+                # 团队链路：每轮 API 调用前注入 TeamManager 待处理团队邮件
+                self._inject_pending_team_mail(session_messages_target=current_session_messages)
 
                 # 使用 API 消息缓存（首次会重建，后续复用）
                 tool_calls_found, tool_args_pending = self._make_api_call(current_messages, use_cache=True)
@@ -2393,6 +3307,10 @@ class OpenAIChatWorker(QThread):
         True 表示继续执行。
         当权限被拒绝时，自动追加错误结果到 results。
         """
+        # 团队工具：无条件放行（schema 层已按团队成员身份过滤，执行层不再拦截）
+        if tool_name in ("team_send_message", "team_list_members"):
+            return True
+
         if not self.permission_check_callback:
             return True
 

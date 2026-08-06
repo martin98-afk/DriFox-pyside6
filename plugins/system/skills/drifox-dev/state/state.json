@@ -1,0 +1,398 @@
+{
+  "version": "1.0.0",
+  "current_focus": {
+    "task": "排查多处绑定刷新 token 后另一处失效的问题",
+    "module": null,
+    "branch": null,
+    "started_at": "2026-08-06T00:31:12",
+    "last_touched": "2026-08-06T00:31:12"
+  },
+  "recent_decisions": [
+    {
+      "id": "D013",
+      "date": "2026-08-05T20:49:59",
+      "scope": "message_card 差量渲染",
+      "decision": "全量渲染应用后基线推进必须守卫:渲染对象含未闭合  thinking/<tool> 块时不推进 _stable_md_len(等完整闭合后由差量/全量重置);_extract_closed_segments 增加起点防护处理历史遗漏的'起点在块内部'残段",
+      "rationale": "首次迭代首chunk全量渲染发生在思考未闭合期,基线推进到块内部是首轮泄漏根源;守卫使其与后续迭代(差量无产出不推进)行为一致"
+    },
+    {
+      "id": "D012",
+      "date": "2026-08-05T01:35:23",
+      "scope": "message_card 差量渲染",
+      "decision": "think 配对守卫必须以 _build_incremental_md 生成的真实标签 <think>/</think> 为准；差量渲染与全量渲染的 compact 形态、reorganize 搬移必须对齐",
+      "rationale": "守卫标签形式与实际生成不一致导致守卫恒失效；差量/全量形态分裂和正文滞留是 9c76d04f 修复不完整的残留"
+    },
+    {
+      "id": "D011",
+      "date": "2026-08-04T02:10:31",
+      "scope": "diff_viewer",
+      "decision": "默认视图 unified 落地：_file_block 按 default_view 控 display + 初始化 JS 兜底 applyView + genBlock 按 _cv 控首帧",
+      "rationale": "预加载块不走 loadFile/applyView 路径，Python 静态控制 + JS 兜底双保险，杜绝默认显示并排"
+    },
+    {
+      "id": "D010",
+      "date": "2026-08-02T16:42:03",
+      "scope": "topic_summary",
+      "decision": "标题生成失败(API异常/JSON解析失败/空结果)统一回退第一条真实用户问题(截断15字,跳过hook/邮件)",
+      "rationale": "R3防御对齐,避免标题不更新或取到assistant消息"
+    },
+    {
+      "id": "D009",
+      "date": "2026-08-02T12:59:39",
+      "scope": "team-restore",
+      "decision": "F1-F7 修复落地: 高频保存加 team 元数据 + _create_fresh_window(branch_data) 消除 showEvent 竞态 + force run_id + agent 去重 + 去 set_template + 卡片胶囊缓存刷新 + SQLite 直查绕开 500 上限",
+      "rationale": "plan 实证两主因(保存缺元数据/赋值太晚) + review 建议项全部落地"
+    },
+    {
+      "id": "D008",
+      "date": "2026-08-02T11:39:43",
+      "scope": "team restore UI",
+      "decision": "历史面板团队分组按 run_id 聚合 + _branch_session_data 复用分支机制恢复，Tab 分组 key 改 run_id",
+      "rationale": "SQLite 会话记录为权威数据源（team.json 成员可能被清理）；复用 showEvent 分支路径零竞态；run_id 分组避免同模板多次加载混组"
+    },
+    {
+      "id": "D007",
+      "date": "2026-08-02T11:21:02",
+      "scope": "team run_id",
+      "decision": "run_id 存 team.json 顶层（与 members 平级），start_team_run 幂等生成，_handle_team_load 注入各新窗口",
+      "rationale": "顶层字段不被 _cleanup_stale_members 清理；幂等避免重复 load 刷新导致历史会话脱钩；update_session 仅团队模式传参，None 保留现值"
+    },
+    {
+      "id": "D006",
+      "date": "2026-08-02T11:04:45",
+      "scope": "session team columns",
+      "decision": "sessions 表加 team_run_id/team_name/agent_name 三列，走 _migrate_add_team_columns 迁移，save_session/update_session 参数透传",
+      "rationale": "方案 A 团队会话恢复数据层；不用 ChatSession.metadata（只在内存不落库）；update 传 None 保留现有值避免覆盖"
+    },
+    {
+      "id": "D005",
+      "date": "2026-08-02T02:55:49",
+      "scope": "dnd-team",
+      "decision": "创建 DND 跑团专用智能体 dm-master/npc-actor 并组团队模板 dnd-run-team",
+      "rationale": "用户选择方案B：专用智能体比通用角色映射体验更佳；agent 放 user-custom 插件 agents/ 目录自动加载；模板引用 leader+dm-master+npc-actor；summary 为 hidden 不可用于团队模板"
+    },
+    {
+      "id": "D004",
+      "date": "2026-07-31T20:26:47",
+      "scope": "message-card-compact-scroll",
+      "decision": "reorganizeContent 程序性更新强制滚底，overflow-anchor:none 禁用浏览器干扰",
+      "rationale": "_userScrolledUp 被异步 scroll 事件误设导致跨周期污染；overflow-anchor 默认 auto 在 DOM 重组后覆盖 JS scrollTop"
+    },
+    {
+      "id": "D003",
+      "date": "2026-07-26T15:44:43",
+      "scope": "tab-gitee-account-row",
+      "decision": "Tab 模式设置下方使用独立 GiteeAccountRow；未绑定也显示；账户主体打开 DriFox_uploads，按钮直接绑定或确认解绑",
+      "rationale": "交互入口清晰，复用现有 Gitee OAuth 与同步能力，同时避免驱动完整设置卡片的脆弱耦合"
+    },
+    {
+      "id": "D002",
+      "date": "2026-07-26T14:39:31",
+      "scope": "tab_manager_window",
+      "decision": "_do_save_geometry 必须用 geometry() 而不是 x()/y()。PyQt5 中顶层窗口 x()/y() 返回 frame 位置（含 title bar），但 setGeometry(x,y,w,h) 把 (x,y) 当作 client 区域位置——保存 frame 位置再用 setGeometry 还原每次会让窗口向上偏移 title bar 高度（约 65px）",
+      "rationale": "TabManagerWindow 在 minimize→restore 后 showEvent 触发 _restore_geometry，调用 setGeometry(saved.x, saved.y, ...)。若 saved.y 是 frame top（= setGeometry.y - title_bar_height），则 setGeometry 把 client area 设到 saved.y 后，frame top 变成 saved.y - title_bar_height，窗口看起来往上跑了 title_bar_height 像素。修复：用 self.geometry() 保存（client area 位置，与 setGeometry 语义一致）。验证：3 个回归测试在原 bug 代码下全部失败（Y 偏移精确等于 65px），修复后全部通过。"
+    },
+    {
+      "id": "D001",
+      "date": "2026-07-25T00:51:50",
+      "scope": "world-1-1-recreation",
+      "decision": "采用 Three.js + Vite、原创程序化资源、横版固定视角和纯数据关卡布局",
+      "rationale": "项目为空且目标是浏览器可玩完整关卡；该组合最少依赖并便于测试与构建"
+    }
+  ],
+  "user_preferences": {
+    "log_language": "zh",
+    "comment_language": "zh",
+    "naming_style": "snake_case",
+    "no_unrelated_refactor": true,
+    "auto_sync_docs": true
+  },
+  "known_pitfalls": [
+    {
+      "id": "P016",
+      "module": "tabpanel 插件热加载 UI 不刷新",
+      "symptom": "插件热加载后 UI 插件列表偶尔不刷新;全关窗口重开才恢复",
+      "cause": "watcher 线程类级单例,只有首个 backend 连接 _hot_reload_requested → _on_hot_reload_requested 只 emit 宿主 backend 的 plugin_changed;宿主窗口关闭断开信号后 watcher 仍存活(其他窗口 refcount>0),emit 无接收者 → 全窗口 UI 静默不刷新;另有窗口隐藏期刷新被可见性门控跳过且 showEvent 无补刷;tab_panel 重建循环无异常隔离,毒条目中断整批刷新",
+      "fix": "ChatBackend._active_instances 类级集合(__init__ 注册/cleanup 移除), _on_hot_reload_requested 广播到全部活跃 backend;TabManagerWindow.showEvent 补刷 refresh_ui_plugins;refresh_ui_plugins 两循环 UIPluginRow 构造加 try/except continue 隔离",
+      "discovered_at": "2026-08-05T21:07:20"
+    },
+    {
+      "id": "P015",
+      "module": "message_card 差量渲染(首轮泄漏残漏)",
+      "symptom": "首次流式(简洁模式)思考后半段以正文 <p> 泄漏显示,后续迭代消失;P014 修复后仍存在",
+      "cause": "_apply_render_result 全量渲染后无条件推进 _stable_md_len;首次迭代 append_reasoning 首chunk 全量渲染(spinner)时基线落在 think 块内部 → 后续差量扫描切片以 ' response' 开头(无 ' thinking' 配对),配对守卫(count开>闭)识别不了,残段被当普通正文渲染",
+      "fix": "_apply_render_result 基线段推进加 _has_unclosed_think_or_tool 守卫(未闭合不推进);_extract_closed_segments 起点防护(切片首个闭合标签在开标签前 → 整片不产出)",
+      "discovered_at": "2026-08-05T20:49:46"
+    },
+    {
+      "id": "P014",
+      "module": "message_card 差量渲染",
+      "symptom": "reasoning_content 流式+简洁模式：首轮思考内容以普通正文显示，思考结束后消失回折叠区",
+      "cause": "_extract_closed_segments 配对守卫用 ' think'/' response' 匹配实际标签 <think>/</think>（count 恒 0 永不触发）→ 多段思考(含\\\\n\\\\n)被切碎，'段2</think>' 无 <think> 开头被 _inject_think_cards 当正文渲染；且差量 updateContentAppend 不调 reorganizeContent 导致思考块滞留正文",
+      "fix": "配对守卫改 <think>/</think>；差量调用点传 _tool_compact_mode；updateContentAppend 追加后调 reorganizeContent；_inject_think_cards 清理孤立 </think>；差量无产出且 md 达自然边界时兜底全量渲染",
+      "discovered_at": "2026-08-05T01:35:20"
+    },
+    {
+      "id": "P013",
+      "module": "main_widget._get_or_create_welcome_card",
+      "symptom": "欢迎卡片推荐列表混入团队会话（成员会话重复展示，点击后团队上下文丢失）",
+      "cause": "get_history_list(project) 无 merge_team 参数，团队会话逐条返回",
+      "fix": "构造推荐列表前过滤 team_run_id 非空条目，与历史面板 merge_team=True 语义对齐",
+      "discovered_at": "2026-08-04T22:45:25"
+    },
+    {
+      "id": "P012",
+      "module": "main_widget._switch_to_session_by_id",
+      "symptom": "欢迎卡片点团队会话：后续保存团队元数据被清空（会话从团队分组消失）；切换时打断的会话缺最后回复",
+      "cause": "保存顺序颠倒（先 save 后 stop）+ stop_streaming 返回值丢弃 + 无 F4 团队标记同步 + 无 _set_ai_state('idle')",
+      "fix": "先停止并 _apply_interrupted_messages_to_session 再保存；提取 _sync_team_markers_from_record 公共方法共用；_load_session_from_record 补同步 finalize_stop",
+      "discovered_at": "2026-08-04T22:45:21"
+    },
+    {
+      "id": "P011",
+      "module": "main_widget._create_new_session",
+      "symptom": "对话中切换项目：TabPanel 仍显示'正在对话'动画；被打断的会话未完整保存（缺最后 partial 回复）",
+      "cause": "stop_streaming() 返回值丢弃 + 未 _set_ai_state('idle')：stop 后 _on_worker_finished 因 is_streaming=False 忽略 stream_finished → _set_ai_state('idle') 永不触发",
+      "fix": "streaming 分支接收 stop_streaming() 返回值并 _apply_interrupted_messages_to_session + _set_ai_state('idle')（对齐 _on_auto_compact_requested）",
+      "discovered_at": "2026-08-04T22:12:41"
+    },
+    {
+      "id": "P010",
+      "module": "message_card.reorganizeContent",
+      "symptom": "简洁模式工具与思考折叠框内容顺序错乱：所有思考在前、所有工具在后",
+      "cause": "JS 注入 #tool-content 的工具块不在 #content-placeholder 中，getPos 无 posMap → 1e9 恒沉底；save/restore appendChild 沉底",
+      "fix": "方案 D：data-order 属性（锚点前 think/tool 计数+序号细分），getPos 优先 data-order，save/restore 按序插入",
+      "discovered_at": "2026-08-04T02:06:29"
+    },
+    {
+      "id": "P009",
+      "module": "question_floating_widget",
+      "symptom": "浅色主题下「预览参数」按钮文字不可读（白字淡黄底）",
+      "cause": "_preview_btn QSS 硬编码 color: rgba(255,255,255,0.72/0.95)，浅色主题 realtime_bg/realtime_tag_bg 偏浅时白字+低对比度。",
+      "fix": "color 改为 Colors.REALTIME_TEXT，跟主题走；深色=浅色字，浅色=深色字。",
+      "discovered_at": "2026-08-02T13:42:04"
+    },
+    {
+      "id": "P008",
+      "module": "main_widget",
+      "symptom": "权限请求触发后 TabPanel 边框不显示问题动画",
+      "cause": "_on_permission_approval_requested 缺少 _set_ai_state('question') 调用，TabManagerWindow._on_ai_state_changed 听不到 state 变化，update_tab_question 不会触发。",
+      "fix": "在 _on_permission_approval_requested 顶部加 self._set_ai_state('question')，与 _on_question_asked 对齐。",
+      "discovered_at": "2026-08-02T13:42:02"
+    },
+    {
+      "id": "P007",
+      "module": "command_card._exit_value_selection",
+      "symptom": "退出值选择模式后 tooltip 残留显示刚选中值描述",
+      "cause": "_exit_value_selection 未清理 tooltip；_value_selection_mode=False 后 detail 分支自动隐藏，但没人触发更新",
+      "fix": "方法末尾加 self._update_desc_tooltip()（走 detail 分支自动隐藏）",
+      "discovered_at": "2026-08-02T11:04:45"
+    },
+    {
+      "id": "P006",
+      "module": "command_card 值选择模式",
+      "symptom": "枚举值只显示值本身、无描述信息",
+      "cause": "ValueItemWidget 只接收 value，数据源为纯字符串列表；_update_desc_tooltip 在 detail 模式（含值选择）直接隐藏",
+      "fix": "枚举值条目升级为 {value,description}（兼容 str）；ValueItemWidget 携带 description；_update_desc_tooltip 增加值选择分支 _update_value_desc_tooltip",
+      "discovered_at": "2026-08-02T10:43:51"
+    },
+    {
+      "id": "P005",
+      "module": "main_widget._handle_team_load",
+      "symptom": "团队模板加载弹窗遮罩只覆盖聊天区、层级定位异常",
+      "cause": "ConfirmDialog parent 传了 self（嵌入 QStackedWidget 的子 widget），MaskDialogBase 用 parent 尺寸铺遮罩",
+      "fix": "parent 改为 self.window() 取顶层主窗口（TabManagerWindow）",
+      "discovered_at": "2026-08-02T10:21:44"
+    },
+    {
+      "id": "P004",
+      "module": "tooling",
+      "symptom": "ruff format 0.15.20 把 except (A, B): 改成 except A, B:（Python2 语法外观）",
+      "cause": "Python 3.14 实现 PEP 758，except 多异常无需括号；ruff target-version=py314 会规范化去括号。commit 61a3c119 反向改成带括号导致 format check 失败",
+      "fix": "Python 3.14 下两种写法等价；勿在无关行上跑 ruff format，避免污染他人 commit",
+      "discovered_at": "2026-08-02T02:11:41"
+    },
+    {
+      "id": "P003",
+      "module": "gitee_account_row",
+      "symptom": "构造 TabPanel 时触发 Gitee 远端同步，拖慢模式切换并干扰防重入守卫",
+      "cause": "GiteeAccountRow._refresh_ui 在已绑定渲染路径调用 _auto_enable_sync，导致纯 UI 刷新产生网络副作用",
+      "fix": "移除渲染路径的同步启动，只在快捷绑定 OAuth 成功回调中 enable；启动恢复继续由完整 GiteeCard 负责",
+      "discovered_at": "2026-07-26T16:36:45"
+    },
+    {
+      "id": "P002",
+      "module": "tab_manager_window",
+      "symptom": "minimize→restore 后窗口往上跑（frame Y 偏移 65px）",
+      "cause": "_do_save_geometry 用 self.x()/self.y() 保存 frame top，但 _restore_geometry 用 setGeometry(...) 把 saved.y 当作 client area 位置，导致 client→frame 转换时丢失 title_bar_height",
+      "fix": "改用 self.geometry() 保存（client area 位置，与 setGeometry 语义一致）。新增 test_tab_geometry_roundtrip.py 回归测试。",
+      "discovered_at": "2026-07-26T14:39:35"
+    },
+    {
+      "id": "P001",
+      "module": "chat_worker",
+      "symptom": "API 不返回 usage 时消息卡片 token 数不更新",
+      "cause": "本地 ctx_count 仅通过 context_updated 更新圆环，未写入 assistant.token_usage；多轮工具调用还可能沿用上一轮 usage",
+      "fix": "保存每轮本地上下文计数，缺失 API usage 时作为 estimated token_usage 写入消息，并在每次 API 调用前清空 usage",
+      "discovered_at": "2026-07-12T18:58:30"
+    }
+  ],
+  "open_questions": [],
+  "auto_snapshot": {
+    "last_updated": "2026-07-26T17:25:48",
+    "key_files_lines": {
+      "app/main_widget.py": 16634,
+      "app/core/backend.py": 2747,
+      "app/core/workers/chat_worker.py": 4147,
+      "app/core/hook_manager.py": 2157,
+      "app/core/plugin_manager.py": 1146,
+      "app/tools/__init__.py": 1222,
+      "app/core/lsp/lsp_manager.py": 720,
+      "app/gateway/manager.py": 489
+    },
+    "recent_commits": [
+      {
+        "hash": "1c8b2be6",
+        "date": "2026-07-26T17:24:29+08:00",
+        "message": "feat: tab-manager - implement custom title bar with drag and maximize/restore functionality"
+      },
+      {
+        "hash": "d0cd91eb",
+        "date": "2026-07-26T16:53:25+08:00",
+        "message": "feat: tab-panel - UI plugin row font, icon theme refresh and scroll"
+      },
+      {
+        "hash": "17a8a39c",
+        "date": "2026-07-26T16:37:46+08:00",
+        "message": "fix: gitee-account-row - avoid sync during rendering"
+      },
+      {
+        "hash": "e801bde3",
+        "date": "2026-07-26T16:22:53+08:00",
+        "message": "feat: tab-panel - add Gitee account shortcut"
+      },
+      {
+        "hash": "79b34bd8",
+        "date": "2026-07-26T16:19:11+08:00",
+        "message": "feat: gitee-account-row - add repository and binding actions"
+      },
+      {
+        "hash": "472b1137",
+        "date": "2026-07-26T16:17:16+08:00",
+        "message": "feat: gitee-account-row - add compact binding state"
+      },
+      {
+        "hash": "ac57b3fa",
+        "date": "2026-07-26T16:09:55+08:00",
+        "message": "docs: tab-gitee-account-row - add implementation plan"
+      },
+      {
+        "hash": "e436ab75",
+        "date": "2026-07-26T16:08:16+08:00",
+        "message": "fix: enhance UI plugin handling and improve question state indication in TabPanel and TabManagerWindow"
+      },
+      {
+        "hash": "e7af6ea7",
+        "date": "2026-07-26T15:44:18+08:00",
+        "message": "docs: tab-gitee-account-row - add design specification"
+      },
+      {
+        "hash": "1416d11e",
+        "date": "2026-07-26T15:17:44+08:00",
+        "message": "docs: tab-ui-plugin-list - add implementation plan"
+      }
+    ],
+    "uncommitted_changes": {
+      "dirty": true,
+      "files": [
+        "v.lock",
+        ".workbuddy/"
+      ],
+      "total": 2
+    },
+    "branch": "dev",
+    "github_issues": {
+      "ok": true,
+      "issues": [
+        {
+          "number": 243,
+          "title": "[Optimization] 优化卡顿问题",
+          "state": "open",
+          "created_at": "2026-07-15T03:06:49Z",
+          "updated_at": "2026-07-17T04:05:28Z",
+          "user": "luoqianyi",
+          "labels": [],
+          "url": "https://github.com/martin98-afk/DriFox/issues/243",
+          "comments": 3
+        },
+        {
+          "number": 144,
+          "title": "[Enhancement] Gateway 支持多用户同时并发对话",
+          "state": "open",
+          "created_at": "2026-05-30T12:26:11Z",
+          "updated_at": "2026-06-13T02:27:13Z",
+          "user": "martin98-afk",
+          "labels": [
+            "enhancement"
+          ],
+          "url": "https://github.com/martin98-afk/DriFox/issues/144",
+          "comments": 1
+        },
+        {
+          "number": 63,
+          "title": "讨论：有没有可能集成 CodeGraph 和 Evolver 这两个项目？",
+          "state": "open",
+          "created_at": "2026-05-17T12:17:24Z",
+          "updated_at": "2026-05-21T01:22:41Z",
+          "user": "gass88wei",
+          "labels": [],
+          "url": "https://github.com/martin98-afk/DriFox/issues/63",
+          "comments": 2
+        },
+        {
+          "number": 52,
+          "title": "[Hook系统] HookManager 动态注册可能导致状态不一致",
+          "state": "open",
+          "created_at": "2026-05-15T05:06:47Z",
+          "updated_at": "2026-06-13T02:27:06Z",
+          "user": "martin98-afk",
+          "labels": [
+            "enhancement"
+          ],
+          "url": "https://github.com/martin98-afk/DriFox/issues/52",
+          "comments": 1
+        },
+        {
+          "number": 32,
+          "title": "[Enhancement] 改进 ToolExecutor UI 检查完整性",
+          "state": "open",
+          "created_at": "2026-05-15T04:45:26Z",
+          "updated_at": "2026-06-13T02:26:50Z",
+          "user": "martin98-afk",
+          "labels": [
+            "enhancement"
+          ],
+          "url": "https://github.com/martin98-afk/DriFox/issues/32",
+          "comments": 1
+        },
+        {
+          "number": 31,
+          "title": "[Bug] BackgroundTaskManager 线程安全问题",
+          "state": "open",
+          "created_at": "2026-05-15T04:45:22Z",
+          "updated_at": "2026-06-13T02:26:43Z",
+          "user": "martin98-afk",
+          "labels": [
+            "bug",
+            "concurrency"
+          ],
+          "url": "https://github.com/martin98-afk/DriFox/issues/31",
+          "comments": 1
+        }
+      ],
+      "fetched_at": "2026-07-26T17:25:49",
+      "repo": "martin98-afk/DriFox",
+      "count": 6
+    }
+  }
+}

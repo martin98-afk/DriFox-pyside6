@@ -18,7 +18,11 @@ pypinyin
 # 桌面自动化 (pynput + mss 组合, 替代 pyautogui)
 pynput>=1.7.6
 mss>=9.0.1
+# 全局热键 (tray_manager)
+keyboard>=0.13.5
 mcp>=1.0.0
+# CodeGraph 代码智能工具
+codegraph-py[all]>=1.4.0
 
 # 插件热更新
 watchfiles>=1.0.0
@@ -36,3 +40,7 @@ dingtalk-stream>=0.20
 #lark-oapi>=1.0
 # 通用异步
 aiohttp>=3.9.0
+
+# 开发依赖 (对应 pyproject [project.optional-dependencies].dev)
+pytest-qt>=4.4.0
+pympler>=1.1

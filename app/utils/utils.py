@@ -26,6 +26,7 @@ import requests
 import yaml
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QIcon, QFont
+from PySide6.QtWidgets import QApplication
 
 from app.utils.config import Settings
 from loguru import logger
@@ -279,6 +280,12 @@ def get_icon(icon_name: str) -> QIcon:
     Returns:
         QIcon 实例
     """
+    # 防御：无 QApplication 实例时无法安全创建 QIcon（原生层崩溃 0xC0000409），
+    # 直接返回空 QIcon。现有 `if not icon.isNull()` 判断保证空图标不缓存，
+    # QApplication 就绪后再次调用即可正常加载。
+    if QApplication.instance() is None:
+        return QIcon()
+
     if icon_name in _ICON_CACHE:
         return _ICON_CACHE[icon_name]
 
