@@ -299,7 +299,10 @@ class PluginManager:
         if name not in enabled:
             enabled.add(name)
             self._save_enabled_set(enabled)
+            self.invalidate_mcp_cache()  # 启用插件可能带入新 MCP 配置
             logger.info(f"[PluginManager] Enabled plugin: {name}")
+        # 联动加载 UI 组件
+        self._load_plugin_ui(name)
 
     def disable_plugin(self, name: str):
         """禁用插件（配置持久化，调用方需触发各子系统 reload）"""
@@ -310,7 +313,29 @@ class PluginManager:
         if name in enabled:
             enabled.discard(name)
             self._save_enabled_set(enabled)
+            self.invalidate_mcp_cache()  # 禁用插件需剔除其 MCP 配置
             logger.info(f"[PluginManager] Disabled plugin: {name}")
+        # 联动卸载 UI 组件
+        self._unload_plugin_ui(name)
+
+    def _load_plugin_ui(self, name: str):
+        """加载指定插件的 UI 组件"""
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+        except ImportError:
+            return
+        plugin = self._plugins.get(name)
+        if plugin is None or not plugin.has_component("ui"):
+            return
+        UIPluginRegistry.get_instance().load_plugin(name, plugin.path)
+
+    def _unload_plugin_ui(self, name: str):
+        """卸载指定插件的 UI 组件"""
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+        except ImportError:
+            return
+        UIPluginRegistry.get_instance().unload_plugin(name)
 
     def _get_enabled_set(self) -> set:
         """从 Settings 读取已启用的插件名集合"""

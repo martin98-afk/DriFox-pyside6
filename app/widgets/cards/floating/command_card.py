@@ -602,6 +602,7 @@ class CommandCard(QWidget):
     commandSelected = Signal(str, str)  # name, display_type（"command"/"prompt"/"agent"/"skill"/""）
     dismissed = Signal()                # 卡片被关闭
     parameterSelected = Signal(str, str)  # param_name, param_type — 参数项被点击
+    parameterDeselected = Signal(str, str)  # param_name, param_type — 已激活参数被再次点击（取消选中）
     parameterValueSelected = Signal(str)  # value — --model= 的值被选中
 
     def __init__(self, parent=None):
@@ -1505,6 +1506,10 @@ class CommandCard(QWidget):
         """参数项被点击"""
         sender = self.sender()
         if sender in self._param_widgets:
+            # 已激活参数再次点击 = 取消该参数（从输入框移除）
+            if sender.is_active:
+                self.parameterDeselected.emit(sender.param_name, sender.param_type)
+                return
             idx = self._param_widgets.index(sender)
             self._selected_param_index = idx
             self._update_param_selection()
@@ -1968,6 +1973,18 @@ class CommandCard(QWidget):
 
         cmd_mgr = CommandManager.get_instance()
         commands = cmd_mgr.get_all_commands()
+
+        # 标记 UI 插件命令（用于排序、分区和标签显示）
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+
+            ui_cmd_names = UIPluginRegistry.get_instance().get_ui_command_names()
+            for cmd in commands:
+                if cmd["name"] in ui_cmd_names:
+                    cmd["subtype"] = "ui_plugin"
+        except Exception:
+            pass
+
         skills = [
             {"name": s["name"], "description": s.get("description", ""), "type": "skill"}
             for s in get_local_skills()

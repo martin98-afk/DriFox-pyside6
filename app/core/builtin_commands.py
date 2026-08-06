@@ -445,6 +445,13 @@ def register_all_commands():
             for name in list(cmd_mgr.get_command_names()):
                 cmd_mgr.unregister(name)
         else:
+            # 🛡️ 恢复 UI 插件命令（register_all_commands 清空了所有命令）
+            try:
+                from app.core.ui_plugin_registry import UIPluginRegistry
+
+                UIPluginRegistry.get_instance().re_register_all_commands()
+            except Exception:
+                pass
             _registered = True
             return
 
@@ -479,6 +486,14 @@ def register_all_commands():
             "prompt_text": ag.get("prompt_text", ""),
         })
     _save_cache(cache_key, serialized_commands, serialized_agents)
+
+    # 🛡️ 恢复 UI 插件命令
+    try:
+        from app.core.ui_plugin_registry import UIPluginRegistry
+
+        UIPluginRegistry.get_instance().re_register_all_commands()
+    except Exception:
+        pass
 
     _registered = True
 
@@ -527,6 +542,14 @@ def reload_all_commands():
             "prompt_text": ag.get("prompt_text", ""),
         })
     _save_cache(cache_key, serialized_commands, serialized_agents)
+
+    # 🛡️ 恢复 UI 插件命令（reload 会清空所有命令，UI 插件使用独立注册表）
+    try:
+        from app.core.ui_plugin_registry import UIPluginRegistry
+
+        UIPluginRegistry.get_instance().re_register_all_commands()
+    except Exception:
+        pass
 
     _registered = True
 

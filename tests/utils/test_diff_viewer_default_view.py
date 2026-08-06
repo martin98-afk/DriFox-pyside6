@@ -27,7 +27,6 @@ from PySide6.QtWidgets import QApplication
 
 # 必须在导入 diff_viewer（其导入 QWebEngineWidgets）之前设置
 QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
-QApplication.instance() or QApplication(sys.argv)
 
 from app.utils.diff_viewer import DiffHtmlGenerator  # noqa: E402
 

@@ -1128,10 +1128,10 @@ class ChatBackend(QObject):
             component: 变更的组件名
 
         Returns:
-            {"agents": int, "commands": bool, "themes": bool, "skills": bool, "mcp": bool}
+            {"agents": int, "commands": bool, "themes": bool, "skills": bool, "mcp": bool, "ui": bool}
         """
         result: dict = {"agents": 0, "commands": False, "hooks": False, "themes": False,
-                        "skills": False, "mcp": False}
+                        "skills": False, "mcp": False, "ui": False}
 
         try:
             from app.core.plugin_manager import PluginManager
@@ -1169,6 +1169,16 @@ class ChatBackend(QObject):
                 result["hooks"] = True
                 result["skills"] = True
                 result["mcp"] = True
+
+                # UI 组件：卸载该插件在 UIPluginRegistry 中的注册
+                try:
+                    from app.core.ui_plugin_registry import UIPluginRegistry
+
+                    UIPluginRegistry.get_instance().unload_plugin(plugin_name)
+                    result["ui"] = True
+                    logger.info(f"[ChatBackend] Plugin '{plugin_name}' UI 组件已卸载")
+                except Exception as e:
+                    logger.error(f"[ChatBackend] Plugin '{plugin_name}' UI 卸载失败: {e}")
                 return result
 
             # 2. 智能体：仅当变更在 agents/ 目录（含 hooks 重载一并完成）
@@ -1227,10 +1237,21 @@ class ChatBackend(QObject):
                 result["mcp"] = True
                 logger.debug(f"[ChatBackend] Plugin '{plugin_name}' MCP config reloaded (lazy)")
 
+            # 8. UI 组件：热重载 UI 组件（先卸载后加载）
+            if component == "ui" and plugin.has_component("ui"):
+                try:
+                    from app.core.ui_plugin_registry import UIPluginRegistry
+
+                    UIPluginRegistry.get_instance().reload_plugin(plugin_name, plugin.path)
+                    result["ui"] = True
+                    logger.info(f"[ChatBackend] Plugin '{plugin_name}' UI 组件已重载")
+                except Exception as e:
+                    logger.error(f"[ChatBackend] Plugin '{plugin_name}' UI 重载失败: {e}")
+
             logger.info(f"[ChatBackend] Plugin [{plugin_name}] reloaded: "
                        f"agents={result['agents']}, commands={result['commands']}, "
                        f"themes={result['themes']}, skills={result['skills']}, "
-                       f"mcp={result['mcp']}")
+                       f"mcp={result['mcp']}, ui={result['ui']}")
         except Exception as e:
             logger.error(f"[ChatBackend] Failed to reload plugin '{plugin_name}': {e}")
 
@@ -1373,11 +1394,11 @@ class ChatBackend(QObject):
 
         Returns:
             {"agents": int, "commands": bool, "hooks": bool, "themes": bool,
-             "skills": bool, "mcp": bool}
+             "skills": bool, "mcp": bool, "ui": bool}
             各子系统的重载结果
         """
         result: dict = {"agents": 0, "commands": False, "hooks": False, "themes": False,
-                        "skills": False, "mcp": False}
+                        "skills": False, "mcp": False, "ui": False}
 
         try:
             from app.core.plugin_manager import PluginManager
@@ -1446,9 +1467,20 @@ class ChatBackend(QObject):
                 # MCP：PluginManager 已更新，UI 懒加载
                 result["mcp"] = bool(comps.get("mcp"))
 
+                # UI 组件
+                if comps.get("ui"):
+                    try:
+                        from app.core.ui_plugin_registry import UIPluginRegistry
+
+                        UIPluginRegistry.get_instance().load_plugin(name, plugin.path)
+                        result["ui"] = True
+                        logger.info(f"[ChatBackend] Plugin '{name}' UI 组件已加载")
+                    except Exception as e:
+                        logger.error(f"[ChatBackend] Plugin '{name}' UI 加载失败: {e}")
+
                 logger.info(f"[ChatBackend] 增量重载「{name}」完成: "
                            f"agents={result['agents']}, commands={result['commands']}, "
-                           f"themes={result['themes']}, skills={result['skills']}, mcp={result['mcp']}")
+                           f"themes={result['themes']}, skills={result['skills']}, mcp={result['mcp']}, ui={result['ui']}")
                 return result
 
             # ── 全量重载（多插件变更/移除/覆盖，或非 watchfiles 触发） ──
@@ -1482,9 +1514,13 @@ class ChatBackend(QObject):
             # 6. MCP 配置：PluginManager 已更新，UI 通过 get_mcp_servers() 懒加载
             result["mcp"] = True
 
+            # 7. UI 组件：全量 rescan 已在 _load_plugin_ui/_unload_plugin_ui 中处理，
+            #    此处标记为 True 以通知 UI 刷新
+            result["ui"] = True
+
             logger.info(f"[ChatBackend] Plugin subsystems reloaded: agents={result['agents']}, "
                        f"commands={result['commands']}, themes={result['themes']}, "
-                       f"skills={result['skills']}, mcp={result['mcp']}")
+                       f"skills={result['skills']}, mcp={result['mcp']}, ui={result['ui']}")
         except Exception as e:
             logger.error(f"[ChatBackend] Failed to reload plugin subsystems: {e}")
 

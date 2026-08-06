@@ -1995,6 +1995,20 @@ class OpenAIChatToolWindow(ToolWindow):
         # （此时命令已注册）更新 /subagents --model= 参数描述
         self._update_subagents_param_description()
 
+        # ===== UI 插件系统集成（轻量：仅注册 registry 上下文） =====
+        # 性能优化：插件加载 + 命令注册 + 浮动卡片处理器注册延迟到首帧后，
+        # 让窗口外壳尽快出现，压缩首次启动感知耗时
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+
+            ui_registry = UIPluginRegistry.get_instance()
+            ui_registry.set_main_widget(self)
+            # 设置上下文提供者：UI 插件首次显示时通过 set_context() 获取当前项目信息
+            ui_registry.set_context_provider(self._build_ui_context, self._window_id)
+            QTimer.singleShot(0, self._init_ui_plugins_deferred)
+        except Exception as e:
+            logger.error(f"[MainWidget] UI plugin registry init failed: {e}")
+
         # ===== 独立工具栏条（钉在主窗口底部，不受 _input_card 缩放影响）=====
         # 关键：工具栏从 _input_card 中拆出，作为 _input_card 的 sibling
         # 放在主 layout 自己的容器里。这样 _input_card 缩小到 0 时，
@@ -2394,6 +2408,166 @@ class OpenAIChatToolWindow(ToolWindow):
 
         register_all_commands()
         self._register_command_shortcuts()
+
+    def _init_ui_plugins_deferred(self):
+        """延迟加载 UI 插件（首帧渲染后执行，避免阻塞窗口出现）"""
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+
+            ui_registry = UIPluginRegistry.get_instance()
+            # 加载所有已启用的 UI 插件
+            self._load_all_ui_plugins()
+            # 确保 UI 插件命令在 CommandManager 中（覆盖 register_all_commands 的清理）
+            ui_registry.re_register_all_commands()
+            # 多窗口隔离：为每个 UI 插件浮动卡片注册当前窗口的实例级处理器
+            for card_id, card_info in ui_registry.get_floating_cards().items():
+                if ":" in card_id:
+                    cmd_name = card_id
+                elif card_info.plugin_name == "system" or card_id == card_info.plugin_name:
+                    cmd_name = card_id
+                else:
+                    cmd_name = f"{card_info.plugin_name}:{card_id}"
+                if cmd_name in self._function_command_handlers:
+                    continue
+
+                def _make_handler(cid=card_id, mw=self):
+                    return lambda args: ui_registry._show_floating_card(cid, main_widget=mw)
+
+                self._function_command_handlers[cmd_name] = _make_handler()
+        except Exception as e:
+            logger.error(f"[MainWidget] UI plugin deferred init failed: {e}")
+
+    def _load_all_ui_plugins(self):
+        """加载所有已启用的 UI 插件"""
+        from app.core.ui_plugin_registry import UIPluginRegistry
+        from app.core.plugin_manager import PluginManager
+
+        pm = PluginManager.get_instance()
+        if not pm.is_initialized():
+            return
+        registry = UIPluginRegistry.get_instance()
+
+        # 🛡️ 多窗口隔离：如果注册表中已有插件（被其他窗口加载），跳过重复加载。
+        # UIPluginRegistry 是单例，所有窗口共享同一注册表。第一个窗口已加载的
+        # 插件在后续窗口无需重新 load_plugin —— 调用 load_plugin 会触发
+        # "先卸载旧版本"逻辑（if self.is_loaded: unload_plugin），导致所有窗口
+        # 的浮动卡片 widget 被 deleteLater()，造成界面闪烁 / 状态丢失。
+        # 窗口实例级的命令注册由 setup_ui 中后续的 for 循环处理，不受此影响。
+        if registry.list_loaded_plugins():
+            return
+
+        plugin_dirs = []
+        for plugin in pm.get_enabled_plugins():
+            if plugin.has_component("ui"):
+                plugin_dirs.append((plugin.name, plugin.path))
+        logger.info(f"[MainWidget] Found {len(plugin_dirs)} UI-enabled plugins: {[p[0] for p in plugin_dirs]}")
+        count = registry.load_all_enabled_plugins(plugin_dirs)
+        if count > 0:
+            logger.info(f"[MainWidget] Loaded {count}/{len(plugin_dirs)} UI plugins")
+
+    def _build_ui_context(self) -> Dict[str, str]:
+        """构建 UI 插件的上下文 dict
+
+        UIPluginRegistry 在首次显示浮动卡片时调用此方法，
+        将结果通过 ``widget.set_context(context)`` 注入卡片。
+
+        Returns:
+            dict 包含以下字段：
+            - project_root: 当前工作目录（git 工作树根）
+            - project_name: 当前项目名
+            - session_id:   当前会话 ID
+            - window_id:    当前窗口 ID
+            - theme_id:     当前主题 ID
+            - theme_name:   当前主题名称
+            - is_dark:      当前是否为深色模式
+            - font_family:  全局字体
+            - font_size:    UI 基础字号（px）
+            - colors:       主题色字典，可直接用: colors["card_bg"]、colors["accent"]、colors["text_primary"] 等
+        """
+        # ── 工作目录取值优先级 ──
+        # 1. tool_executor.get_workdir() — 用户显式设置的项目根目录（最优先）
+        # 2. _current_workdir 实例缓存 — 本窗口最后一次设置的工作目录
+        # 3. os.getcwd() — 最后兜底（在打包版中可能指向软件安装目录，不推荐）
+        workdir = ""
+        try:
+            if self.backend and self.backend.tool_executor:
+                workdir = self.backend.tool_executor.get_workdir() or ""
+        except Exception as e:
+            logger.warning(f"[_build_ui_context] get_workdir failed: {e}")
+
+        if not workdir:
+            project = getattr(self, "_current_project", "")
+            workdir = self._current_workdir.get(project, "")
+            if workdir:
+                logger.debug(f"[_build_ui_context] workdir from _current_workdir cache: {workdir}")
+
+        if not workdir:
+            workdir = os.getcwd()
+            logger.warning(
+                f"[_build_ui_context] workdir fallback to os.getcwd()={workdir}; "
+                f"tool_executor workdir may be unset. Consider calling set_workdir first."
+            )
+
+        # 主题信息
+        theme_id = ""
+        theme_name = ""
+        is_dark = True
+        font_family = "Segoe UI"
+        font_size = 14
+        theme_colors = {}
+        try:
+            from app.utils.theme_manager import theme_manager
+            from app.utils.design_tokens import get_ui_font_size, _get_global_font
+            from app.utils.fluent_shim import isDarkTheme
+
+            theme_id = theme_manager.get_current_theme_id()
+            theme_data = theme_manager.get_current_theme()
+            theme_name = theme_data.get("name", "") if theme_data else ""
+            is_dark = isDarkTheme()
+            font_family = _get_global_font()
+            font_size = get_ui_font_size()
+            theme_colors = theme_manager.get_current_colors()
+        except Exception:
+            pass
+
+        return {
+            "project_root": workdir,
+            "project_name": getattr(self, "_current_project", ""),
+            "session_id": getattr(self, "_current_session_id", ""),
+            "window_id": getattr(self, "_window_id", ""),
+            "theme_id": theme_id,
+            "theme_name": theme_name,
+            "is_dark": is_dark,
+            "font_family": font_family,
+            "font_size": font_size,
+            "colors": theme_colors,
+        }
+
+    def _create_message_widget(self, role: str, content, timestamp=None, **kwargs):
+        """统一的创建消息 widget 入口：先让插件工厂尝试处理
+
+        Returns:
+            QWidget 实例（可能是 MessageCard 或插件自定义 widget），
+            无工厂处理时返回 None（调用方应使用默认逻辑）
+        """
+        from app.core.ui_plugin_registry import UIPluginRegistry
+
+        message_data = {
+            "role": role,
+            "content": content,
+            "timestamp": timestamp,
+            **kwargs,
+        }
+        registry = UIPluginRegistry.get_instance()
+        for factory in registry.get_message_factories():
+            try:
+                if factory.condition_func(message_data):
+                    widget = factory.factory_func(message_data, self)
+                    if widget is not None:
+                        return widget
+            except Exception as e:
+                logger.error(f"[MainWidget] Message factory {factory.name} failed: {e}")
+        return None
 
     def _clear_command_shortcuts(self):
         """清除已注册的命令快捷键"""
@@ -13431,6 +13605,18 @@ class OpenAIChatToolWindow(ToolWindow):
 
             CardManager.get_instance().unregister_window(self._window_id)
             logger.debug(f"[OpenAIChatToolWindow] 注销窗口卡片: {self._window_id}")
+        except Exception:
+            pass
+
+        # ★ 泄漏修复（P0）：注销窗口的 UI 插件状态，释放注册表对窗口的强引用。
+        # 窗口 __init__ 调用 ui_registry.set_main_widget(self) +
+        # set_context_provider(self._build_ui_context, self._window_id)——
+        # provider 闭包、_window_main_widgets、_card_widget_instances 均按
+        # window_id 持有窗口引用，不清理则窗口对象树被全局单例持续持有。
+        try:
+            from app.core.ui_plugin_registry import UIPluginRegistry
+
+            UIPluginRegistry.get_instance().unregister_window(self._window_id)
         except Exception:
             pass
 

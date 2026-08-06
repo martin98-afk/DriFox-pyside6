@@ -85,7 +85,11 @@ class TestCheckRemoteFile:
     def svc(self, reset_sync_service):
         reset_sync_service._token = "valid_token"
         reset_sync_service._owner = "test_user"
-        return reset_sync_service
+        # py6 适配：_check_remote_file 内部会调 _prepare_read_token 从 Settings 重读，
+        # 测试环境 Settings 无 token 会覆盖上面的手动值 → 返回 None。
+        # 此处 mock 为 no-op，保留手动 token（仅测试环境适配，不改 app 代码）。
+        with patch.object(reset_sync_service, "_prepare_read_token", return_value=True):
+            yield reset_sync_service
 
     def test_returns_true_when_200_with_content(self, svc):
         """HTTP 200 + 有 content → True（文件存在）"""
@@ -352,7 +356,16 @@ class TestDoDownload:
         svc._sha_cache_path = MagicMock()
         # 默认 httpx mock
         svc._debounce_timer = MagicMock(spec=QTimer)
-        return svc
+        # py6 适配：_do_download 内部调 _prepare_read_token 从 Settings 重读 token，
+        # 测试环境 Settings 无 token 会覆盖手动值。mock 为已绑定（仅测试环境适配）。
+        fake_cfg = MagicMock()
+        fake_cfg.gitee_bound.value = True
+        fake_cfg.gitee_user_token.value = "valid_token"
+        fake_cfg.gitee_user_owner.value = "test_user"
+        fake_cfg.gitee_user_refresh_token.value = "valid_rt"
+        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
+        with patch("app.core.config_sync.Settings.get_instance", return_value=fake_cfg):
+            yield svc
 
     def test_downloads_app_config_successfully(self, svc):
         """正常下载 app.config"""
@@ -466,7 +479,16 @@ class TestInitialSync:
         svc._sha_cache_path = MagicMock()
         svc._debounce_timer = MagicMock(spec=QTimer)
         svc._upload_lock = threading.Lock()
-        return svc
+        # py6 适配：_initial_sync 开头检查 Settings.gitee_bound，测试环境未绑定
+        # （默认 False）会直接 return。mock 为已绑定（仅测试环境适配，不改 app）。
+        fake_cfg = MagicMock()
+        fake_cfg.gitee_bound.value = True
+        fake_cfg.gitee_user_token.value = "valid_token"
+        fake_cfg.gitee_user_owner.value = "test_user"
+        fake_cfg.gitee_user_refresh_token.value = "valid_rt"
+        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
+        with patch("app.core.config_sync.Settings.get_instance", return_value=fake_cfg):
+            yield svc
 
     def test_downloads_when_remote_exists(self, svc):
         """远端有配置 → 下载覆盖本地 → 标记初始同步完成"""
@@ -607,7 +629,7 @@ class TestInitialSync:
         fake_cfg.gitee_user_token.value = "stale_token"
         fake_cfg.gitee_user_owner.value = "test_user"
         fake_cfg.gitee_user_refresh_token.value = "stale_rt"
-        fake_cfg.gitee_token_expires_at.value = 0.0
+        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -676,7 +698,7 @@ class TestInitialSync:
         fake_cfg.gitee_user_token.value = "stale_token"
         fake_cfg.gitee_user_owner.value = "test_user"
         fake_cfg.gitee_user_refresh_token.value = "stale_rt"
-        fake_cfg.gitee_token_expires_at.value = 0.0
+        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
 
         with patch("httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
@@ -794,7 +816,16 @@ class TestReBinding:
         svc._sha_cache_path = MagicMock()
         svc._debounce_timer = MagicMock(spec=QTimer)
         svc._upload_lock = threading.Lock()
-        return svc
+        # py6 适配：_initial_sync 开头检查 Settings.gitee_bound，测试环境未绑定
+        # （默认 False）会直接 return。mock 为已绑定（仅测试环境适配，不改 app）。
+        fake_cfg = MagicMock()
+        fake_cfg.gitee_bound.value = True
+        fake_cfg.gitee_user_token.value = "valid_token"
+        fake_cfg.gitee_user_owner.value = "test_user"
+        fake_cfg.gitee_user_refresh_token.value = "valid_rt"
+        fake_cfg.gitee_token_expires_at.value = time.time() + 3600  # token 有效（避免走刷新分支）
+        with patch("app.core.config_sync.Settings.get_instance", return_value=fake_cfg):
+            yield svc
 
     def test_enable_clears_initial_sync_flag(self, svc):
         """enable() 重置 _initial_sync_completed"""
