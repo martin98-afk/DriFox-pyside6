@@ -8,6 +8,7 @@ AI 也可通过 gitee_upload 工具手动上传。
 
 参考实现: WorkFlowGUI/app/components/消息推送 中的 Gitee 上传逻辑
 """
+
 import base64
 import uuid
 from pathlib import Path
@@ -15,9 +16,49 @@ from typing import Optional, Tuple
 
 import requests
 from loguru import logger
+from PySide6.QtCore import QObject, Signal
 
 
-class GiteeUploader:
+class GiteeContentBackend:
+    """
+    Gitee contents API 存储后端
+
+    只负责「把一段 base64 内容写入仓库指定路径」这一原子动作，
+    上传器通过 _backend 属性持有，便于替换为其他平台的存储实现（GitHub 等）。
+    """
+
+    API_URL = "https://gitee.com/api/v5/repos/{owner}/{repo}/contents/{path}"
+
+    def __init__(self):
+        self.last_error: str = ""
+
+    def upload(self, token: str, owner: str, repo: str, branch: str, path: str, content_b64: str, message: str) -> bool:
+        """上传内容到仓库。成功返回 True；失败返回 False 并记录 last_error"""
+        url = self.API_URL.format(owner=owner, repo=repo, path=path)
+        payload = {
+            "access_token": token,
+            "content": content_b64,
+            "message": message,
+            "branch": branch,
+        }
+        resp = requests.post(url, data=payload, timeout=30)
+        if resp.status_code == 201:
+            self.last_error = ""
+            return True
+
+        self.last_error = f"[{resp.status_code}] {self._parse_error(resp)}"
+        return False
+
+    @staticmethod
+    def _parse_error(resp) -> str:
+        try:
+            body = resp.json()
+            return body.get("message", resp.text[:200])
+        except Exception:
+            return resp.text[:200]
+
+
+class GiteeUploader(QObject):
     """
     Gitee 图床上传器（单例）
 
@@ -29,15 +70,25 @@ class GiteeUploader:
 
     _instance: Optional["GiteeUploader"] = None
 
-    API_URL = "https://gitee.com/api/v5/repos/{owner}/{repo}/contents/{path}"
+    # OAuth 绑定 token 真失效（上传 401 且刷新重试仍失败）→ UI 据此提示重新绑定
+    tokenInvalid = Signal()
+
+    # 公开下载链接模板（与 Gitee contents API 返回的 download_url 一致）
+    DOWNLOAD_URL = "https://gitee.com/{owner}/{repo}/raw/{branch}/{path}"
 
     def __init__(self):
+        super().__init__()
         self._token: str = ""
         self._owner: str = ""
         self._repo: str = ""
         self._path: str = "drifox"
         self._branch: str = "master"
         self._config_loaded: bool = False
+        # 是否为 OAuth 绑定账号模式（区别于共享仓库模式）；仅该模式下
+        # 401 重试失败才判定为"绑定 token 失效"并发出 tokenInvalid
+        self._oauth_mode: bool = False
+        # 存储后端（可替换为其他平台实现）
+        self._backend = GiteeContentBackend()
 
     @classmethod
     def get_instance(cls) -> "GiteeUploader":
@@ -47,24 +98,54 @@ class GiteeUploader:
         return cls._instance
 
     def _ensure_config(self) -> bool:
-        """从 Settings 加载配置，仅加载一次"""
+        """加载配置。
+        优先使用用户 OAuth 绑定的 token/repo（通过抽象层查询），
+        未绑定时回退到共享仓库配置（向后兼容）。
+        """
+        # OAuth 模式：每次都从后端获取最新 token（支持自动过期刷新）
+        try:
+            from app.gateway.auth import get_oauth_backend
+
+            backend = get_oauth_backend("gitee")
+            bound_info = backend.get_bound_info()
+            if bound_info:
+                self._token = bound_info["token"]
+                self._owner = bound_info["owner"]
+                self._repo = bound_info.get("repo", "DriFox_uploads")
+                self._path = "drifox"
+                self._branch = "master"
+                self._config_loaded = True
+                self._oauth_mode = True
+                return True
+            self._oauth_mode = False
+        except Exception as e:
+            # OAuth 后端查询失败（未绑定/异常等），回退到共享仓库
+            logger.debug(f"[GiteeUploader] OAuth 后端查询异常: {e}")
+            self._oauth_mode = False
+
+        # 共享仓库模式：token 固定不变，可用缓存
         if self._config_loaded:
             return bool(self._token and self._owner and self._repo)
 
         try:
             from app.utils.config import Settings
-            cfg = Settings.get_instance()
 
+            cfg = Settings.get_instance()
             self._token = cfg.gitee_token.value or ""
             self._owner = cfg.gitee_owner.value or ""
             self._repo = cfg.gitee_repo.value or ""
             self._path = cfg.gitee_path.value or "drifox"
             self._branch = cfg.gitee_branch.value or "master"
+            logger.info("[GiteeUploader] 使用共享仓库上传")
             self._config_loaded = True
         except Exception as e:
             logger.warning(f"[GiteeUploader] 加载配置失败: {e}")
 
         return bool(self._token and self._owner and self._repo)
+
+    def reset_config(self):
+        """重置配置缓存，使下次访问时重新加载（用于绑定/解绑后刷新）"""
+        self._config_loaded = False
 
     def is_configured(self) -> bool:
         """检查 Gitee 是否已配置"""
@@ -72,7 +153,7 @@ class GiteeUploader:
 
     def upload_file(self, local_path: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        上传本地文件到 Gitee 仓库
+        上传本地文件到 Gitee 仓库（同步版本，请勿在 async 上下文中直接调用）
 
         Args:
             local_path: 本地文件路径
@@ -95,9 +176,13 @@ class GiteeUploader:
         except Exception as e:
             return None, f"读取文件失败: {e}"
 
-    def upload_bytes(
-        self, data: bytes, filename: str = "", ext: str = ""
-    ) -> Tuple[Optional[str], Optional[str]]:
+    async def upload_file_async(self, local_path: str) -> Tuple[Optional[str], Optional[str]]:
+        """上传本地文件到 Gitee 仓库（异步版本，不阻塞事件循环）"""
+        import asyncio
+
+        return await asyncio.to_thread(self.upload_file, local_path)
+
+    def upload_bytes(self, data: bytes, filename: str = "", ext: str = "") -> Tuple[Optional[str], Optional[str]]:
         """
         上传字节数据到 Gitee 仓库
 
@@ -115,43 +200,89 @@ class GiteeUploader:
             return None, "Gitee 未配置 (缺少 token/owner/repo)"
 
         try:
-            # 确定文件名
+            # 确定文件名：优先用原始文件名，仅无文件名时才用 UUID
             if not ext and filename:
                 ext = Path(filename).suffix
             if not ext:
                 ext = ".png"
 
-            unique_name = f"{uuid.uuid4().hex}{ext}"
+            if filename:
+                # 使用原始文件名（分享文件已带时间戳，不存在冲突）
+                upload_name = filename
+            else:
+                upload_name = f"{uuid.uuid4().hex}{ext}"
+
             storage_path = self._path.strip("/")
-            full_path = f"{storage_path}/{unique_name}" if storage_path else unique_name
+            full_path = f"{storage_path}/{upload_name}" if storage_path else upload_name
 
             # Base64 编码
             content_b64 = base64.b64encode(data).decode("utf-8")
 
-            url = self.API_URL.format(
-                owner=self._owner, repo=self._repo, path=full_path
+            ok = self._backend.upload(
+                token=self._token,
+                owner=self._owner,
+                repo=self._repo,
+                branch=self._branch,
+                path=full_path,
+                content_b64=content_b64,
+                message=f"DriFox Upload: {upload_name}",
             )
-
-            payload = {
-                "access_token": self._token,
-                "content": content_b64,
-                "message": f"DriFox Upload: {unique_name}",
-                "branch": self._branch,
-            }
-
-            resp = requests.post(url, data=payload, timeout=30)
-            if resp.status_code == 201:
-                download_url = (
-                    resp.json().get("content", {}).get("download_url")
+            if ok:
+                download_url = self.DOWNLOAD_URL.format(
+                    owner=self._owner, repo=self._repo, branch=self._branch, path=full_path
                 )
-                if download_url:
-                    logger.info(f"[GiteeUploader] 上传成功: {unique_name} → {download_url}")
-                    return download_url, None
-                return None, "API 返回了 201 但缺少 download_url"
+                logger.info(f"[GiteeUploader] 上传成功: {upload_name} → {download_url}")
+                return download_url, None
 
-            err_msg = self._parse_error(resp)
-            logger.warning(f"[GiteeUploader] 上传失败 [{resp.status_code}]: {err_msg}")
-            return None, f"[{resp.status_code}] {err_msg}"
+            # token 过期 → 强制刷新后重试一次
+            err_msg = getattr(self._backend, "last_error", "") or "上传失败"
+            if "401" in err_msg or "Access token is expired" in err_msg:
+                logger.info("[GiteeUploader] token 过期，尝试刷新后重试")
+                self.reset_config()
+                config_ok = self._ensure_config()
+                if not config_ok:
+                    # ★ 多设备修复：本地 RT 可能被其他设备轮换作废（invalid_grant），
+                    # 先尝试从云端拉取最新 RT 恢复（ConfigSync 云端 single source of truth）
+                    try:
+                        from app.core.config_sync import ConfigSyncService
+
+                        svc = ConfigSyncService.get_instance()
+                        if svc.recover_token_from_cloud():
+                            logger.info("[GiteeUploader] 已通过云端恢复 token，重试上传")
+                            self.reset_config()
+                            config_ok = self._ensure_config()
+                    except Exception as _re:
+                        logger.warning(f"[GiteeUploader] 云端恢复 token 失败: {_re}")
+
+                if config_ok:
+                    ok = self._backend.upload(
+                        token=self._token,
+                        owner=self._owner,
+                        repo=self._repo,
+                        branch=self._branch,
+                        path=full_path,
+                        content_b64=content_b64,
+                        message=f"DriFox Upload: {upload_name} (retry)",
+                    )
+                    if ok:
+                        download_url = self.DOWNLOAD_URL.format(
+                            owner=self._owner, repo=self._repo, branch=self._branch, path=full_path
+                        )
+                        logger.info(f"[GiteeUploader] 刷新后上传成功: {upload_name} → {download_url}")
+                        return download_url, None
+                    err_msg = getattr(self._backend, "last_error", "") or "重试上传失败"
+
+                # ★ T8B 修复：OAuth 模式 401 重试仍失败 → 绑定 token 已失效，
+                # 发出 tokenInvalid 供 UI 显示失效标识并提示重新绑定
+                if self._oauth_mode and ("401" in err_msg or "Access token is expired" in err_msg):
+                    logger.warning("[GiteeUploader] OAuth token 已失效（401 重试仍失败），发出 tokenInvalid")
+                    try:
+                        self.tokenInvalid.emit()
+                    except Exception as e:
+                        logger.warning(f"[GiteeUploader] tokenInvalid 信号发射失败: {e}")
+
+            logger.warning(f"[GiteeUploader] 上传失败: {err_msg}")
+            return None, err_msg
 
         except requests.exceptions.Timeout:
             return None, "上传超时 (30s)"
@@ -160,15 +291,6 @@ class GiteeUploader:
         except Exception as e:
             logger.error(f"[GiteeUploader] 上传异常: {e}", exc_info=True)
             return None, str(e)
-
-    @staticmethod
-    def _parse_error(resp) -> str:
-        """解析 Gitee API 错误响应"""
-        try:
-            body = resp.json()
-            return body.get("message", resp.text[:200])
-        except Exception:
-            return resp.text[:200]
 
 
 # 便捷函数
