@@ -1509,11 +1509,7 @@ class HistoryManager:
         get_history_list() 收集会漏成员（恢复成员不全的根因之一）。
         """
         if self._use_sqlite and self._session_store:
-            # TODO(pyside6): 目标 SessionStore 暂缺 get_sessions_by_team_run_id
-            #（SQLite 直查绕开 _history_limit 截断的优化待 store 补方法后恢复）
-            # 临时走内存过滤（get_history_list 轻量模式，不加载 messages）
-            sessions = self.get_history_list(with_messages=False)
-            return [s for s in sessions if (s.get("team_run_id") or "").strip() == run_id]
+            return self._session_store.get_sessions_by_team_run_id(run_id)
         # 非 SQLite 模式（JSON 存储）：退化为内存列表过滤
         sessions = self.get_history_list(with_messages=False)
         return [s for s in sessions if (s.get("team_run_id") or "").strip() == run_id]

@@ -24,7 +24,7 @@
 
 from typing import Optional
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer
+from PySide6.QtCore import QObject, QPoint, QEvent, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -206,7 +206,7 @@ class SimpleHoverTooltip(QWidget):
                     oldest = _tooltip_instances.pop(0)
                     if oldest is not None:
                         oldest.deleteLater()
-                except RuntimeError, IndexError:
+                except (RuntimeError, IndexError):
                     pass
             _tooltip_instances.append(self)
             # 自注销：destroyed 信号在 deleteLater + sendPostedEvents 后
@@ -240,7 +240,7 @@ class SimpleHoverTooltip(QWidget):
         """根据文本（支持多行 \\n） + padding 计算 widget 尺寸。"""
         fm = QFontMetrics(self._font)
         lines = self._text.split("\n") if self._text else [""]
-        max_w = max((fm.width(line) for line in lines), default=0)
+        max_w = max((fm.horizontalAdvance(line) for line in lines), default=0)
         line_h = fm.lineSpacing()  # 含行间距，多行不挤
         w = max_w + self._padding_h * 2
         h = line_h * len(lines) + self._padding_v * 2
@@ -324,7 +324,11 @@ class _HoverTooltipFilter(QObject):
         self._parent = parent
         self._text = text
         self._tooltip: Optional[SimpleHoverTooltip] = None
-        self._timer = QTimer(self)
+        # timer 独立于父对象（不挂 parent）：目标 child deleteLater 销毁时，
+        # 连带的 filter/timer 若随 C++ 销毁，后续 toString 访问会崩溃。
+        # 场景：test_scenario_g 在 child deleteLater 后仍访问 f._timer。
+        # 无 parent 的 timer 由 Python 引用管理（filter 存活期间有效）。
+        self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.setInterval(delay_ms)
         self._timer.timeout.connect(self._on_timeout)
@@ -341,23 +345,44 @@ class _HoverTooltipFilter(QObject):
         if obj is not self._parent:
             return False
         t = event.type()
-        if t == event.ToolTip:
+        if t == QEvent.Type.ToolTip:
             return True  # 拦截原生
-        elif t in (event.Enter, event.HoverEnter):
+        elif t in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
             tip = self._parent.toolTip() or ""
             if tip:
                 self._text = tip
                 self._timer.start()
-        elif t in (event.Leave, event.HoverLeave, event.Hide, event.HideToParent):
+        elif t in (QEvent.Type.Leave, QEvent.Type.HoverLeave, QEvent.Type.Hide, QEvent.Type.HideToParent):
             # 🛡️ B2 修复：目标随父容器隐藏时 Qt 发 HideToParent（27）而非 Hide（18）。
             # 团队 header 按钮（关闭团队 close_btn 等）在团队关闭时随 header 容器
             # 隐藏，旧分支只捕 Hide/Leave/HoverLeave → tooltip 不隐藏 → 屏幕残留
             # "飘着的 tooltip"。补上 HideToParent 使容器隐藏即收掉 tooltip。
             self._timer.stop()
             self._hide()
+        elif t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            # 🛡️ B3 修复：点击即收起 tooltip（与 Qt 原生 QToolTip / qfluentwidgets
+            # ToolTipFilter 在 MouseButtonPress 时 hideToolTip() 的行为对齐）。
+            # 此前漏捕：点击关闭团队按钮时 tooltip 仍显示，随后团队组
+            # deleteLater 销毁（close_btn 的 destroyed→_cleanup 隐藏 tooltip）
+            # 与用户点击之间存在延迟窗口，若窗口 close 阻塞/事件繁忙/清理
+            # 竞态 → tooltip 残留在屏幕上不消失。按下即隐藏彻底消除该窗口期。
+            # 注意：此处不 return True（不拦截鼠标事件），按钮点击正常响应。
+            self._timer.stop()
+            self._hide()
         return False
 
     def _on_timeout(self):
+        # 🛡️ 目标已销毁：timer 独立存活时（无 parent QTimer）指令迟到触发，
+        # 直接放弃（不访问已删 C++ parent）
+        try:
+            import shiboken6 as _sh6
+
+            if not _sh6.isValid(self._parent):
+                self._timer.stop()
+                return
+        except Exception:
+            self._timer.stop()
+            return
         # 🛡️ 问题B 修复：显示气泡前校验鼠标是否仍在目标控件内——
         # 按钮 visible 切换时序（团队框 hover 显示按钮）或隐藏态几何错位
         # （DPI 缩放）下，timer 可能已启动但鼠标已不在控件上（或控件已
@@ -392,7 +417,7 @@ class _HoverTooltipFilter(QObject):
             pass
         try:
             self._timer.stop()
-        except RuntimeError, AttributeError:
+        except (RuntimeError, AttributeError):
             pass
         self._hide()
         # 🛡️ 泄漏根因修复（B7）：目标 widget 销毁时 tooltip 同步销毁。
@@ -424,14 +449,15 @@ def install_hover_tooltip(widget: QWidget, text: str = "", delay_ms: int = 400):
         text: tooltip 文本。留空则读取 widget.toolTip()
         delay_ms: 悬停延迟（毫秒），默认 400
     """
-    # 避免重复安装
+    # 避免重复安装：已存在时返回已有 filter（供调用方访问其 _timer 等），
+    # 而非 None——避免测试/调用方对返回值做 None 判空时误判。
     if id(widget) in _filters:
-        return
+        return _filters[id(widget)]
     if text:
         widget.setToolTip(text)
-        # setToolTip 可能触发 _patched_setToolTip 已安装 filter，此时直接返回
+        # setToolTip 可能触发 _patched_setToolTip 已安装 filter，此时返回已有 filter
         if id(widget) in _filters:
-            return
+            return _filters[id(widget)]
     f = _HoverTooltipFilter(widget, widget.toolTip() or "", delay_ms)
     _filters[id(widget)] = f
     return f

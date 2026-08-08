@@ -5,6 +5,7 @@ Chat Worker - OpenAI 对话执行器
 
 import gc
 import os
+import queue
 import re
 import sys
 import time
@@ -145,6 +146,16 @@ class OpenAIChatWorker(QThread):
         # tracemalloc 深度追踪（MEM_TRACE=1 时启用，用于定位单步大分配）
         self._mem_trace_enabled = os.environ.get('MEM_TRACE') == '1'
         self._mem_trace_snapshot = None
+
+        # ========== Stop hook 强制续命（Claude Code 兼容）==========
+        # 状态机：
+        #   False = 正常 turn 结束，Stop hook 可 block 强制续命
+        #   True  = 上一轮被 Stop hook 强制续命过，当前 turn 结束时的
+        #           Stop 触发后应立即放行（不再 block），避免无限循环
+        # 详见 docs/stop_hook_block.md 设计说明
+        self._stop_hook_active: bool = False
+        # Stop hook 续命时保存上轮的完整响应文本，避免续命后第二轮覆盖丢失
+        self._prev_stophook_response: Optional[str] = None
 
     def _get_persister(self) -> Optional["ToolResultPersister"]:
         """
@@ -441,8 +452,6 @@ class OpenAIChatWorker(QThread):
             logger.info(f"[TeamMail] Worker 注入团队邮件: #{mail['id']} from [{sender_id}]")
         except Exception as e:
             logger.debug(f"[TeamMail] 注入待处理团队邮件失败: {e}")
-
-    @property
 
     # ===== P2 补齐（从原项目同步）=====
 
@@ -1765,11 +1774,94 @@ class OpenAIChatWorker(QThread):
                     # 更新 API 消息缓存：追加响应消息
                     self._append_to_api_cache(response_sequence)
                     # 性能优化：在发送前才合成完整响应字符串
-                    self.full_response = ''.join(self._response_chunks)
-                    self._emit_with_callback("finished_with_messages", self.finished_with_messages,
-                                             current_session_messages)
+                    self.full_response = "".join(self._response_chunks)
+                    # 🔧 Stop hook 续命恢复：prepend 上次保存的响应文本
+                    # 当 Stop hook 注入消息导致续命时（_stop_hook_active=True），
+                    # _prev_stophook_response 保存了上一轮（续命前）的完整响应文本。
+                    # 在此 prepend 到本轮新生成的响应之前，避免内容丢失。
+                    if self._stop_hook_active:
+                        prev_resp = getattr(self, "_prev_stophook_response", None)
+                        if prev_resp:
+                            self.full_response = prev_resp + self.full_response
+                            self._prev_stophook_response = None
+
+                    # ====== PostAssistantMessage hook：assistant 响应后触发 ======
+                    self._trigger_worker_hook(
+                        "PostAssistantMessage",
+                        current_messages,
+                        current_session_messages,
+                        extra_context={"assistant_response": self.full_response},
+                    )
+
+                    # ====== Stop hook：正常完成退出循环前触发 ======
+                    # Stop hook 通过正常的 hook 消息注入（add_to_context=True）来决定
+                    # 是否继续工具迭代，不再依赖 block 决策：
+                    #   - 第一次 Stop 触发时 _stop_hook_active=False
+                    #   - 如果 Stop hook 向消息列表注入了内容，_stop_hook_active 翻转为 True，
+                    #     继续一轮让 LLM 看到注入的消息并响应
+                    #   - 重跑出来的 Stop 时 _stop_hook_active=True，直接跳过 hook 执行、
+                    #     放行退出，避免重复注入消息
+                    # 这限制了续命最多 1 次，避免无限循环。
+                    if not self._stop_hook_active:
+                        # 第一次 Stop：正常触发 hook
+                        stop_extra_ctx = {
+                            "stop_hook_active": self._stop_hook_active,
+                            "last_assistant_message": self.full_response,
+                            "reason": "completed",
+                        }
+                        # 记录 Stop hook 触发前的消息数，用于检测是否有 hook 消息注入
+                        before_stop_count = len(current_messages)
+                        self._trigger_worker_hook(
+                            "Stop",
+                            current_messages,
+                            current_session_messages,
+                            extra_context=stop_extra_ctx,
+                        )
+
+                        # 检查 Stop hook 是否有消息注入到消息列表（通过正常的 add_to_context 机制）
+                        # 如果有注入且未触发过续命（_stop_hook_active=False），则继续一轮工具迭代
+                        stop_injected = len(current_messages) - before_stop_count
+                        if stop_injected > 0:
+                            # 1. 翻转 _stop_hook_active：下一轮 Stop 时直接跳过 hook 执行
+                            self._stop_hook_active = True
+                            # 2. 发射 finished_with_messages 让 UI 看到注入的消息（可选）
+                            self._emit_with_callback(
+                                "finished_with_messages",
+                                self.finished_with_messages,
+                                current_session_messages,
+                            )
+                            logger.info(
+                                f"[Stop hook] {stop_injected} message(s) injected via hook, force continuation."
+                            )
+                            # 🔧 修复：保存本轮 full_response，避免 next round 被覆盖
+                            # _clear_pending_response_state 会清空 _response_chunks，
+                            # 下一轮 API 调用后 full_response 仅保留新文本，上一轮文本丢失。
+                            self._prev_stophook_response = self.full_response
+                            # 3. 清理 pending state 后回到 while 顶部重跑 API
+                            self._clear_pending_response_state()
+                            continue  # 跳回 while 顶部，再来一轮
+
+                    # 真正结束：重置状态
+                    self._stop_hook_active = False
+
+                    # ★ 退出前最后一次消费 _hook_message_queue，确保 SubAgentFinished
+                    # 等 hook 消息不被遗漏（子智能体可能在最后一轮 API 调用期间完成）。
+                    # ★ 修复 T23：include_team_mail=False——退出前不再注入 TeamManager
+                    # 待处理邮件。此时注入的邮件进入消息列表后对话即终止（无下一轮 API），
+                    # LLM 永远不会响应 → 收尾会被误判 done 导致永久丢失。邮件保持 pending，
+                    # 由流结束后的 _check_and_process_pending 走非流式路径正常处理。
+                    self._inject_pending_hook_messages(
+                        session_messages_target=current_session_messages, include_team_mail=False
+                    )
+
+                    self._emit_with_callback(
+                        "finished_with_messages", self.finished_with_messages, current_session_messages
+                    )
+                    # 🔧 修复：先保存 full_response，再清理状态（_clear_pending_response_state
+                    # 内部的 _sync_state_from_state 会用 state 中的旧值覆盖 self.full_response）
+                    final_response = self.full_response
                     self._clear_pending_response_state()
-                    self._emit_with_callback("finished_with_content", self.finished_with_content, self.full_response)
+                    self._emit_with_callback("finished_with_content", self.finished_with_content, final_response)
                     return
 
                 # [MEM] 执行工具前

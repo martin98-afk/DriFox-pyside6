@@ -45,6 +45,23 @@ ENCODING_MAPPING = {
     "default": "cl100k_base",
 }
 
+# 模型 token 校正系数 — cl100k_base 编码器与实际模型 tokenizer 之间的补偿
+# 系数 = 实际 API token / cl100k_base 估算值
+# DeepSeek/Claude/Qwen/GLM 的中文分词效率与 OpenAI 不同，需要乘以校正系数
+_MODEL_TOKEN_RATIOS: dict = {
+    "deepseek": 1.05,   # DeepSeek tokenizer 对中文/代码比 cl100k_base 略多 5%
+    "claude": 1.08,     # Anthropic tokenizer 差异更大
+    "minimax": 1.04,    # MiniMax 近似 OpenAI
+    "qwen": 1.07,       # 通义千问对中文更费 token
+    "glm": 1.06,        # 智谱 tokenizer
+    "kimi": 1.04,       # Moonshot 近似
+    "gemini": 1.03,     # Google tokenizer 较高效
+    "gpt-4": 1.00,      # OpenAI 原生，无需校正
+    "gpt-3.5": 1.00,
+    "gpt-3": 1.00,
+    "default": 1.00,    # 未知模型不校正
+}
+
 
 def _get_encoding_name(model: str = "gpt-4") -> str:
     """根据模型名称获取编码名称"""
@@ -166,61 +183,17 @@ def count_messages_tokens(
         return 0
     
     total = 0
-    
-    # 消息 overhead
-    total += len(messages) * 4
-    
+    # 单条消息 token 计算统一走 _compute_message_tokens（含 overhead / reasoning / tool_calls / tool_call_id），
+    # 与 per_message_tokens 同口径。修复旧内联循环缺失 reasoning 导致 count(messages) 与 per_message_tokens([msg]) 不一致。
     for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-            
-        role = msg.get("role", "")
-        if role:
-            total += estimate_tokens(str(role), model)
-        
-        # content 处理
-        content = msg.get("content")
-        if content is None:
-            pass  # 无 content，跳过
-        elif isinstance(content, str):
-            if content:  # 确保非空字符串
-                total += estimate_tokens(content, model)
-        elif isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "text":
-                    text = item.get("text", "")
-                    if text:
-                        total += estimate_tokens(text, model)
-                elif item.get("type") == "image_url":
-                    # 图片 token 估算 (简化版)
-                    total += 85  # 图片基准开销
-        
-        # tool_calls 处理
-        tool_calls = msg.get("tool_calls")
-        if tool_calls and isinstance(tool_calls, list):
-            for tool_call in tool_calls:
-                if not isinstance(tool_call, dict):
-                    continue
-                total += 3  # tool_call overhead
-                function = tool_call.get("function") or {}
-                name = function.get("name") if isinstance(function, dict) else ""
-                args = function.get("arguments") if isinstance(function, dict) else ""
-                if name:
-                    total += estimate_tokens(str(name), model)
-                if args:
-                    total += estimate_tokens(str(args), model)
-        
-        # tool_call_id 处理
-        tool_call_id = msg.get("tool_call_id")
-        if tool_call_id:
-            total += estimate_tokens(str(tool_call_id), model)
-    
+        total += _compute_message_tokens(msg, model)
     # 工具定义 tokens
     if tools:
         total += count_tools_tokens(tools, model)
-    
+
+    # 模型 tokenizer 校正系数（cl100k_base → 实际模型编码补偿）
+    total = int(total * _get_model_token_ratio(model))
+
     # 确保返回值非负（防御性编程）
     return max(0, total)
 

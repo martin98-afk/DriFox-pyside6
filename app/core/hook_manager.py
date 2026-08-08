@@ -126,7 +126,7 @@ class Hook:
     add_output_to_context: bool = True
     skill_root: str = ""
     enabled: bool = True
-    timeout: int = 300
+    timeout: int = 30
     retry: int = 0
     conditions: List[HookCondition] = field(default_factory=list)
     

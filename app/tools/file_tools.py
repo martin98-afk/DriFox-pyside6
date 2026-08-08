@@ -12,6 +12,8 @@
 """
 import fnmatch
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 from pathlib import Path
 import os
@@ -34,6 +36,78 @@ _GREP_EXCLUDE_DIRS = frozenset({
 def _compile_grep_pattern(pattern: str) -> re.Pattern:
     """编译 grep 正则表达式（带缓存）"""
     return re.compile(pattern, re.IGNORECASE)
+
+
+_GITIGNORE_CACHE: dict[str, list[str]] = {}
+
+
+def _load_gitignore_patterns(search_root: Path) -> list[str]:
+    """读取项目的 .gitignore 并返回 fnmatch 模式列表（带缓存，最多 8 个项目）"""
+    key = str(search_root)
+    if key in _GITIGNORE_CACHE:
+        return _GITIGNORE_CACHE[key]
+    patterns = []
+    gitignore_path = search_root / ".gitignore"
+    if gitignore_path.exists():
+        try:
+            for line in gitignore_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # 去掉开头的 '/'（.gitignore 中的路径是相对于根目录的）
+                    if line.startswith("/"):
+                        line = line[1:]
+                    # 去掉结尾的 '/'（目录标识）
+                    if line.endswith("/"):
+                        line = line.rstrip("/")
+                    patterns.append(line)
+        except Exception:
+            pass
+    _GITIGNORE_CACHE[key] = patterns
+    # 最多缓存 8 个项目的 .gitignore
+    if len(_GITIGNORE_CACHE) > 8:
+        _GITIGNORE_CACHE.pop(next(iter(_GITIGNORE_CACHE)))
+    return patterns
+
+
+def _glob_match(rel_path: str, pattern: str) -> bool:
+    """
+    标准 glob 语义匹配（忽略大小写，跨平台一致）。
+
+    与 fnmatch.translate + re.search 实现的差异修复：
+    - '*' 只匹配单个目录层级，不跨路径分隔符
+    - '**' 匹配零个或多个目录层级
+    - '?' 匹配单个字符，不跨分隔符
+    - 路径分隔符统一按 '/' 处理（Windows 反斜杠同样兼容）
+
+    Args:
+        rel_path: 相对路径（/ 或 \\ 分隔均可）
+        pattern: glob 模式，如 "*.py"、"**/*.py"、"src/**/*.ts"
+
+    Returns:
+        是否匹配
+    """
+    rel_parts = rel_path.replace("\\", "/").split("/")
+    if not pattern or pattern in ("/", "."):
+        return False
+    pat_parts = [p for p in pattern.replace("\\", "/").split("/") if p not in ("", ".")]
+
+    # DP 匹配：dp[i] 表示 rel_parts[:i] 已被模式段消费
+    dp = [False] * (len(rel_parts) + 1)
+    dp[0] = True
+    for pat in pat_parts:
+        ndp = [False] * (len(rel_parts) + 1)
+        if pat == "**":
+            # '**' 可吞掉零个或多个层级
+            first = next((i for i, v in enumerate(dp) if v), None)
+            if first is not None:
+                for k in range(first, len(rel_parts) + 1):
+                    ndp[k] = True
+        else:
+            for i, part in enumerate(rel_parts):
+                if dp[i] and fnmatch.fnmatchcase(part.lower(), pat.lower()):
+                    ndp[i + 1] = True
+        dp = ndp
+    return dp[len(rel_parts)]
 
 
 def _resolve_path(workdir: Path, path: str) -> Path:
@@ -442,26 +516,102 @@ class FileTools:
         except Exception as e:
             return ToolResult(False, error=f"List error: {str(e)}")
 
-    def glob_files(self, pattern: str, path: str = ".") -> ToolResult:
+    def glob_files(self, pattern: str, path: str = ".", max_results: int = 100, workers: int = 4) -> ToolResult:
         """
-        通过通配符查找文件
+        高性能 glob：通过通配符查找文件（带排除和并行收集）
+
+        Args:
+            pattern: 通配符模式，如 "*.py", "**/*.tsx", "src/**/*.css"
+            path: 搜索路径（默认 workdir）
+            max_results: 最大返回数（默认 100）
+            workers: 并行工作线程数（默认 4）
+
+        Returns:
+            ToolResult: 匹配的文件列表
         """
         try:
             search_path = self._resolve_path(path)
-            matches = list(search_path.rglob(pattern))
+            if not search_path.exists():
+                return ToolResult(False, error=f"Path not found: {path}")
+            if not search_path.is_dir():
+                return ToolResult(False, error=f"Not a directory: {path}")
 
-            if not matches:
-                return ToolResult(True, content="No files matched the pattern.")
+            gitignore_patterns = _load_gitignore_patterns(search_path)
 
-            results = []
-            for m in matches[:100]:
-                if m.is_file():
+            # ── 1. 收集候选文件列表（os.walk + 排除） ──
+            candidates: list[Path] = []
+            for root, dirs, files in os.walk(search_path):
+                dirs[:] = [d for d in dirs if d not in _GREP_EXCLUDE_DIRS]
+                if gitignore_patterns:
+                    dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, p) for p in gitignore_patterns)]
+                for filename in files:
+                    if gitignore_patterns and any(fnmatch.fnmatch(filename, p) for p in gitignore_patterns):
+                        continue
+                    candidates.append(Path(root) / filename)
+
+            if not candidates:
+                return ToolResult(True, content="No files found (all excluded by .gitignore or hardcoded rules).")
+
+            start_time = time.time()
+
+            # ── 2. 并行 glob 匹配（标准语义：* 不跨目录，** 跨任意层级） ──
+            results: list[str] = []
+
+            def _match_single(fp: Path) -> str | None:
+                """单文件 glob 匹配"""
+                # 匹配基准：优先相对搜索起点，其次相对 workdir，兜底绝对路径
+                try:
+                    rel_match = fp.relative_to(search_path).as_posix()
+                except ValueError:
                     try:
-                        results.append(str(m.relative_to(self.workdir)))
+                        rel_match = fp.relative_to(self.workdir).as_posix()
                     except ValueError:
-                        results.append(str(m))
+                        rel_match = str(fp).replace("\\", "/")
+                if not _glob_match(rel_match, pattern):
+                    return None
+                # 输出：相对 workdir（与 read 等工具一致），越界则 fallback 绝对路径
+                try:
+                    return str(fp.relative_to(self.workdir))
+                except ValueError:
+                    return str(fp)
 
-            return ToolResult(True, content="\n".join(results))
+            # Path.rglob 在剔除排除目录后没意义了，因为我们自己 walk 了
+            # 小规模直接串行，大批量并行
+            if len(candidates) < 500:
+                for fp in candidates:
+                    r = _match_single(fp)
+                    if r:
+                        results.append(r)
+                        if len(results) >= max_results:
+                            break
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {pool.submit(_match_single, fp): fp for fp in candidates}
+                    for future in as_completed(futures):
+                        r = future.result()
+                        if r:
+                            results.append(r)
+                            if len(results) >= max_results:
+                                for f in futures:
+                                    f.cancel()
+                                break
+
+            elapsed = time.time() - start_time
+            logger.info(f"[glob] {pattern}: {len(results)} matches in {len(candidates)} candidates ({elapsed:.2f}s)")
+
+            if not results:
+                return ToolResult(True, content=f"No files matched pattern: {pattern}")
+
+            content = "\n".join(results)
+            if len(content) > MAX_GREP_CONTENT_LENGTH:
+                meta = f"# Glob: {pattern} | {len(results)} matches ({elapsed:.2f}s)\n\n"
+                content = (
+                    content[:MAX_GREP_CONTENT_LENGTH]
+                    + f"\n\n... (Content truncated, exceeds {MAX_GREP_CONTENT_LENGTH} characters limit)"
+                )
+                return ToolResult(True, content=meta + content)
+
+            return ToolResult(True, content=content)
         except Exception as e:
             return ToolResult(False, error=f"Glob error: {str(e)}")
 

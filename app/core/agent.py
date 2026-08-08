@@ -652,13 +652,26 @@ class AgentManager:
         logger.info(f"[AgentManager] Unloaded skill: {skill_name}")
 
     def get_agent_tools_schema(
-            self, agent_name: str, global_permission: Optional[Dict[str, Any]] = None, is_subagent_call: bool = False
+            self, agent_name: str, global_permission: Optional[Dict[str, Any]] = None, is_subagent_call: bool = False, builtin_tools=None,
     ) -> List[Dict]:
+        """获取智能体的工具 schema。
+
+        Args:
+            agent_name: 智能体名称
+            global_permission: 全局权限覆盖
+            is_subagent_call: 是否为子智能体调用
+            builtin_tools: BuiltinTools 实例，多窗口场景下用于获取当前窗口的
+                团队上下文（_team_window_id）。None 时回退到 AgentManager 单例
+                的 _builtin_tools 引用。
+        """
         agent = self.get_agent(agent_name)
         if not agent:
             return []
 
-        all_tools = get_builtin_tools_schema(self, builtin_tools=self._builtin_tools)
+        # 优先使用调用方传入的 builtin_tools（多窗口隔离），回退到 AgentManager 单例引用
+        _bt = builtin_tools if builtin_tools is not None else self._builtin_tools
+
+        all_tools = get_builtin_tools_schema(self, builtin_tools=_bt)
 
         # 【新增】子智能体禁止使用交互和嵌套子智能体工具（需要用户交互或发布子智能体，不支持）
         forbidden_tools = {"question", "subagent_para", "subagent_status", "subagent_dag"}

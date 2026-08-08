@@ -1,5 +1,18 @@
 MAX_SESSION_CARD_CACHE_SIZE = 10
 
+# OpenCode 免费公用 API key，用于默认服务商配置，让用户下载后开箱即用。
+# ⚠️ 安全属性：开源公用 key，非私密凭据（随源码分发，人人可见）；
+# 轮换时用 OPENCODE_LEGACY_KEYS 升级旧 key，勿当作个人密钥保管。
+OPENCODE_SHARED_API_KEY = "sk-nUee6hP1bn3GDn9sPApQD6wBv3v2ZBRZzA4DLN44E98HSYm86FmWCCbnJNrVAdVoI"
+
+# 历史上使用过的 OpenCode 共享 key。版本更新换 key 时，把旧 key 追加到这里，
+# 启动时用于把用户配置里的过期内置 key 自动升级为新 key（用户自定义 key 不受影响）。
+OPENCODE_LEGACY_KEYS = frozenset(
+    {
+        "sk-zAIZkBM2o3MMKHzryhxmIWPffHyhxSwrpPjtIlyaxBIaCNbOkH2Qx4QXEOJlIRre",
+    }
+)
+
 # ============================================================
 # 套餐用量查询字段（与模型参数无关，仅用于配额查询，不得泄漏到模型参数或 API 请求）
 # ============================================================
@@ -371,4 +384,47 @@ PROVIDER_ICONS = {
     "Anthropic (Claude)": "Anthropic",
     "Google Gemini": "gemini-ai",
     "OpenCode Zen": "opencode",
+    "OpenCode Go": "opencode",
 }
+
+
+# ============================================================
+# models.dev 动态同步：白名单与合并
+# ============================================================
+# 注：MODELS_DEV_PROVIDER_MAP 已在 models_dev_sync 模块级定义，
+# 实际合并逻辑通过 get_dynamic_models() 函数调用，无需在此导入。
+
+
+def get_merged_provider_models() -> dict:
+    """返回 PROVIDER_MODELS 与 models.dev 动态数据的合并结果。
+
+    合并规则：
+      - 硬编码模型始终保留，且排在前面。
+      - 动态模型按服务商追加，去重（不区分大小写）。
+      - models.dev 未覆盖的服务商保持原样。
+      - 同步失败或禁用时，完全回退到硬编码。
+    """
+    try:
+        from app.core.models_dev_sync import get_dynamic_models
+
+        dynamic = get_dynamic_models()
+        dynamic_providers = dynamic.provider_models
+    except Exception:
+        # 同步模块异常时不影响主程序，直接回退到硬编码
+        return dict(PROVIDER_MODELS)
+
+    merged: dict = {}
+    for provider_name, static_models in PROVIDER_MODELS.items():
+        merged_models: list = list(static_models)
+        seen_lower = {m.strip().lower() for m in merged_models}
+
+        dynamic_models = dynamic_providers.get(provider_name, [])
+        for model in dynamic_models:
+            key = model.strip().lower()
+            if key and key not in seen_lower:
+                merged_models.append(model)
+                seen_lower.add(key)
+
+        merged[provider_name] = merged_models
+
+    return merged

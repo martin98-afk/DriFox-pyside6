@@ -286,11 +286,12 @@ class SubAgentExecutor(QThread):
             system_prompt = self.agent_manager.get_agent_system_prompt(
                 self.agent_name, is_subagent_call=self.is_subagent_call
             )
-            tools = self.agent_manager.get_agent_tools_schema(self.agent_name, is_subagent_call=self.is_subagent_call)
-            # TODO(团队链路): 源版此处传 builtin_tools=self.tool_executor._builtin_tools，
-            # 让 is_in_team 检查使用正确窗口的 team_window_id（多窗口隔离）。
-            # pyside6 版 agent.py get_agent_tools_schema 暂不支持 builtin_tools 参数
-            # （当前用 AgentManager 单例 _builtin_tools），待 agent.py 扩展后接入。
+            # 传入当前窗口的 builtin_tools 实例，确保多窗口场景下使用当前窗口的
+            # 团队上下文（_team_window_id），而非 AgentManager 单例的最后覆盖值。
+            _bt = self.tool_executor._builtin_tools if self.tool_executor else None
+            tools = self.agent_manager.get_agent_tools_schema(
+                self.agent_name, is_subagent_call=self.is_subagent_call, builtin_tools=_bt
+            )
 
             # 基于 context budget 构建主智能体历史上下文注入（返回消息对象列表）
             inherited_messages = []

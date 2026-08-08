@@ -10,10 +10,13 @@ MCP 工具模块 - 管理 MCP Server 连接、工具发现与调用
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
 import threading
+import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -24,6 +27,245 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from app.tools.result import ToolResult
+
+
+# ============================================================
+# 状态机（供 UI 指示灯直接消费）
+# ============================================================
+class MCPState:
+    """MCP 服务器连接状态（与 UI 指示灯颜色一一对应）
+
+    DISABLED   → 黑色：用户关闭 / 未启动
+    CONNECTING → 黄色：正在启动（进程拉起、握手、list_tools 全过程）
+    CONNECTED  → 绿色：握手成功且工具已发现
+    FAILED     → 红色：启动失败（超时 / 进程崩溃 / 协议错误）
+    """
+
+    DISABLED = "disabled"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    FAILED = "failed"
+
+
+# Windows 下单个环境变量值上限约 32767 字符（含结尾 \0）。超出时
+# subprocess.Popen 会直接抛 ValueError，导致整个 stdio MCP 子进程创建失败。
+# 宿主可能注入 ACC_PRODUCT_CONFIG_V3 等超大变量，必须丢弃。
+_MAX_ENV_VALUE_LEN = 32766
+
+
+def _build_stdio_env(env: Optional[dict]) -> dict:
+    """构造 stdio 子进程环境变量。
+
+    MCP SDK 默认只继承 DEFAULT_INHERITED_ENV_VARS（PATH/APPDATA 等十来个），
+    会丢掉 HTTP_PROXY / HTTPS_PROXY / NODE_EXTRA_CA_CERTS / npm 镜像等关键变量，
+    导致 npx / uvx 拉包失败 → 启动超时。这里显式继承完整父进程环境；
+    但丢弃超长变量（见 _MAX_ENV_VALUE_LEN 说明）避免子进程创建失败。
+    """
+    merged = {}
+    for k, v in os.environ.items():
+        if not isinstance(v, str):
+            continue
+        # 跳过 bash 导出的函数定义（安全风险，SDK 同样过滤）
+        if v.startswith("()"):
+            continue
+        # 跳过超长变量
+        if len(v) > _MAX_ENV_VALUE_LEN:
+            continue
+        merged[k] = v
+    if env:
+        for k, v in env.items():
+            if v is None:
+                continue
+            s = str(v)
+            if len(s) <= _MAX_ENV_VALUE_LEN:
+                merged[k] = s
+    return merged
+
+
+# ── 插件路径占位符兜底解析 ──────────────────────────────
+def _expand_mcp_placeholder(value: str, plugin_root: Path) -> str:
+    """将单个字符串中的 ${CLAUDE_PLUGIN_ROOT} / ${CLAUDE_PLUGIN_DATA} 解析为绝对路径。"""
+    if not isinstance(value, str) or not value:
+        return value
+    root = plugin_root.as_posix()
+    data = (plugin_root / "data").as_posix()
+    normalized = value.replace("\\", "/")
+    # 先替换长的（DATA 含 ROOT 前缀），避免 ${CLAUDE_PLUGIN_ROOT}/data 被部分替换
+    return normalized.replace("${CLAUDE_PLUGIN_DATA}", data).replace("${CLAUDE_PLUGIN_ROOT}", root)
+
+
+def _resolve_plugin_paths(config: dict) -> dict:
+    """启动前兜底解析 config 中的插件路径占位符（防御旧缓存 / 热重载竞态 / UI 直增）。
+
+    通过 config["_source"]（.mcp.json 路径）反推 plugin_root；无法反推时原样返回。
+    """
+    source = config.get("_source", "")
+    plugin_root = None
+    if source and source.endswith(".json"):
+        p = Path(source)
+        if p.parent.exists():
+            plugin_root = p.parent
+    if plugin_root is None:
+        return config
+    cfg = copy.deepcopy(config)
+    cfg["command"] = _expand_mcp_placeholder(cfg.get("command", ""), plugin_root)
+    cfg["args"] = [_expand_mcp_placeholder(a, plugin_root) for a in cfg.get("args", [])]
+    cfg["url"] = _expand_mcp_placeholder(cfg.get("url", ""), plugin_root)
+    cfg["env"] = {
+        k: _expand_mcp_placeholder(v, plugin_root) if isinstance(v, str) else v
+        for k, v in cfg.get("env", {}).items()
+    }
+    cfg["headers"] = {
+        k: _expand_mcp_placeholder(v, plugin_root) if isinstance(v, str) else v
+        for k, v in cfg.get("headers", {}).items()
+    }
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════════════════
+# MCP stdio 子进程安全校验（DriFox-pyside6 同步自源项目 / AstrBot 设计）
+# ════════════════════════════════════════════════════════════════════════
+# 风险：MCP stdio 配置里的 `command` 会被直接 `subprocess.Popen`，没有校验等于
+#       让 MCP 配置通道可以执行任意命令（curl|sh、rm、powershell 等）。
+# 防御：四层校验：白名单 / 黑名单 / shell 元字符 / inline 代码标志。
+#       任何一层失败 → 子进程不 spawn，返回 (False, error_msg)。
+
+# 允许作为 MCP stdio launcher 的命令（不含扩展名，小写比较）
+_STDIO_ALLOWED_COMMANDS = frozenset(
+    {
+        "python",
+        "python3",
+        "py",
+        "node",
+        "npx",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "bunx",
+        "deno",
+        "uv",
+        "uvx",
+    }
+)
+
+# 明确禁止的 stdio launcher（shell / 网络 / 危险文件操作 / 提权 / 关机类）
+_STDIO_DENIED_COMMANDS = frozenset(
+    {
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "osascript",
+        "open",
+        "curl",
+        "wget",
+        "nc",
+        "netcat",
+        "telnet",
+        "ssh",
+        "scp",
+        "sftp",
+        "rm",
+        "mv",
+        "cp",
+        "dd",
+        "mkfs",
+        "sudo",
+        "su",
+        "chmod",
+        "chown",
+        "kill",
+        "killall",
+        "pkill",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "halt",
+        "docker",
+        "podman",
+    }
+)
+
+# 命令中出现的 shell 元字符（包含即视为不可信——command 字段不应被解释为 shell）
+_STDIO_SHELL_META_RE = re.compile(r"[\r\n\x00;&|<>\`$]")
+
+# python -c / node -e 等 inline 代码标志
+_STDIO_INLINE_PYTHON_FLAGS = frozenset({"-c"})  # 只禁 -c；-m 合法（模块启动）
+_STDIO_INLINE_JS_FLAGS = frozenset({"-e", "--eval", "-p", "--print"})
+
+
+def _normalize_stdio_command_name(command: str) -> str:
+    """归一化命令名为小写裸名（去路径、去 Windows 扩展名）
+
+    "C:\\Python312\\python.exe" → "python"
+    "uvx" → "uvx"
+    "npx.cmd" → "npx"
+    """
+    name = command.strip().replace("\\", "/")
+    name = name.rsplit("/", 1)[-1]
+    lower = name.lower()
+    for ext in (".exe", ".cmd", ".bat", ".com", ".ps1"):
+        if lower.endswith(ext):
+            lower = lower[: -len(ext)]
+    return lower
+
+
+def _validate_stdio_config(config: dict) -> str:
+    """校验 stdio 型 MCP 配置，返回空串=通过，非空串=拒绝原因。
+
+    只对含 command 字段的配置做校验（stdio / http_from_stdio 都走子进程）；
+    纯 url 型（sse/streamable http）不涉及本地子进程，直接放行。
+    """
+    command = config.get("command")
+    if not command:
+        return ""  # 无 command → 非 stdio（url 型），放行
+
+    if not isinstance(command, str) or not command.strip():
+        return "MCP stdio server 必须提供非空 command。"
+
+    # 1) shell 元字符检查（command 字段本身不能被当成 shell 脚本执行）
+    if _STDIO_SHELL_META_RE.search(command):
+        return "MCP stdio command 含不安全的 shell 元字符（含 `;` `&` `|` `>` `$(` 等）。"
+
+    cmd_name = _normalize_stdio_command_name(command)
+
+    # 2) 危险命令黑名单
+    if cmd_name in _STDIO_DENIED_COMMANDS:
+        return f"MCP stdio command `{cmd_name}` 被安全策略禁止。"
+
+    # 3) 白名单
+    if cmd_name not in _STDIO_ALLOWED_COMMANDS:
+        allowed = ", ".join(sorted(_STDIO_ALLOWED_COMMANDS))
+        return (
+            f"MCP stdio command `{cmd_name}` 不在允许列表中。"
+            f"允许的命令: {allowed}。建议改用 uvx / npx / python 等方式启动。"
+        )
+
+    # 4) args 校验：必须是字符串列表；控制字符 / inline 代码标志全拦
+    args = config.get("args") or []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return "MCP stdio args 必须为字符串列表。"
+
+    for arg in args:
+        if "\x00" in arg or "\r" in arg or "\n" in arg:
+            return "MCP stdio args 不能包含控制字符（\\x00 / \\r / \\n）。"
+
+    if cmd_name.startswith("python") or cmd_name == "py":
+        if any(flag in args for flag in _STDIO_INLINE_PYTHON_FLAGS):
+            return "MCP stdio Python server 禁止使用 `-c` inline 代码；应从模块或文件启动。"
+
+    if cmd_name in {"node", "npx", "npm", "pnpm", "yarn", "bun", "bunx", "deno"}:
+        if any(flag in args for flag in _STDIO_INLINE_JS_FLAGS):
+            return "MCP stdio 禁止使用 inline eval 标志启动 server（应使用包或文件入口）。"
+
+    return ""
 
 
 def _extract_real_error(exc: Exception) -> Exception:
@@ -52,11 +294,20 @@ class MCPServerConnection:
         self.config = config
         self.session: Optional[ClientSession] = None
         self.tools: List[mcp_types.Tool] = []
+        # 状态机（供 UI 指示灯直接消费）
+        self.state: str = MCPState.CONNECTING
+        self.last_error: str = ""
+        self.updated_at: float = time.time()
         # 持久 Task 管理（__aenter__/__aexit__ 在同一 Task 中）
         self._task: Optional[asyncio.Task] = None
         self._disconnect_event: Optional[asyncio.Event] = None
         self._ready_event: Optional[asyncio.Event] = None
         self._connect_error: Optional[Exception] = None
+
+    def set_state(self, state: str, error: str = "") -> None:
+        self.state = state
+        self.last_error = error
+        self.updated_at = time.time()
 
     @property
     def server_type(self) -> str:
@@ -95,6 +346,8 @@ class MCPClientManager:
 
         self._connections: Dict[str, MCPServerConnection] = {}
         self._connected = False
+        # 全量连接去重：启动另一步全量时跳过（防多窗口连接踩踏）
+        self._connect_all_running = False
 
         # 按 name 加锁：同一 server 只允许一个进行中的连接/断开操作
         self._busy_names: set = set()
@@ -197,6 +450,11 @@ class MCPClientManager:
         args = conn.config.get("args", [])
         env = conn.config.get("env")
 
+        # 纵深防御：_connect_single 已校验；此处再校验一次以防有人绕过入口
+        reject = _validate_stdio_config(conn.config)
+        if reject:
+            raise ValueError(f"MCP stdio 安全校验失败: {reject}")
+
         params = StdioServerParameters(command=command, args=args, env=env)
 
         async with stdio_client(params) as (read_stream, write_stream):
@@ -243,8 +501,16 @@ class MCPClientManager:
         """
         command = conn.config.get("command", "")
         args = conn.config.get("args", [])
+        command = conn.config.get("command", "")
+        args = conn.config.get("args", [])
         env = conn.config.get("env")
         merged_env = {**os.environ, **(env or {})}
+
+        # 纵深防御：与 _lifespan_stdio 一致，启动子进程前再校验一次
+        # （_connect_single 已校验；此处防绕过入口的重复校验保持口径统一）
+        reject = _validate_stdio_config(conn.config)
+        if reject:
+            raise ValueError(f"MCP stdio 安全校验失败: {reject}")
 
         logger.info(f"[MCP] '{conn.name}' 启动进程中获取 URL...")
 
@@ -337,21 +603,43 @@ class MCPClientManager:
         self._run_async(self._connect_all(servers_config))
 
     def connect_all_background(self, servers_config: List[dict], on_done=None) -> None:
-        """后台连接所有 MCP 服务器（不阻塞 UI 线程）"""
+        """后台连接所有 MCP 服务器（不阻塞 UI 线程）
+
+        多窗口场景下每个窗口都会调用一次，这里做全局去重：
+        已有一轮全量连接在进行中时直接跳过，避免后启动的窗口把
+        前一个窗口刚连好的连接全部断掉（连接踩踏）。
+        """
+        with self._busy_lock:
+            if self._connect_all_running:
+                logger.debug("[MCP] 已有全量连接进行中，跳过重复请求")
+                if on_done:
+                    try:
+                        on_done(0, len(servers_config), [])
+                    except Exception:
+                        pass
+                return
+            self._connect_all_running = True
+
         def _worker():
             try:
-                self._run_async(self._connect_all(servers_config))
+                self._run_async(self._connect_all(servers_config), timeout=None)
             except Exception as e:
                 logger.error(f"[MCP] 后台连接失败: {e}")
             finally:
+                with self._busy_lock:
+                    self._connect_all_running = False
                 if on_done:
-                    connected = sum(1 for c in self._connections.values() if c.session)
+                    connected = sum(
+                        1 for c in self._connections.values()
+                        if c.state == MCPState.CONNECTED
+                    )
                     failed = [
-                        s.get("name", "?") for s in servers_config
-                        if s.get("enabled", True) and s.get("name") not in self._connections
+                        n for n, c in self._connections.items()
+                        if c.state == MCPState.FAILED
                     ]
+                    enabled_total = sum(1 for s in servers_config if s.get("enabled", True))
                     try:
-                        on_done(connected, len(servers_config), failed)
+                        on_done(connected, enabled_total, failed)
                     except Exception as e:
                         logger.warning(f"[MCP] on_done 回调异常: {e}")
 
@@ -359,37 +647,67 @@ class MCPClientManager:
         logger.info("[MCP] 后台连接已启动")
 
     async def _connect_all(self, servers_config: List[dict]) -> None:
-        if self._connected:
-            await self._disconnect_all()
+        """全量同步到目标配置（增量，不做"先全断再全连"）
 
+        原实现开头执行 _disconnect_all()，多窗口各调一次时会把已连好的
+        连接反复拆掉重建，是"服务经常起不来"的主要来源之一。
+        """
         # 收集需要连接的服务器列表
         enabled_servers = []
+        enabled_names = set()
         for server_cfg in servers_config:
             name = server_cfg.get("name", "")
             if not name:
                 continue
             if not server_cfg.get("enabled", True):
-                logger.info(f"[MCP] 跳过已禁用的服务器: {name}")
                 continue
             enabled_servers.append(server_cfg)
+            enabled_names.add(name)
 
-        # 并行启动所有服务器连接（不再串行 await）
-        tasks = {
-            server_cfg["name"]: asyncio.create_task(
-                self._connect_single(server_cfg["name"], server_cfg),
-                name=f"mcp-connect-{server_cfg['name']}",
+        # 1) 断开已不在目标列表中的连接（配置被删除或被禁用）
+        stale = [n for n, c in self._connections.items() if n not in enabled_names]
+        for name in stale:
+            try:
+                await self._disconnect_single(name)
+            except Exception as e:
+                logger.warning(f"[MCP] 断开陈旧连接 '{name}' 失败: {e}")
+
+        # 2) 跳过已连接且配置未变的 server（幂等，避免踩踏）
+        pending = []
+        for server_cfg in enabled_servers:
+            name = server_cfg["name"]
+            conn = self._connections.get(name)
+            if conn and conn.state == MCPState.CONNECTED and conn.config == server_cfg:
+                logger.debug(f"[MCP] '{name}' 已连接且配置未变，跳过")
+                continue
+            pending.append(server_cfg)
+
+        if not pending:
+            self._connected = any(
+                c.state == MCPState.CONNECTED for c in self._connections.values()
             )
-            for server_cfg in enabled_servers
+            return
+
+        # 3) 并行启动所有待连接的服务器（不串行 await）
+        tasks = {
+            cfg["name"]: asyncio.create_task(
+                self._connect_single(cfg["name"], cfg),
+                name=f"mcp-connect-{cfg['name']}",
+            )
+            for cfg in pending
         }
 
-        # 等待所有连接完成（每个任务内部有 30 秒超时，互不阻塞）
+        # 等待所有连接完成（每个任务内部各自超时，互不阻塞）
         for name, task in tasks.items():
             try:
                 await task
             except Exception as e:
                 logger.error(f"[MCP] 连接服务器 '{name}' 失败: {e}")
 
-        self._connected = True
+        # 从实际连接状态计算，避免全失败也显示已连接
+        self._connected = any(
+            c.state == MCPState.CONNECTED for c in self._connections.values()
+        )
 
     def connect_server_sync(self, name: str, config: dict) -> bool:
         """同步连接单个 MCP 服务器（热添加）"""
@@ -443,6 +761,17 @@ class MCPClientManager:
         连接单个服务器：启动生命周期 Task 并等待就绪
         返回: (success: bool, error_msg: str)
         """
+        # ── stdio 安全校验：在 spawn 子进程之前拦截危险配置 ──
+        # 只拦截含 command 的 stdio 型配置；url 型（sse/http）直接放行。
+        if config.get("command"):
+            reject = _validate_stdio_config(config)
+            if reject:
+                logger.warning(f"[MCP] 拒绝启动服务器 '{name}': {reject}")
+                conn = MCPServerConnection(name, config)
+                conn._connect_error = ValueError(reject)
+                self._connections[name] = conn
+                return False, reject
+
         # 如果已存在，先断开
         if name in self._connections:
             await self._disconnect_single(name)
@@ -522,26 +851,42 @@ class MCPClientManager:
 
         threading.Thread(target=_worker, name="mcp-hot-disconnect", daemon=True).start()
 
-    async def _disconnect_single(self, name: str) -> bool:
-        """断开单个服务器：信号通知 + 取消 Task，不等待清理完成"""
-        conn = self._connections.pop(name, None)
+    async def _disconnect_single(self, name: str, *, keep_record: bool = False) -> bool:
+        """断开单个服务器
+
+        Args:
+            keep_record: True 时保留注册表条目（仅置为 DISABLED，UI 显示黑色"已关闭"）；
+                False 时从注册表移除。
+        """
+        conn = self._connections.get(name) if keep_record else self._connections.pop(name, None)
         if not conn:
             return False
+        if keep_record:
+            conn.set_state(MCPState.DISABLED)
+        else:
+            self._connections.pop(name, None)
 
         # 通知生命周期 Task 退出（走 async with 正常清理路径）
         if conn._disconnect_event:
             conn._disconnect_event.set()
 
         # 取消 Task 作为备份（CancelledError 在 async with 内触发 __aexit__）
-        if conn._task and not conn._task.done():
-            conn._task.cancel()
+        task = conn._task
+        if task and not task.done():
+            task.cancel()
+            # 等待 Task 完全退出，确保子进程释放资源（文件锁、端口等），
+            # 避免热重载时旧进程未完全退出 → 新进程初始化失败。
+            try:
+                await asyncio.wait({task}, timeout=5)
+            except Exception as e:
+                logger.debug(f"[MCP] 等待 '{name}' 生命周期退出异常: {e}")
 
-        # 立即清除引用，不等待 Task 完成
+        # 立即清除引用（keep_record 时保留 state 但清 session/tools）
         conn.session = None
         conn.tools = []
-
-        if not self._connections:
-            self._connected = False
+        self._connected = any(
+            c.state == MCPState.CONNECTED for c in self._connections.values()
+        )
         return True
 
     def disconnect_all_sync(self) -> None:
@@ -577,6 +922,19 @@ class MCPClientManager:
 
         self._connections.clear()
         self._connected = False
+
+    def disconnect_missing(self, valid_names: set) -> None:
+        """断开所有不在 valid_names 中的已注册连接
+
+        用于热重载后清理：插件被删除 / .mcp.json 中服务器被移除 / 被禁用时，
+        对应的子进程不会自动退出，需要显式断开，否则残留进程继续运行。
+        """
+        orphans = [n for n in self._connections if n not in valid_names]
+        if not orphans:
+            return
+        logger.info(f"[MCP] 热重载检测到 {len(orphans)} 个已失效连接，准备断开: {orphans}")
+        for name in orphans:
+            self.disconnect_server_background(name)
 
     # ── 工具 Schema ──────────────────────────────────
 
@@ -670,16 +1028,23 @@ class MCPClientManager:
     def get_status(self) -> List[Dict]:
         # 注意：返回的 tools 必须带 mcp__{server}__ 前缀，与 get_tool_schemas() 保持一致，
         # 避免 LLM 从 mcp_list_servers 看到裸名后误用导致调用失败。
+        #
+        # 返回注册表中的**全部** server（含 CONNECTING / FAILED / DISABLED），
+        # 旧实现只返回连接成功的条目，导致 UI 永远读不到"启动中"和"失败"两种状态。
         status = []
         with self._busy_lock:
             busy_names = set(self._busy_names)
         for name, conn in self._connections.items():
+            busy = name in busy_names or conn.state == MCPState.CONNECTING
             status.append({
                 "name": name,
                 "type": conn.server_type,
                 "enabled": conn.enabled,
-                "connected": conn.session is not None,
-                "busy": name in busy_names,
+                "connected": conn.session is not None and conn.state == MCPState.CONNECTED,
+                # busy 集合中的 server 即便记录是旧的 FAILED，也应报告为启动中
+                "state": MCPState.CONNECTING if busy and conn.state != MCPState.CONNECTED else conn.state,
+                "error": conn.last_error,
+                "busy": busy,
                 "tool_count": len(conn.tools),
                 "tools": [
                     f"{self.TOOL_PREFIX}{name}__{t.name}" for t in conn.tools

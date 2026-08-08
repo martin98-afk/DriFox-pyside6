@@ -1858,13 +1858,68 @@ class CardSeparator(QWidget):
         painter.drawLine(2, 1, self.width() - 2, 1)
 
 
+class _SimpleSignal:
+    """非 QObject 类的轻量信号占位：支持 connect/emit/disconnect。
+
+    fluent_shim 的 ConfigItem 不是 QObject 子类，PySide6 的 Signal() 在
+    普通 Python 类上不需要实例 signal；用纯 Python 回调实现等价
+    valueChanged 语义，供配置赋值通知与测试桩使用。
+    """
+    def __init__(self):
+        self._slots = []
+
+    def connect(self, slot):
+        if slot not in self._slots:
+            self._slots.append(slot)
+
+    def disconnect(self, slot=None):
+        if slot is None:
+            self._slots = []
+        elif slot in self._slots:
+            self._slots.remove(slot)
+
+    def emit(self, *args):
+        for slot in list(self._slots):
+            try:
+                slot(*args)
+            except TypeError:
+                try:
+                    slot()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+
 class ConfigItem:
-    """配置项占位"""
-    def __init__(self, key, default=None):
-        self.key = key
+    """配置项占位
+
+    兼容两种调用：
+    - qfluentwidgets 风格 (group, name, default, validator)：self.key = "group/name"
+    - 简化风格 (key, default) / (key)
+    """
+    def __init__(self, *args):
+        if len(args) >= 4:
+            self.group = args[0]
+            self.name = args[1]
+            default = args[2]
+            self.validator = args[3]
+            self.key = f"{self.group}/{self.name}"
+        elif len(args) == 3:
+            self.group = args[0]
+            self.name = args[1]
+            default = args[2]
+            self.validator = None
+            self.key = f"{self.group}/{self.name}"
+        else:
+            self.group = None
+            self.name = args[0] if len(args) > 0 else None
+            self.key = args[0] if len(args) > 0 else ""
+            default = args[1] if len(args) > 1 else None
+            self.validator = None
         self.default = default
         self._value = default
-        self.valueChanged = Signal()
+        self.valueChanged = _SimpleSignal()
 
     @property
     def value(self):
@@ -1872,6 +1927,13 @@ class ConfigItem:
 
     @value.setter
     def value(self, v):
+        # 与 qfluentwidgets 语义对齐：setter 经 validator.correct 净化，
+        # 未注册选项/超范围值自动回退到合法默认（防止脏配置写入）。
+        if getattr(self, "validator", None) is not None:
+            try:
+                v = self.validator.correct(v)
+            except Exception:
+                pass
         self._value = v
         self.valueChanged.emit(v)
 
@@ -1933,20 +1995,62 @@ class RangeValidator(ConfigValidator):
 
 
 class OptionsConfigItem(ConfigItem):
-    """选项配置项（P1 配置体系，映射 ConfigItem）"""
-    def __init__(self, key, default, options, restart=False, validator=None):
-        super().__init__(key, default)
-        self.options = options
-        self.restart = restart
-        self.validator = validator or OptionsValidator(options)
+    """选项配置项（兼容 qfluentwidgets 4 参与简化 3 参）
+
+    - 4 参 (group, name, default, OptionsValidator) → options 取 validator.options
+    - 3 参 (key, default, options) → 原简化语义
+    - 3 参 (group, name, default) → 无 options（等价 ConfigItem + OptionsValidator 兜底）
+    """
+    def __init__(self, *args, **kwargs):
+        restart = kwargs.get('restart', False)
+        validator = kwargs.get('validator', None)
+        if len(args) >= 4:
+            # qfluentwidgets 风格：第 4 参是 OptionsValidator 实例
+            opt_validator = args[3]
+            options = getattr(opt_validator, 'options', None) or []
+            super().__init__(args[0], args[1], args[2], opt_validator)
+            self.options = list(options)
+            self.restart = restart
+            self.validator = validator or opt_validator
+        else:
+            # 原简化语义 (key, default, options) / (key, default)
+            key = args[0]
+            default = args[1] if len(args) > 1 else None
+            options = args[2] if len(args) > 2 else (kwargs.get('options') or [])
+            super().__init__(key, default)
+            self.options = list(options)
+            self.restart = restart
+            self.validator = validator or OptionsValidator(self.options)
 
 
 class RangeConfigItem(ConfigItem):
-    """数值范围配置项（P1 配置体系，映射 ConfigItem）"""
-    def __init__(self, key, default, min_, max_, restart=False, validator=None):
-        super().__init__(key, default)
-        self.restart = restart
-        self.validator = validator or RangeValidator(min_, max_)
+    """数值范围配置项（兼容 qfluentwidgets 4 参 + 原 5 参）
+
+    - 4 参 (group, name, default, RangeValidator) → validator.min/max
+    - 原语义 (key, default, min_, max_, restart, validator)
+    """
+    def __init__(self, *args, **kwargs):
+        restart = kwargs.get('restart', False)
+        validator = kwargs.get('validator', None)
+        if len(args) >= 4 and not isinstance(args[3], (int, float)):
+            # qfluentwidgets 风格：第 4 参是 RangeValidator 实例
+            rv = args[3]
+            super().__init__(args[0], args[1], args[2], rv)
+            self.restart = restart
+            self.validator = validator or rv
+        else:
+            # 原语义 (key, default, min_, max_, ...)
+            key = args[0]
+            default = args[1]
+            min_ = args[2] if len(args) > 2 else None
+            max_ = args[3] if len(args) > 3 else None
+            super().__init__(key, default)
+            self.restart = restart
+            self.validator = validator or RangeValidator(min_, max_)
+            if min_ is not None:
+                self.validator.min = min_
+            if max_ is not None:
+                self.validator.max = max_
 
 
 class LineEdit(QLineEdit):

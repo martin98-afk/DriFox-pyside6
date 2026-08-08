@@ -109,6 +109,48 @@ _SHIMMER_COLORS = (
     _QColor(255, 255, 255, 0),
 )
 
+# 报错红色流光渐层颜色常量（避免 paintEvent 中反复创建 5 个 QColor）
+_SHIMMER_ERROR_COLORS = (
+    _QColor(255, 255, 255, 0),
+    _QColor(220, 80, 60, 80),
+    _QColor(235, 110, 80, 140),
+    _QColor(220, 80, 60, 80),
+    _QColor(255, 255, 255, 0),
+)
+
+# 提问橙黄流光渐层颜色常量（避免 paintEvent 中反复创建 5 个 QColor）
+_SHIMMER_QUESTION_COLORS = (
+    _QColor(255, 255, 255, 0),
+    _QColor(245, 170, 60, 80),
+    _QColor(250, 200, 110, 140),
+    _QColor(245, 170, 60, 80),
+    _QColor(255, 255, 255, 0),
+)
+
+# 彩虹流光渐层缓存：key = 彩虹索引 → 5 段渐层色元组（主体色随相位循环）
+_SHIMMER_RAINBOW_CACHE: dict = {}
+
+
+def _shimmer_rainbow_colors(idx: int):
+    """按彩虹索引生成 5 段流光渐层（透明→彩虹色→亮白→彩虹色→透明），带缓存
+
+    流式流光随 _anim_phase 推进切换彩虹色，形成"彩色循环"的来回流光。
+    """
+    cached = _SHIMMER_RAINBOW_CACHE.get(idx)
+    if cached is not None:
+        return cached
+    base = _RAINBOW_COLORS[idx]
+    r, g, b = base.red(), base.green(), base.blue()
+    colors = (
+        _QColor(255, 255, 255, 0),
+        _QColor(r, g, b, 55),
+        _QColor(min(255, r + 60), min(255, g + 60), min(255, b + 60), 100),
+        _QColor(r, g, b, 55),
+        _QColor(255, 255, 255, 0),
+    )
+    _SHIMMER_RAINBOW_CACHE[idx] = colors
+    return colors
+
 # 错误态红条颜色
 _CACHED_ERROR_RED = _QColor(220, 50, 50)
 
@@ -223,6 +265,12 @@ class TabItem(QFrame):
         self._capsule_color = ""  # 胶囊颜色（紧凑态首字符图标用同色）
         self._compact_saved = None  # 紧凑态恢复现场（展开时逐控件配对还原）
         self._panel = panel  # TabPanel 引用，用于读取 _anim_phase
+        # ── 关闭按钮二次确认（内联确认，对话进行中防误关） ──
+        self._confirming_close = False  # 关闭确认态（首次点击进入，二次点击真正关闭）
+        self._close_timer = QTimer(self)  # 确认超时自动取消
+        self._close_timer.setSingleShot(True)
+        self._close_timer.setInterval(3000)
+        self._close_timer.timeout.connect(self._cancel_close_confirm)
         # ── paintEvent 缓存：当尺寸未变时复用 QPainterPath ──
         self._cached_rect_key = (-1, -1)
         self._cached_round_rect = None
@@ -257,12 +305,13 @@ class TabItem(QFrame):
         self._apply_title_style()
         layout.addWidget(self._title_label, 1)
 
-        # 关闭按钮（与主标题栏一致的 FluentIcon.CLOSE）
+        # 关闭按钮（与主标题栏一致的 FluentIcon.CLOSE，支持内联二次确认）
         self._close_btn = TransparentToolButton(self)
         self._close_btn.setIcon(FIF.CLOSE)
         self._close_btn.setFixedSize(20, 20)
         self._close_btn.setVisible(False)
-        self._close_btn.clicked.connect(self.closeRequested.emit)
+        self._close_btn_orig_ss = self._close_btn.styleSheet()  # 保存全局样式，确认态恢复时还原
+        self._close_btn.clicked.connect(self._on_close_btn_clicked)
         layout.addWidget(self._close_btn)
 
     def _apply_title_style(self):
@@ -284,6 +333,11 @@ class TabItem(QFrame):
 
     def refresh_style(self):
         """主题 / 字体变更后刷新样式，重新调整图标尺寸与文字字号/颜色"""
+        # 🛡️ 刷新样式前取消关闭确认态：红色"确认关闭"样式依赖 setStyleSheet 临时
+        # 覆盖；refresh_style 重刷样式会丢失该覆盖但 _confirming_close 仍为 True →
+        # 状态与视觉脱钩，后续点击会被误判为"二次确认"直接关闭。先 _cancel 复位，
+        # 确保主题刷新后关闭确认态干净重来。
+        self._cancel_close_confirm()
         # 重新读取缩放后的图标尺寸
         new_size = scale_icon_size(20)
         if new_size != self._icon_size:
@@ -414,6 +468,8 @@ class TabItem(QFrame):
             return
         self._compact = compact
         if compact:
+            # 进入紧凑态：关闭按钮被隐藏，二次确认态无意义，直接取消恢复
+            self._cancel_close_confirm()
             # 保存恢复现场（用 isHidden 逆：显式隐藏状态，与父链显示无关）
             self._compact_saved = {
                 "icon_visible": not self._icon_widget.isHidden(),
@@ -456,6 +512,70 @@ class TabItem(QFrame):
         self._capsule_label.setVisible(False)
         self._capsule_label.setText("")
 
+    def _on_close_btn_clicked(self):
+        """关闭按钮点击：内联二次确认（防误关正在进行的对话）。
+
+        仅在存在"进行中状态"（流式对话 _streaming / 提问等待 _question）时启用
+        二次确认，防止误触丢掉正在进行的对话；对话已结束（无状态）直接关闭不打扰。
+
+        确认流程：首次点击 → 按钮变为红色"确认关闭"，3 秒内再次点击才真正
+        emit closeRequested；移出 Tab / 3 秒超时自动取消。
+        """
+        # 对话已结束：直接关闭，不做二次确认
+        if not self._streaming and not self._question:
+            self.closeRequested.emit()
+            return
+
+        if not self._confirming_close:
+            # 首次点击（对话进行中）：进入确认态
+            self._confirming_close = True
+            self._close_btn.setIcon(QIcon())  # 清除图标，文字占位
+            self._close_btn.setText("确认关闭")
+            self._close_btn.setFixedSize(64, 20)
+            # ⚠️ 必须显式透明背景：局部 stylesheet 会覆盖 fluent_shim 全局样式
+            # （原背景半透明白），若只设 color 则 Qt 回退默认深色底 → 全黑。
+            # PySide6 QPushButton 无 setToolButtonStyle，靠 setIcon(QIcon()) + setText
+            # 互斥实现"仅文字"显示效果。
+            self._close_btn.setStyleSheet(
+                "QPushButton { background: transparent; border: none; "
+                f"color: #f85149; font-weight: 600; {get_font_family_css()} {font_size_css(11)} "
+                "}"
+            )
+            self._close_btn.setToolTip("正在对话，再次点击确认关闭，3秒后自动取消")
+            self._close_timer.start()
+        else:
+            # 二次点击：确认关闭
+            if self._close_timer.isActive():
+                self._close_timer.stop()
+            # 🛡️ emit 前先清理按钮态（_cancel_close_confirm 复位 disabled +
+            # "确认关闭"文字 + 红色样式），防上层拒绝关闭时按钮残留确认态。
+            # 若上层 closeRequested 被拒、Tab 未关闭，按钮已恢复普通态可再次点击。
+            self._cancel_close_confirm()
+            self.closeRequested.emit()
+
+    def _cancel_close_confirm(self):
+        """取消关闭确认态，恢复普通关闭按钮样式（移出按钮 / 超时触发）"""
+        # ⚠️ pyside6 版早退条件（更自愈）：
+        # `not confirming and enabled and not text` —— disabled 时也重置。
+        # 与源项目（PyQt5）相反（源为 `not confirming and not enabled: return`，
+        # 即 disabled 时直接早退）。差异原因：pyside6 的 emit 前已调本方法清理
+        # （T23 建议 1），若此处沿用源条件，emit 清理时按钮 disabled 会直接
+        # return 不恢复 → "确认关闭"文字残留；本版在 disabled 时仍重置，
+        # 靠 leaveEvent 把 disabled 按钮也恢复为普通态，更自愈。
+        if not self._confirming_close and self._close_btn.isEnabled() and not self._close_btn.text():
+            # 已是普通态（无残留）：什么都不做，避免多余 repaint
+            return
+        self._confirming_close = False
+        if self._close_timer.isActive():
+            self._close_timer.stop()
+        self._close_btn.setEnabled(True)
+        self._close_btn.setIcon(FIF.CLOSE)
+        self._close_btn.setText("")
+        self._close_btn.setFixedSize(20, 20)
+        # 还原全局样式（不能 setStyleSheet("")，否则连全局样式一起清掉）
+        self._close_btn.setStyleSheet(getattr(self, "_close_btn_orig_ss", ""))
+        self._close_btn.setToolTip("")
+
     def enterEvent(self, event):
         # 紧凑态守卫：折叠态不弹关闭按钮，避免撑破小容器（矩阵 C3）
         if not self._compact:
@@ -466,6 +586,8 @@ class TabItem(QFrame):
 
     def leaveEvent(self, event):
         self._hovered = False
+        # 移出 Tab 时若处于关闭确认态：取消确认（防止悬停残留误删）
+        self._cancel_close_confirm()
         if not self._selected and not self._compact:
             self._close_btn.setVisible(False)
         self.update()
@@ -513,47 +635,57 @@ class TabItem(QFrame):
             painter_obj.drawPath(_round_rect)
             painter_obj.restore()
 
-        # ── 流式/错误状态 ──
+        def _draw_shimmer(painter_obj, phase, colors):
+            """sin 相位 → 光斑从 -20% 扫到 120% 再折回：内部来回移动的流光脉冲
+
+            colors 为 5 段渐层色（透明→主体→透明）；流式传彩虹色循环，
+            报错传红色渐层。
+            """
+            if self._panel and self._panel._is_resizing:
+                return  # resize 期间跳过昂贵渐层
+            sweep = _math.sin(_math.radians(phase))
+            sweep_t = (sweep + 1.0) / 2.0  # 0.0 ~ 1.0
+            # 光斑中心在标签上从 -20% 扫到 120%
+            shimmer_center = sweep_t * (w + 0.4 * w) - 0.2 * w
+            shimmer_grad = _QLinearGradient(shimmer_center - 80, 0, shimmer_center + 80, 0)
+            shimmer_grad.setColorAt(0.0, colors[0])
+            shimmer_grad.setColorAt(0.3, colors[1])
+            shimmer_grad.setColorAt(0.5, colors[2])
+            shimmer_grad.setColorAt(0.7, colors[3])
+            shimmer_grad.setColorAt(1.0, colors[4])
+            painter_obj.save()
+            painter_obj.setClipPath(_round_rect)
+            painter_obj.fillRect(self.rect(), shimmer_grad)
+            painter_obj.restore()
+
+        # ── 流式/错误/提问三态：共用扫描相位（_anim_phase），各态独立配色 ──
         if self._streaming or self._stream_error:
+            phase = self._panel._anim_phase if self._panel else 0
             if self._stream_error:
-                _draw_left_indicator(painter, _CACHED_ERROR_RED)
+                # 报错：内部红色流光脉冲（选中时叠加红色指示条）
+                if self._selected:
+                    _draw_left_indicator(painter, _CACHED_ERROR_RED)
+                _draw_shimmer(painter, phase, _SHIMMER_ERROR_COLORS)
             else:
-                # 左侧彩虹逐帧单色指示条（贴合圆角曲线）
-                phase = self._panel._anim_phase if self._panel else 0
+                # 流式：内部彩虹流光（选中时叠加彩色循环指示条，相位驱动颜色循环）
                 idx = int((phase / 360) * _RAINBOW_N) % _RAINBOW_N
-                _draw_left_indicator(painter, _RAINBOW_COLORS[idx])
-
-                # ── 整条标签来回脉冲流光（约束在圆角路径内） ──
-                # ★ resize 期间跳过昂贵渐层，仅保留左侧指示条
-                if self._panel and self._panel._is_resizing:
-                    pass  # 跳过 shimmer 渐层
-                else:
-                    # sin 映射：0→360 相位对应 -1→1→-1，产生来回扫动
-                    sweep = _math.sin(_math.radians(phase))
-                    sweep_t = (sweep + 1.0) / 2.0  # 0.0 ~ 1.0
-                    # 光斑中心在标签上从 -20% 扫到 120%
-                    shimmer_center = sweep_t * (w + 0.4 * w) - 0.2 * w
-
-                    shimmer_grad = _QLinearGradient(shimmer_center - 80, 0, shimmer_center + 80, 0)
-                    shimmer_grad.setColorAt(0.0, _SHIMMER_COLORS[0])
-                    shimmer_grad.setColorAt(0.3, _SHIMMER_COLORS[1])
-                    shimmer_grad.setColorAt(0.5, _SHIMMER_COLORS[2])
-                    shimmer_grad.setColorAt(0.7, _SHIMMER_COLORS[3])
-                    shimmer_grad.setColorAt(1.0, _SHIMMER_COLORS[4])
-                    painter.save()
-                    painter.setClipPath(_round_rect)
-                    painter.fillRect(self.rect(), shimmer_grad)
-                    painter.restore()
+                if self._selected:
+                    _draw_left_indicator(painter, _RAINBOW_COLORS[idx])
+                _draw_shimmer(painter, phase, _shimmer_rainbow_colors(idx))
         elif self._question:
             # AI 提问等待回答：橙黄 #F59E0B 慢呼吸脉动（1.2s 一周期）
             phase = self._panel._question_phase if self._panel else 0
-            # resize 期间跳过 sin 计算取固定亮度
-            if self._panel and self._panel._is_resizing:
-                alpha = 150
+            # 内部橙黄流光脉冲（选中时叠加橙黄指示条，与流式同款流光动效）
+            if not self._selected:
+                _draw_shimmer(painter, phase, _SHIMMER_QUESTION_COLORS)
             else:
-                # 50ms 帧速 +6°/帧 ≈ 1.2s 一周期；亮度在 ~80~220 间脉动
-                alpha = int(150 + _math.sin(_math.radians(phase)) * 70)
-            _draw_left_indicator(painter, _QColor(245, 158, 11, max(0, min(255, alpha))))
+                # resize 期间跳过 sin 计算取固定亮度
+                if self._panel and self._panel._is_resizing:
+                    alpha = 150
+                else:
+                    # 50ms 帧速 +6°/帧 ≈ 1.2s 一周期；亮度在 ~80~220 间脉动
+                    alpha = int(150 + _math.sin(_math.radians(phase)) * 70)
+                _draw_left_indicator(painter, _QColor(245, 158, 11, max(0, min(255, alpha))))
         elif self._selected:
             # 左侧选中指示条（贴合圆角曲线）
             _draw_left_indicator(painter, _CACHED_INFO)
@@ -1952,6 +2084,8 @@ class TabPanel(QWidget):
         if 0 <= self._active_index < len(self._items):
             self._items[self._active_index].set_selected(False)
             self._items[self._active_index]._close_btn.setVisible(False)
+            # 🛡️ 切换选中时取消旧 tab 的关闭确认态（防悬停残留误删 + 防状态残留）
+            self._items[self._active_index]._cancel_close_confirm()
 
         self._active_index = index
 

@@ -94,7 +94,7 @@ class TestInvalidateWelcomeCardMethod:
         method = _get_method(cls, "_invalidate_welcome_card")
         assert method is not None
         src = ast.unparse(method)
-        assert "isdeleted" in src, "失效方法应检查 sip.isdeleted"
+        assert "isValid" in src, "失效方法应检查 shiboken6.isValid（PySide6 等价于源 sip.isdeleted）"
 
 
 class TestInvalidationCallSites:

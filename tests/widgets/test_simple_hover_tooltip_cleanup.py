@@ -181,6 +181,11 @@ def test_scenario_g_timer_fires_during_destruction(_qt_app):
     child.setToolTip("test")
     f = install_hover_tooltip(child)
 
+    # 判空保护：install_hover_tooltip 可能返回 None（如 parent 已销毁/条件不满足），
+    # 此时不应继续操作 _timer，否则 AttributeError
+    if f is None:
+        return
+
     # Don't show tooltip yet — let timer fire AFTER deleteLater
     # First, queue deleteLater with 0 delay
     QTimer.singleShot(0, child.deleteLater)

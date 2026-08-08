@@ -35,6 +35,22 @@ from enum import Enum, auto
 from typing import Dict, List, Optional, Set
 
 
+class CommandNeedDegrade(Exception):
+    """handler 抛出此异常表示需要降级到 prompt 层；分发器自动捕获。
+
+    业务降级语义：命令处理器在执行过程中识别到"无法继续正常执行"的状态
+    （如团队模板加载时存在缺失成员），主动抛出本异常，由 `_execute_command`
+    统一捕获并转走 `prompt_sections` 注入流程（select_prompt 按参数匹配段），
+    避免在 UI 层硬编码参数名判断。
+    """
+
+    def __init__(self, command_name: str, remainder: str = "", degrade_section: str = ""):
+        self.command_name = command_name
+        self.remainder = remainder
+        self.degrade_section = degrade_section
+        super().__init__(f"Command {command_name} needs degrade to {degrade_section}")
+
+
 @dataclass
 class CommandParameter:
     """命令参数定义（用于 detail 模式交互式参数列表）"""
@@ -143,6 +159,7 @@ class CommandManager:
         prompt_text: str = "",
         parameters: Optional[List[CommandParameter]] = None,
         shortcut: str = "",
+        prompt_sections: Optional[Dict[str, str]] = None,
     ):
         """注册一个内置命令
 
@@ -154,7 +171,22 @@ class CommandManager:
             prompt_text: PROMPT/AGENT 命令使用，替换后的提示词文本
             parameters: 可交互参数列表（用于 detail 模式参数补全）
             shortcut: 快捷键，如 "Ctrl+Shift+B"
+            prompt_sections: 参数→提示词分段映射（用于按需加载，如 {"--create=": "提示词模板", "common": "通用提示词"}）
+
+        同名命令覆盖时：若新旧类型相同且新注册缺少参数/提示词，则保留旧定义中的对应字段。
+        这确保用户通过 ShortcutManager 分配自定义快捷键时不会丢失原始的 parameters/argument_hint。
         """
+        if name in self._commands and command_type in self._commands[name]:
+            existing = self._commands[name][command_type]
+            if not parameters:
+                parameters = existing.parameters
+            if not argument_hint:
+                argument_hint = existing.argument_hint
+            if not prompt_text:
+                prompt_text = existing.prompt_text
+            if not prompt_sections:
+                prompt_sections = existing.prompt_sections
+
         if name not in self._commands:
             self._commands[name] = {}
         self._commands[name][command_type] = CommandDefinition(
@@ -165,6 +197,7 @@ class CommandManager:
             prompt_text=prompt_text,
             parameters=parameters or [],
             shortcut=shortcut,
+            prompt_sections=prompt_sections or {},
         )
 
     def unregister(self, name: str):

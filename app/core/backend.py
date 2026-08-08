@@ -351,43 +351,61 @@ class ChatBackend(QObject):
         self._ui_valid = True
         
         # Hook 完成后，把输出添加到上下文
-        def on_hook_finished(event_name: str, output: str, success: bool):
-            # 检查 UI 是否仍然有效，防止窗口关闭后 hook 回调访问已销毁的 UI
-            if not getattr(self, '_ui_valid', True):
+        # 误报「worker 过期回调」并在 main_widget 中产生 WARNING 日志。
+        # 直接 return 让最终的 signal 由调用方（create_session / trigger_session_event /
+        # engine.send_message）在所有 hook 输出注入完成后再 emit。
+        _PRE_DIALOG_EVENTS = {"SessionStart", "PreUserMessage", "PostUserMessage"}
+
+        def on_hook_finished(event_name: str, output: str, success: bool, status_message: str = ""):
+            if not getattr(self, "_ui_valid", True):
                 logger.debug("[HookManager] Hook callback skipped: UI already closed")
                 return
-            
-            logger.info(f"[HookManager] Hook callback: event={event_name}, success={success}，output={output[:100]}...")
-            
-            # 只有成功执行的 hook 才添加到消息列表
-            if not success:
+
+            is_prompt_hook = event_name.startswith("__prompt__:")
+            if is_prompt_hook:
+                event_name = event_name[len("__prompt__:") :]
+
+            # 🛡️ W1：异步 worker 完成回调标记（command/http 类型 hook 后台执行后
+            # 回补注入用）。同步路径（trigger_async=False）无此前缀。
+            # 🛡️ F1(W1-R2)：异步事件名可能携带触发时的 session_id（格式
+            # `__async__:<event>:<sid>`），回补注入前校验当前会话一致。
+            is_async_hook = event_name.startswith("__async__:")
+            async_session_id = ""
+            if is_async_hook:
+                rest = event_name[len("__async__:") :]
+                if ":" in rest:
+                    event_name, _, async_session_id = rest.partition(":")
+                else:
+                    event_name = rest
+
+            # BuildSystemPrompt hook 的输出已在 get_agent_system_prompt() 中直接注入 system prompt，
+            # 不需要再通过队列注入到 assistant 消息中，跳过回调避免双重注入。
+            if event_name == "BuildSystemPrompt":
                 return
-            
-            hook_output = f"<hook event=\"{event_name}\">\n{output}\n</hook>"
-            
-            # SessionStart 和 PreUserMessage 添加到消息列表
-            add_to_messages = event_name in ("SessionStart", "PreUserMessage", "PostUserMessage")
-            
-            if add_to_messages:
-                session = self.get_current_session()
-                if session:
-                    # 对于 PreUserMessage，先删除之前的同类 hook 消息，只保留最新一个
-                    if event_name == "PreUserMessage":
-                        session.messages = [
-                            msg for msg in session.messages
-                            if not (msg.get("role") == "assistant" and "<hook " in (msg.get("content") or "") and 'event="PreUserMessage"' in (msg.get("content") or ""))
-                        ]
-                    
-                    # 添加新消息
-                    session.add_assistant_message(hook_output)
-                
-                # 发送消息给前端显示（仅在 UI 有效时发送，防止窗口关闭后 emit 导致 segfault）
-                if getattr(self, '_ui_valid', True):
-                    self.message_received.emit({
-                        "role": "assistant",
-                        "content": hook_output
-                    })
-                logger.info(f"[HookManager] Hook added to messages: {event_name}")
+
+            # 🛡️ 预对话 hook 的输出由调用方负责直接注入 session.messages；
+            # 这里再 emit signal 会和 _session_switched 哨兵冲突，同时还会污染
+            # _hook_message_queue（chat_worker 不会消费 SessionStart 等预对话事件）。
+            # 例外（W1）：异步路径（__async__ 前缀，UI 线程 SessionStart 的
+            # command/http hook 后台执行）输出仅此一处回补注入，不注入则丢失。
+            # 🛡️ F1(W1-R2)：回补注入前校验当前会话 == 触发时会话，不一致则丢弃
+            # （用户已切换会话，注入会污染错误 session 的上下文）。
+            if event_name in _PRE_DIALOG_EVENTS:
+                if is_async_hook and success and output and output.strip():
+                    session = self.get_current_session()
+                    if session is not None and (not async_session_id or session.session_id == async_session_id):
+                        _inject_hook_to_session(session, event_name, output, status_message)
+                        self._hook_messages_updated.emit()
+                        logger.info(f"[HookManager] Async hook output injected: {event_name}")
+                    else:
+                        logger.info(
+                            f"[HookManager] Async hook output dropped (session switched): "
+                            f"{event_name}, expect_sid={async_session_id!r}, "
+                            f"current_sid={getattr(session, 'session_id', None)!r}"
+                        )
+                return
+
+            logger.info(f"[HookManager] Hook callback: event={event_name}, success={success}")
         self._hook_manager.set_on_finished_callback(on_hook_finished)
         
         # 4. 创建初始会话（不触发 SessionStart hook，避免重复初始化）
@@ -619,7 +637,7 @@ class ChatBackend(QObject):
                 logger.error(f"[ChatBackend] 延迟启动插件监听失败: {e}")
 
             # 初始化 LSP 管理器（仅首次，多窗口共享单例）
-            # TODO(pyside6): 原项目用 get_lsp_manager() 工厂，pyside6 为 LspManager.get_instance()
+            # pyside6: LspManager 使用 get_instance() 类方法工厂，与源项目 get_lsp_manager() 等价
             try:
                 from app.core.lsp.lsp_manager import LspManager
 
@@ -668,6 +686,9 @@ class ChatBackend(QObject):
     _plugin_watcher_refcount = 0  # 活跃 backend 引用计数
     _plugin_watcher_stop = None  # threading.Event：设置后 watch() 生成器退出
     _plugin_watcher_thread = None  # 当前 watcher 线程（cleanup 归零时 join 确保退出）
+    # 启动静默期结束时间戳：初始化扫描/写缓存会产生大量 watch 误报，
+    # 期内忽略变更，避免应用刚启动就触发全量 plugin reload 阻塞窗口显示/闪屏
+    _plugin_watch_startup_until = 0.0
 
     def _start_plugin_watcher(self):
         """启动 watchfiles 插件文件变更监听（引用计数 +1，首个 backend 启动）"""
@@ -675,6 +696,11 @@ class ChatBackend(QObject):
         if ChatBackend._plugin_watcher_started:
             return
         ChatBackend._plugin_watcher_started = True
+        # 启动静默期：初始化扫描/写插件缓存会产生大量 watch 误报（跨插件变更），
+        # 若在应用展示窗口前触发全量 reload 会反复重建组件、占用主线程，导致
+        # 窗口迟迟不显示/闪屏。设 5 秒静默期，期内 watch 变更全部忽略。
+        import time as _time
+        ChatBackend._plugin_watch_startup_until = _time.time() + 5.0
 
         try:
             from watchfiles import watch
@@ -803,6 +829,16 @@ class ChatBackend(QObject):
                         relevant_changes.append((change_type, change_path))
 
                     if not relevant_changes:
+                        continue
+
+                    # 启动静默期：初始化扫描/写缓存误报的插件变更，期内在
+                    # watch 线程侧直接丢弃（不 emit 主线程 reload），避免
+                    # 应用刚启动就全量重载阻塞窗口显示/闪屏。
+                    if time.time() < ChatBackend._plugin_watch_startup_until:
+                        logger.debug(
+                            f"[ChatBackend] 启动静默期内忽略 {len(relevant_changes)} 处插件变更"
+                            f"（剩 {ChatBackend._plugin_watch_startup_until - time.time():.0f}s）..."
+                        )
                         continue
 
                     current_prefixes = _prefixes_ref[0]
@@ -1307,8 +1343,8 @@ class ChatBackend(QObject):
             if comps.get("agents") and self._agent_manager:
                 result["agents"] = self._agent_manager.reload_plugin_agents(plugin_name)
                 result["hooks"] = True  # agents 组件包含 hooks 重载
-                # TODO(pyside6): 原项目用 reload_agent_commands()，pyside6 无此函数，
-                # 用等价的全量命令重载 reload_all_commands() 替代
+                # pyside6: 用 reload_all_commands() 替代源项目 reload_agent_commands()，
+                # 智能体命令与 builtin 命令共用同一命令注册表，全量重载语义等价
                 try:
                     from app.core.builtin_commands import reload_all_commands
 
@@ -1344,13 +1380,12 @@ class ChatBackend(QObject):
                     logger.error(f"[ChatBackend] Failed to reload themes: {e}")
 
             # 5. 技能 / MCP：懒加载，只需标记
-            # TODO(pyside6): 原项目此处调用 invalidate_skills_cache()，
-            # pyside6 无技能缓存（get_local_skills 懒加载），已省略
+            # pyside6: 无技能缓存（get_local_skills 懒加载，无需 invalidate_skills_cache()）
             result["skills"] = bool(comps.get("skills"))
             result["mcp"] = bool(comps.get("mcp"))
 
             # 6. LSP：增量注册，不重启已有服务器
-            # TODO(pyside6): 原项目用 get_lsp_manager() 工厂，pyside6 为 LspManager.get_instance()
+            # pyside6: LspManager 使用 get_instance() 类方法工厂，等价于源项目 get_lsp_manager()
             if comps.get("lsp"):
                 try:
                     from app.core.lsp.lsp_manager import LspManager
@@ -1951,12 +1986,11 @@ class ChatBackend(QObject):
         }
 
         # 团队模式：让 SessionStart hook 也能按 #team_member matcher 精确触发
-        # TODO(pyside6): 原项目用 chat_worker._check_team_member，pyside6 无此函数，
-        # 暂固定 False，团队 matcher 场景留待后续移植
+        # pyside6: 等价实现已上移至 app.core.team_manager.check_team_member(backend_or_window_id)
         try:
-            from app.core.workers.chat_worker import _check_team_member
+            from app.core.team_manager import check_team_member
 
-            ctx["is_team_member"] = _check_team_member(self)
+            ctx["is_team_member"] = check_team_member(self)
         except Exception:
             ctx["is_team_member"] = False
 
@@ -2006,16 +2040,27 @@ class ChatBackend(QObject):
         session = self._session_manager.create_new_session()
         self.session_created.emit(session.session_id)
         
-        # Trigger SessionStart hook
+        # Trigger SessionStart hook — 同步执行，直接注入 session.messages
         if trigger_hook and self._hook_manager:
-            context = {
-                "project_root": os.getcwd(),
-            }
-            self._hook_manager.trigger_event(
+            context = self._build_session_context("startup")
+            context["session_id"] = session.session_id  # Claude Code 兼容字段
+            # 🛡️ W1：UI 线程（新建/分支会话等 GUI 场景）→ trigger_async=True，
+            # command/http 类型 hook 后台执行 + finished 回调回补注入，主线程不被
+            # 外部进程/网络阻塞（PROMPT 类型仍同步顺序注入，语义不变）。
+            # 非 UI 线程（CLI 等无 Qt 事件循环，异步回调无处回补）→ 保持同步。
+            from app.core.hook_manager import _is_ui_thread
+
+            trigger_async = _is_ui_thread()
+            results = self._hook_manager.trigger_event(
                 "SessionStart",
                 context=context,
-                current_message=""
+                current_message="",
+                trigger_async=trigger_async,
             )
+            for r in results:
+                if r.success and r.output:
+                    _inject_hook_to_session(session, "SessionStart", r.output, r.status_message)
+            self._hook_messages_updated.emit()
         
         return session
 
@@ -2034,21 +2079,22 @@ class ChatBackend(QObject):
             ctx["session_id"] = session.session_id  # Claude Code 兼容字段
         if extra_context:
             ctx.update(extra_context)
-        # TODO(pyside6): 原项目用 hook_manager._is_ui_thread() 决定 trigger_async，
-        # pyside6 无此函数；pyside6 trigger_event 默认 trigger_async=True 走后台
-        # 异步 + 回调回补，语义等价，直接采用默认异步
+        # 🛡️ W1：UI 线程（clear/compact 等 GUI 场景）→ trigger_async=True 走后台
+        # 执行 + finished 回调回补；非 UI 线程（CLI 等无事件循环）→ 保持同步。
+        from app.core.hook_manager import _is_ui_thread
+
         results = self._hook_manager.trigger_event(
             "SessionStart",
             context=ctx,
             current_message="",
+            trigger_async=_is_ui_thread(),
         )
         if session:
             for r in results:
                 if r.success and r.output:
-                    # TODO(pyside6): 原项目 r.status_message，pyside6 HookExecutionResult
-                    # 无此字段，用 getattr 兜底
+                    # HookExecutionResult.status_message 字段直接访问（见 app/core/hook_manager.py）
                     _inject_hook_to_session(
-                        session, "SessionStart", r.output, getattr(r, "status_message", "")
+                        session, "SessionStart", r.output, r.status_message
                     )
             self._hook_messages_updated.emit()
 

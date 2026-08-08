@@ -75,6 +75,21 @@ def _set_consolidate_cache(list_id: int, list_len: int, result: list, fingerprin
         entries.popitem(last=False)  # FIFO 逐出最旧条目
 
 
+VALID_MESSAGE_ROLES = {"system", "user", "assistant", "tool"}
+
+# 渲染敏感标记（按长度降序排列，避免部分匹配）
+_SENSITIVE_MARKERS = [
+    " thinking",
+    " response",
+    "</tool>",
+    "<tool>",
+    "```",
+]
+
+# 性能优化：预编译正则表达式用于一次性替换所有敏感标记
+_SANITIZE_PATTERN = re.compile("|".join(re.escape(marker) for marker in _SENSITIVE_MARKERS))
+
+
 def _sanitize_rendering_string(text: str) -> str:
     """
     清理字符串中的渲染敏感标记。

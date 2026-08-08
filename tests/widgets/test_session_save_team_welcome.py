@@ -174,8 +174,8 @@ class TestLoadSessionFromRecordInterrupt:
 class TestWelcomeCardBehavior:
     """行为验证：欢迎卡片推荐列表过滤团队会话"""
 
-    @patch("PyQt5.sip.isdeleted", return_value=False)
-    def test_recent_sessions_exclude_team(self, _mock_isdeleted):
+    @patch("shiboken6.isValid", return_value=True)
+    def test_recent_sessions_exclude_team(self, _mock_isvalid):
         """recent_sessions 不应包含 team_run_id 非空的会话"""
         from app.main_widget import OpenAIChatToolWindow
 

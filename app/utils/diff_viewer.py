@@ -222,6 +222,53 @@ class DiffHtmlGenerator:
             overflow-y: auto;
         }
 
+        /* ---- View toggle（unified/split 视图切换条） ---- */
+        .view-bar {
+            display: flex;
+            align-items: center;
+            padding: 5px 12px;
+            background: var(--gh-bg-tertiary);
+            border-bottom: 1px solid var(--gh-border);
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        .view-bar .spacer { flex: 1; }
+        .view-bar .view-hint {
+            font-size: 10px;
+            color: var(--gh-text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .view-tgl {
+            display: flex;
+            border: 1px solid var(--gh-border);
+            border-radius: 4px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        .view-tgl button {
+            padding: 4px 12px;
+            font-size: 11px;
+            font-family: var(--gh-font-sans);
+            background: transparent;
+            color: var(--gh-text-secondary);
+            border: none;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            position: relative;
+        }
+        .view-tgl button:first-child { border-right: 1px solid var(--gh-border); }
+        .view-tgl button.active {
+            background: var(--gh-blue-bg);
+            color: var(--gh-blue-text);
+            font-weight: 500;
+        }
+        .view-tgl button:hover:not(.active) {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--gh-text-primary);
+        }
+
         .file-block {
             border-bottom: 1px solid var(--gh-border);
         }
@@ -566,13 +613,20 @@ class DiffHtmlGenerator:
         )
 
     @classmethod
-    def generate_html_report(cls, diff_output: str, session_id: str = "", lazy_load: bool = True) -> str:
+    def generate_html_report(
+        cls,
+        diff_output: str,
+        session_id: str = "",
+        lazy_load: bool = True,
+        default_view: str = "unified",
+    ) -> str:
         """生成完整的 HTML diff 报告
 
         Args:
             diff_output: diff 文本
             session_id: 会话 ID
             lazy_load: 是否启用懒加载（启用后只渲染前3个文件，后续滚动加载）
+            default_view: 默认视图模式（"unified" 统一直列 / "split" 并排对比）
         """
         if diff_output is None:
             diff_output = ""
@@ -601,7 +655,7 @@ class DiffHtmlGenerator:
 
             # 只预渲染前 preload_count 个文件
             if i < preload_count:
-                file_blocks_html += cls._generate_file_block(file_info, file_id, i)
+                file_blocks_html += cls._generate_file_block(file_info, file_id, i, default_view)
 
         # 为懒加载文件创建占位块（用于 IntersectionObserver 触发自动加载）
         if lazy_load:
@@ -618,6 +672,11 @@ class DiffHtmlGenerator:
                 <p>当前会话没有修改任何文件，或所有文件已恢复到原始状态</p>
             </div>
             """
+
+        # 视图切换按钮初始 active 态（与 default_view 对齐，与 _file_block
+        # 的 data-view display 静态控制一致，避免"按钮状态与实际显示不一致"）
+        split_on = "active" if default_view == "split" else ""
+        unified_on = "active" if default_view != "split" else ""
 
         # 生成完整 HTML
         html = f"""<!DOCTYPE html>
@@ -655,6 +714,15 @@ class DiffHtmlGenerator:
             </div>
         </div>
 
+        <div class="view-bar">
+            <div class="view-tgl">
+                <button class="{split_on}" id="btn-split" onclick="switchView('split')">并排对比</button>
+                <button class="{unified_on}" id="btn-unified" onclick="switchView('unified')">统一直列</button>
+            </div>
+            <span class="spacer"></span>
+            <span class="view-hint">点击文件路径可在编辑器中打开</span>
+        </div>
+
         <div class="diff-content" id="diff-content">
             {file_blocks_html}
         </div>
@@ -665,6 +733,32 @@ class DiffHtmlGenerator:
         window._diffFiles = {files_json};
         window._loadedFiles = new Set({list(range(preload_count))});
         window._preloadCount = {preload_count};
+        // 默认视图（"unified" 统一直列 / "split" 并排对比）
+        window._cv = {json.dumps(default_view)};
+
+        // 🐛 修复：预加载文件块不走 loadFile → applyView 路径（Python 端已按
+        // default_view 控制初始 display），此处再兜底一次：懒加载占位块虽无
+        // [data-view] 子元素（applyView 无操作），但保证任何遗漏块都被纠正到
+        // 默认视图，杜绝"默认统一直列却显示并排"。
+        document.querySelectorAll('.file-block').forEach(function(b){{applyView(b);}});
+
+        // 视图切换：根据每个 [data-view] 子元素的 data-view 与 window._cv
+        // 比较，控制 display。预加载块初始即按 default_view 正确渲染，
+        // 此函数仅在用户切换视图时被调用。
+        function applyView(c){{
+            var v = window._cv;
+            c.querySelectorAll('[data-view]').forEach(function(t){{
+                t.style.display = t.getAttribute('data-view') === v ? '' : 'none';
+            }});
+        }}
+
+        function switchView(v){{
+            window._cv = v;
+            document.querySelectorAll('.view-tgl button').forEach(function(b){{b.classList.remove('active');}});
+            var btn = document.getElementById(v === 'split' ? 'btn-split' : 'btn-unified');
+            if (btn) btn.classList.add('active');
+            document.querySelectorAll('.file-block').forEach(function(b){{applyView(b);}});
+        }}
 
         // HTML转义函数
         function escapeHtml(text) {{
@@ -824,7 +918,11 @@ class DiffHtmlGenerator:
                 <div class="file-stats">${{addStat}}${{delStat}}</div>
             </div>`;
             const rowsHtml = generateDiffRowsHtml(fileInfo.lines);
-            return headerHtml + `<div class="diff-table">${{rowsHtml}}</div>`;
+            // 🐛 修复：懒加载块首帧即按当前视图渲染（与 Python 端 _generate_file_block 一致），
+            // 避免先显示 split 再被 applyView 纠正的闪帧。
+            return headerHtml +
+                `<div class="diff-unified" data-view="unified" style="display:${{window._cv==='unified'?'':'none'}}"><div class="diff-table">${{rowsHtml}}</div></div>` +
+                `<div class="diff-split" data-view="split" style="display:${{window._cv==='split'?'':'none'}}"><div class="diff-table">${{rowsHtml}}</div></div>`;
         }}
 
         function loadFileContent(fileId, index) {{
@@ -1381,16 +1479,42 @@ class DiffHtmlGenerator:
         return diff_rows_html
 
     @classmethod
-    def _generate_file_block(cls, file_info: Dict, file_id: str, index: int) -> str:
-        """生成文件块 HTML（包含头部和内容）"""
+    def _generate_file_block(
+        cls,
+        file_info: Dict,
+        file_id: str,
+        index: int,
+        default_view: str = "unified",
+    ) -> str:
+        """生成文件块 HTML（包含头部和内容）
+
+        Args:
+            file_info: 文件 diff 信息
+            file_id: 文件块 DOM ID
+            index: 文件索引
+            default_view: 默认视图模式（"unified" / "split"），控制 [data-view]
+                子元素的初始 display，避免默认进入并排视图的视觉错位
+        """
         header_html = cls._generate_file_block_header(file_info, file_id)
         rows_html = cls._generate_file_block_rows(file_info)
+
+        # 预加载块不走 JS loadFile → applyView 路径，按 default_view 静态决定
+        # unified/split 初始 display，杜绝"默认进入并排"问题。
+        unified_disp = "" if default_view == "unified" else "none"
+        split_disp = "" if default_view == "split" else "none"
 
         return f'''
         <div class="file-block" id="{file_id}">
             {header_html}
-            <div class="diff-table">
-                {rows_html}
+            <div class="diff-unified" data-view="unified" style="display:{unified_disp}">
+                <div class="diff-table">
+                    {rows_html}
+                </div>
+            </div>
+            <div class="diff-split" data-view="split" style="display:{split_disp}">
+                <div class="diff-table">
+                    {rows_html}
+                </div>
             </div>
         </div>
         '''

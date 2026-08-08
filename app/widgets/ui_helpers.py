@@ -699,6 +699,11 @@ def build_node_preview_data(messages: list, content_getter: Optional[Callable] =
 
     for msg in messages:
         if msg.get("role") == "user":
+            # 🛡️ 非 TeamMail 的 hook 消息（系统注入，非用户真实提问）不生成节点：
+            # current_user_msg 保持前一个真实 user，避免 hook 内容出现在时间线节点。
+            # TeamMail（团队任务邮件）是用户可见消息，照常生成。
+            if msg.get("_hook_event") and msg.get("_hook_event") != "TeamMail":
+                continue
             content = content_getter(msg.get("content", ""))[:max_len]
             current_user_msg = content
         elif msg.get("role") == "assistant" and current_user_msg:
@@ -1938,3 +1943,24 @@ class TitleEditWidget(QWidget):
         elided = fm.elidedText(self._full_text, Qt.ElideRight, self._label.width())
         if elided != self._label.text():
             self._label.setText(elided)
+
+
+# 预编译 hook 内容格式正则（与 message_content.py 中的 _is_hook_message 保持一致）
+_HOOK_CONTENT_PATTERN = re.compile(
+    r"<system-reminder>\s*<[a-z0-9-]+-hook>.*?</[a-z0-9-]+-hook>\s*</system-reminder>", re.DOTALL
+)
+
+
+def _is_hook_message_ui(msg: dict) -> bool:
+    """判断消息是否为 hook 内部通知消息（UI 层兜底检查）
+
+    与 message_content._is_hook_message 保持逻辑一致，
+    用于渲染路径的防御性检查（正常情况下 batch 已被 group_messages_for_display 过滤）。
+    TeamMail 标记放行（团队邮件是用户可见消息，非 hook 内部通知）。
+    """
+    if msg.get("_hook_event") and msg.get("_hook_event") != "TeamMail":
+        return True
+    content = msg.get("content", "")
+    if isinstance(content, str) and _HOOK_CONTENT_PATTERN.search(content):
+        return True
+    return False

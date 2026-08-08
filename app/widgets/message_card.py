@@ -16,6 +16,7 @@ MessageCard - 消息卡片组件
 - tool_call_id: str         # 工具结果关联 ID
 """
 import base64
+import concurrent.futures
 import hashlib
 import math
 import os
@@ -23,12 +24,15 @@ import random
 import re
 import shiboken6
 import sys
+import threading
 import time
 import urllib.parse
+import weakref
+from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
 from html import escape, unescape
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import orjson as json
 from loguru import logger
@@ -119,6 +123,19 @@ _TOOL_RESULT_PATTERN = re.compile(r"^result:\s*(.*)$", re.MULTILINE)
 _NEXT_FIELD_PATTERN = re.compile(r"\n\w+:")
 # 性能优化：正则提取后备方案使用的预编译模式
 _EXTRACT_KEY_VALUE_PATTERN = re.compile(r'"([^"\\]+)"\s*:\s*"([^"]*)"', re.DOTALL)
+
+# ======== B3：渲染线程池（md.convert 等纯计算移出主线程） ========
+# 线程池 worker 只做纯 CPU 渲染（sanitize→inject→md.convert→wrap→resolve），
+# 不触碰任何 Qt 对象；结果通过 Future 回调 + Qt 信号回主线程应用。
+# 独立 2 worker：与 _SHARED_TOOL_POOL（工具执行）隔离，避免互相饿死。
+_RENDER_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="md_render",
+)
+# 线程局部：每线程私有 Markdown 实例 + formatter。
+# 不得用全局 _md_instance / _FORMATTER_CACHE / set_pygments_style 跨线程
+# （Markdown.reset() 与 HtmlFormatter 均非线程安全）。
+_render_tls = threading.local()
 
 # ======== 欢迎卡片随机 Tips ========
 WELCOME_TIPS = [
@@ -297,6 +314,65 @@ def _get_think_icon_html(size: int = 18) -> str:
         prefix = "qrc:/icons"
     style = f"width:{size}px;height:{size}px;vertical-align:middle;pointer-events:none;"
     return f'<img src="{prefix}/思考过程.svg" style="{style}" />'
+
+
+# 流式模式追加的字符统计 HTML 标记，用于 finish_streaming 时移除
+_CHAR_COUNT_HTML = '<div id="char-count" style="color: var(--text-muted); font-size: 11px; margin-top: 12px; text-align: right; opacity: 0.7;"></div>'
+
+# ── 流式活动坞（Streaming Dock）骨架资产 ──
+# 简洁模式下流式期间：#tool-section 从卡片顶部沉到底部并限高 ~3-4 行，
+# 让用户实时看到正在执行的工具/思考；流式结束后归位顶部恢复现状。
+# 由 _sync_streaming_dock 注入 _setStreamingDock(true/false) 切换。
+_STREAMING_DOCK_CSS = """
+                /* ── 流式活动坞：简洁模式流式期间工具区沉底 + 限高 ──
+                   纯 CSS order 调换，不搬移 DOM，避免闪烁。 */
+                body.streaming-dock {
+                    display: flex;
+                    flex-direction: column;
+                    overflow-anchor: auto;
+                }
+                body.streaming-dock #content-placeholder {
+                    order: 1;
+                }
+                body.streaming-dock #tool-section {
+                    order: 2;
+                    margin: 8px 0 0 0;
+                }
+                /* 坞态限高：≈3-4 行条目（行高约 26px + 上下 padding） */
+                body.streaming-dock #tool-content {
+                    max-height: 110px;
+                }
+"""
+
+_STREAMING_DOCK_JS = """
+                // ===== 流式活动坞（Streaming Dock）=====
+                window._streamingActive = false;
+                function _setStreamingDock(active) {
+                    // 仅简洁模式启用坞态
+                    var on = !!active && !!window._toolCompactMode;
+                    var wasOn = document.body.classList.contains('streaming-dock');
+                    window._streamingActive = !!active;
+                    if (on === wasOn) return;
+                    var ts = document.getElementById('tool-section');
+                    // 切换前记录工具区高度与用户是否在底部，用于阅读位置补偿
+                    var _dockH = ts ? ts.offsetHeight : 0;
+                    var _atBottom = Math.abs(document.body.scrollHeight - document.body.scrollTop - document.body.clientHeight) < 40;
+                    document.body.classList.toggle('streaming-dock', on);
+                    if (!on && wasOn) {
+                        // 坞态 → 归位顶部：正文整体下移 ≈ 工具区高度
+                        if (!_atBottom && _dockH > 0) {
+                            document.body.scrollTop = document.body.scrollTop + _dockH;
+                        }
+                        var tc = document.getElementById('tool-content');
+                        if (tc) { tc._userScrolledUp = false; tc.scrollTop = tc.scrollHeight; }
+                    } else if (on && !wasOn) {
+                        if (!_atBottom && _dockH > 0) {
+                            document.body.scrollTop = Math.max(0, document.body.scrollTop - _dockH);
+                        }
+                    }
+                    if (typeof reportHeightDebounced === 'function') reportHeightDebounced();
+                }
+"""
 
 
 def _has_unclosed_think(text: str) -> bool:
@@ -699,7 +775,24 @@ def _strip_code_blocks(text: str) -> str:
 
 
 # ======== 核心逻辑：保留你的原始代码块样式 ========
-def _wrap_code_blocks_with_copy_button_web(html: str) -> str:
+def _wrap_code_blocks_with_copy_button_web(
+    html: str,
+    icon_prefix: str = None,
+    font_size: int = None,
+    formatter: object = None,
+) -> str:
+    """包裹代码块为带复制按钮的容器。
+
+    Args:
+        html: markdown 渲染后的 HTML
+        icon_prefix: 图标前缀（None=用全局 _ICON_PREFIX_CACHE，主线程默认）
+        font_size: 代码字号（None=用全局 _CODE_FONT_SIZE，主线程默认）
+        formatter: Pygments formatter（None=用全局缓存 formatter，主线程默认；
+                   B3 线程池 worker 必须传入线程局部 formatter，避免跨线程共享）
+    """
+    _icon_prefix = icon_prefix if icon_prefix is not None else _ICON_PREFIX_CACHE
+    _font_size = font_size if font_size is not None else _CODE_FONT_SIZE
+
     def replacer(match):
         lang = (match.group(1) or "").replace("language-", "").strip()
         code_content_raw = match.group(2) or ""
@@ -769,15 +862,9 @@ def _wrap_code_blocks_with_copy_button_web(html: str) -> str:
 
         # 高亮代码（获取 <pre> 内部 HTML）
         try:
-            lexer = get_lexer_by_name(lang, stripall=False) if lang else TextLexer()
-            formatter = HtmlFormatter(
-                style="dracula",
-                linenos=False,
-                noclasses=True,
-                cssclass="code-block",
-                prestyles="margin:0; padding:0; background:transparent; font-family: Consolas, monospace; font-size:{scale_font_size(13)}px; color:#D4D4D4;",
-            )
-            highlighted = highlight(copy_text, lexer, formatter)
+            lexer = _get_lexer_cached(lang) if lang else TextLexer()
+            _fmt = formatter if formatter is not None else _get_formatter_cached()
+            highlighted = highlight(copy_text, lexer, _fmt)
             # 提取 <pre> 内部内容
             pre_match = _PRE_CONTENT_PATTERN.search(highlighted)
             if pre_match:
@@ -810,7 +897,7 @@ def _wrap_code_blocks_with_copy_button_web(html: str) -> str:
             box-shadow: 0 4px 12px rgba(0,0,0,0.18), 0 1px 3px rgba(0,0,0,0.2);
             backdrop-filter: blur(8px);
             font-family: Consolas, monospace;
-            font-size: {scale_font_size(13)}px;
+            font-size: {_font_size}px;
         ">
             <!-- 顶部工具栏区域 -->
             <div style="
@@ -818,13 +905,13 @@ def _wrap_code_blocks_with_copy_button_web(html: str) -> str:
                 padding: 6px 10px; height: 30px; background: rgba(255, 255, 255, 0.03);
                 border-bottom: 1px solid var(--code-border, rgba(45, 45, 57, 0.5)); border-radius: 10px 10px 0 0;
             ">
-                {f'<span style="color: #FFA500; font-size: {scale_font_size(13)}px; font-weight: bold;">{lang}</span>' if lang else '<span style="color: #888;">Plain Text</span>'}
+                {f'<span style="color: #FFA500; font-size: {_font_size}px; font-weight: bold;">{lang}</span>' if lang else '<span style="color: #888;">Plain Text</span>'}
                 <div style="display: flex; gap: 12px; align-items: center; padding-right: 4px;">
                     <button type="button" data-action="save_file" data-lang="{lang}" data-copy="{b64_copy}" class="code-btn" data-tooltip="保存本地文件" style="width: 30px; height: 30px; background: transparent; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; border-radius: 6px;">
-                        <img src="qrc:/icons/导入.svg" style="width:22px; height:22px; pointer-events: none;" />
+                        <img src="{_icon_prefix}/导入.svg" style="width:22px; height:22px; pointer-events: none;" />
                     </button>
                     <button type="button" data-action="copy" data-copy="{b64_copy}" class="code-btn" data-tooltip="复制代码" style="width: 30px; height: 30px; background: transparent; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; border-radius: 6px;">
-                        <img src="qrc:/icons/复制.svg" style="width:22px; height:22px; pointer-events: none;" />
+                        <img src="{_icon_prefix}/复制.svg" style="width:22px; height:22px; pointer-events: none;" />
                     </button>
                 </div>
             </div>
@@ -1982,7 +2069,7 @@ def _inject_hook_blocks(md_text: str, completed: bool = True) -> str:
 _LRU_CACHE_SIZE_THRESHOLD = 50 * 1024  # 50KB
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=16)
 def _render_markdown_to_html_cached_impl(raw_md: str, reasoning: str) -> str:
     """
     Markdown 转 HTML 的核心渲染函数（带 LRU 缓存）。
@@ -2354,6 +2441,14 @@ class CodeWebViewer(QWebEngineView):
 
         # 思考已完成标志：工具调用开始时置 True，阻止 _render_markdown_to_html 继续剥离 </think>
         self._thinking_finalized = False
+        # 文本流式思考标志：text 块中包含 <think> 标签时的静默累积策略
+        # （append_text 守卫用：think 未闭合期间静默累积，闭合后才增量注入）
+        self._think_text_streaming_started = False
+
+        # [B4-强回收] renderer 进程 PID（强回收层 kill 离屏进程用；0 = 未就绪/已清理）
+        self._renderer_pid: int = 0
+        # [B3] 连接线程池渲染完成信号（worker 线程 emit → 本槽在主线程执行）
+        self.renderDone.connect(self._on_render_done_signal)
 
         # 1. 渲染定时器
         self._render_timer = QTimer(self)
@@ -3489,11 +3584,128 @@ class CodeWebViewer(QWebEngineView):
                 #content-placeholder img {{
                     cursor: pointer;
                 }}
+                /* 工具/思考区域 - 高度自适应 + 可折叠（正文上方，背景+边框区分） */
+                /* ── 性能优化：contain: layout paint 让浏览器把此容器视为独立渲染作用域，
+                   父布局变化不会让其子树重排 ── */
+                #tool-section {{
+                    margin: 0 0 8px 0;
+                    contain: layout paint;
+                }}
+                #tool-separator {{
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    font-size: 11px;
+                    color: var(--text-muted);
+                    user-select: none;
+                    padding: 2px 2px 6px 2px;
+                    cursor: pointer;
+                    border-radius: 4px;
+                    transition: background-color 120ms ease;
+                }}
+                #tool-separator:hover {{
+                    background: var(--panel-soft);
+                }}
+                /* 自绘 tooltip：hover 时在分隔条下方显示说明 */
+                #tool-separator {{
+                    position: relative;
+                }}
+                .tool-separator-tooltip {{
+                    position: absolute;
+                    left: 50%;
+                    top: 100%;
+                    transform: translateX(-50%);
+                    margin-top: 6px;
+                    white-space: nowrap;
+                    background: var(--panel, rgba(30,30,32,250));
+                    color: var(--text, #ffffff);
+                    font-size: 11px;
+                    padding: 4px 8px;
+                    border-radius: 6px;
+                    border: 1px solid var(--border, rgba(128,128,128,0.15));
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+                    pointer-events: none;
+                    z-index: 100;
+                    line-height: 1.4;
+                    opacity: 0;
+                    transition: opacity 140ms ease;
+                }}
+                #tool-separator:hover .tool-separator-tooltip {{
+                    opacity: 1;
+                }}
+                #tool-section[data-collapsed="true"] #tool-separator .chevron {{
+                    transform: rotate(-90deg);
+                }}
+                #tool-separator::before,
+                #tool-separator::after {{
+                    content: '';
+                    flex: 1;
+                    height: 1px;
+                    background: var(--border);
+                    opacity: 0.6;
+                }}
+                #tool-separator .chevron {{
+                    display: inline-block;
+                    transition: transform 160ms ease;
+                    font-size: 9px;
+                    opacity: 0.7;
+                }}
+
+                @keyframes _streamingPulse {{
+                    0%, 100% {{ opacity: 0.3; transform: scale(0.85); }}
+                    50% {{ opacity: 1; transform: scale(1.1); }}
+                }}
+                #tool-content {{
+                    max-height: 600px;
+                    overflow-y: auto;
+                    overflow-anchor: none;
+                    background: transparent;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 2px 4px;
+                    transition: max-height 200ms ease, opacity 160ms ease;
+                }}
+                #tool-section[data-collapsed="true"] #tool-content {{
+                    max-height: 0;
+                    opacity: 0;
+                    padding-top: 0;
+                    padding-bottom: 0;
+                    overflow: hidden;
+                }}
+                @keyframes _toolBlockEnter {{
+                    from {{ opacity: 0; transform: translateY(4px); }}
+                    to {{ opacity: 1; transform: translateY(0); }}
+                }}
+                #tool-content > .tool-block:not([data-tool-call-id]):not([data-restored]),
+                #tool-content > .think-block:not([data-restored]),
+                #tool-content > .think-streaming:not([data-restored]) {{
+                    animation: _toolBlockEnter 160ms ease-out;
+                }}
+                #tool-content > .tool-block:first-child,
+                #tool-content > .think-block:first-child,
+                #tool-content > .think-streaming:first-child {{
+                    margin-top: 0;
+                }}
+                #tool-content > .tool-block:last-child,
+                #tool-content > .think-block:last-child,
+                #tool-content > .think-streaming:last-child {{
+                    margin-bottom: 0;
+                }}
+                {_STREAMING_DOCK_CSS}
             </style>
         </head>
         <body>
+            <div id="tool-section" style="display: none;" data-collapsed="false">
+              <div id="tool-separator" role="button" tabindex="0" aria-expanded="true">
+                <span class="chevron">▾</span>
+                <span>⚙ 工具与思考</span>
+                <span class="tool-separator-tooltip">点击折叠/展开工具与思考区</span>
+              </div>
+              <div id="tool-content"></div>
+            </div>
             <div id="content-placeholder"></div>
             <script>
+                {_STREAMING_DOCK_JS}
                 const collapsibleState = new Map();
 
                 function syncExpandedAttrs(block, expanded) {{
@@ -3723,6 +3935,15 @@ class CodeWebViewer(QWebEngineView):
 
                         // 使用延迟报告，确保折叠框高度设为 auto 后浏览器布局完成
                         setTimeout(() => reportHeight(), 50);
+
+                        // 工具/思考区迁移与排序（工具块从正文搬到独立容器）。
+                        // 流式中有进行中的工具块（data-streaming=true）时跳过淡入动画
+                        // 与排序（由 save/restore 与 append_tool_result 增量维护），
+                        // 避免与 JS 注入的运行框冲突。
+                        if (window._toolCompactMode) {{
+                            var _hasStreaming = !!document.querySelector('#tool-content [data-streaming="true"]');
+                            if (!_hasStreaming) reorganizeContent();
+                        }}
                     }}
                 }}
                 function reportHeight() {{
@@ -3745,7 +3966,335 @@ class CodeWebViewer(QWebEngineView):
                         _heightReportPending = false;
                     }});
                 }}
+                // 简洁模式标志：由 Python 在 _load_skeleton 后通过 JS 同步更新
+                window._toolCompactMode = true;
+
+                // ===== 正文/非正文分区：将工具块/思考块从内容区移到独立可滚动容器 =====
+                // 编辑类工具保留在正文中，不迁移到"工具与思考"区域；
+                // 子智能体/提问类工具与编辑工具类似，留在正文更连贯。
+                var _EDIT_TOOLS_SELECTOR = ':not([data-tool-name="write"]):not([data-tool-name="edit"]):not([data-tool-name="multi_edit"]):not([data-tool-name="subagent_para"]):not([data-tool-name="subagent_dag"]):not([data-tool-name="question"])';
+
+                // ===== 工具区（#tool-content）自动滚底 =====
+                function _scrollToolContentToBottom(force) {{
+                    var tc = document.getElementById('tool-content');
+                    if (!tc) return;
+                    if (tc._userScrolledUp && !force) return;
+                    tc.scrollTop = tc.scrollHeight;
+                    if (force) tc._userScrolledUp = false;
+                }}
+                document.getElementById('tool-content')?.addEventListener('scroll', function() {{
+                    var tc = this;
+                    var atBottom = Math.abs(tc.scrollHeight - tc.scrollTop - tc.clientHeight) < 30;
+                    tc._userScrolledUp = !atBottom;
+                    if (atBottom) tc._userScrolledUp = false;
+                }});
+
+                // ===== 深度思考轮播提示（减少等待焦虑）=====
+                const _thinkTips = [
+                    "正在深度思考中...", "分析上下文关联...", "检索相关知识库...",
+                    "正在综合推理...", "组织回答结构...", "即将输出结果...",
+                    "梳理关键信息...", "对比多个方案...", "校验逻辑完整性...",
+                    "回溯历史消息...", "推理最佳路径...", "整合分析结果...",
+                    "审查边缘场景...", "串联上下文线索...", "构建最终输出...",
+                    "准备呈现答案..."
+                ];
+                let _tipIndex = 0;
+                let _tipTimer = null;
+                function _startTipRotation() {{
+                    _stopTipRotation();
+                    _tipTimer = setInterval(() => {{
+                        const el = document.querySelector('.think-streaming[data-streaming="true"]');
+                        if (!el) {{ _stopTipRotation(); return; }}
+                        const tipSpan = el.querySelector('span > span:last-child');
+                        if (tipSpan) {{
+                            _tipIndex = (_tipIndex + 1) % _thinkTips.length;
+                            tipSpan.textContent = _thinkTips[_tipIndex];
+                        }}
+                    }}, 3500);
+                }}
+                function _stopTipRotation() {{
+                    if (_tipTimer) {{ clearInterval(_tipTimer); _tipTimer = null; }}
+                }}
+                const _tipObserver = new MutationObserver(() => {{
+                    const hasStreaming = !!document.querySelector('.think-streaming[data-streaming="true"]');
+                    if (hasStreaming && !_tipTimer) _startTipRotation();
+                    else if (!hasStreaming && _tipTimer) _stopTipRotation();
+                }});
+                const _tipTarget = document.getElementById('content-placeholder');
+                if (_tipTarget) _tipObserver.observe(_tipTarget, {{ childList: true, subtree: true }});
+                const _tipToolContent = document.getElementById('tool-content');
+                if (_tipToolContent) _tipObserver.observe(_tipToolContent, {{ childList: true, subtree: true }});
+
+                // 更新"工具与思考"标题（总项数，无勾叉 badge）
+                function _updateToolSectionHeader() {{
+                    var toolContent = document.getElementById('tool-content');
+                    var separator = document.getElementById('tool-separator');
+                    if (!separator) return;
+                    var total = toolContent ? toolContent.children.length : 0;
+                    var titleSpan = separator.querySelector(':scope > span:not(.chevron)');
+                    if (titleSpan) {{
+                        titleSpan.textContent = total > 0 ? '⚙ 工具与思考 · ' + total + ' 项' : '⚙ 工具与思考';
+                    }}
+                    var _hasStreaming = document.querySelector('#tool-content [data-streaming="true"]');
+                    var _tsEl2 = document.getElementById('tool-section');
+                    if (_hasStreaming && _tsEl2 && _tsEl2.getAttribute('data-collapsed') === 'true') {{
+                        _tsEl2.setAttribute('data-collapsed', 'false');
+                        separator.setAttribute('aria-expanded', 'true');
+                    }}
+                }}
+
+                function reorganizeContent() {{
+                    var container = document.getElementById('content-placeholder');
+                    var toolSection = document.getElementById('tool-section');
+                    var toolContent = document.getElementById('tool-content');
+                    if (!container || !toolContent || !toolSection) return;
+                    var blocks = container.querySelectorAll(
+                        '.tool-block' + _EDIT_TOOLS_SELECTOR + ', ' +
+                        '.think-block, .think-streaming, .think-compact, ' +
+                        '[data-tool-call-id]' + _EDIT_TOOLS_SELECTOR
+                    );
+                    if (blocks.length === 0) {{
+                        if (toolContent.children.length === 0) {{
+                            toolSection.style.display = 'none';
+                            return;
+                        }}
+                        toolSection.style.display = '';
+                        _updateToolSectionHeader();
+                        if (window._streamingActive && window._toolCompactMode) _scrollToolContentToBottom(true);
+                        return;
+                    }}
+                    // 单次扫描 posMap + thinkKeys + toolIds
+                    var posMap = Object.create(null);
+                    var _currentThinkKeys = new Set();
+                    var _currentToolIds = new Set();
+                    var _hasNewThinkStreaming = false;
+                    var _thinkStreamingEl = null;
+                    var _bi;
+                    for (_bi = 0; _bi < blocks.length; _bi++) {{
+                        var _el = blocks[_bi];
+                        var _bk = _el.getAttribute('data-block-key');
+                        var _tid = _el.getAttribute('data-tool-call-id');
+                        if (_bk) posMap['bk:' + _bk] = _bi;
+                        if (_tid) {{
+                            posMap['tcid:' + _tid] = _bi;
+                            _currentToolIds.add(_tid);
+                        }}
+                        if (_bk && (
+                            _el.classList.contains('think-block')
+                            || _el.classList.contains('think-streaming')
+                            || _el.classList.contains('think-compact')
+                        )) {{
+                            _currentThinkKeys.add(_bk);
+                        }}
+                        if (_el.classList.contains('think-streaming')) {{
+                            _hasNewThinkStreaming = true;
+                            _thinkStreamingEl = _el;
+                        }} else if (!_bk && !_tid) {{
+                            _el._posIdx = _bi;
+                        }}
+                    }}
+                    var _toolKids = toolContent.children;
+                    var _oldThinkStreaming = null;
+                    var _ti;
+                    for (_ti = 0; _ti < _toolKids.length; _ti++) {{
+                        var _tk = _toolKids[_ti];
+                        if (_tk.classList.contains('think-streaming') && !_oldThinkStreaming) _oldThinkStreaming = _tk;
+                    }}
+                    if (!_hasNewThinkStreaming && _oldThinkStreaming) {{
+                        _oldThinkStreaming.remove();
+                        _oldThinkStreaming = null;
+                    }}
+                    // 过期 think/tool 清理
+                    var _existingKids = Array.prototype.slice.call(toolContent.children);
+                    var _ei;
+                    for (_ei = 0; _ei < _existingKids.length; _ei++) {{
+                        var _eel = _existingKids[_ei];
+                        if (!_eel || !_eel.parentNode) continue;
+                        var _ebk = _eel.getAttribute('data-block-key');
+                        var _etid = _eel.getAttribute('data-tool-call-id');
+                        if (_ebk && !_currentThinkKeys.has(_ebk) && !_etid && (
+                            _eel.classList.contains('think-block') || _eel.classList.contains('think-compact')
+                        )) {{
+                            _eel.remove();
+                            continue;
+                        }}
+                        if (_etid && !_currentToolIds.has(_etid) && _eel.getAttribute('data-streaming') !== 'true' && _eel.classList.contains('tool-block')) {{
+                            _eel.remove();
+                            continue;
+                        }}
+                    }}
+                    // 迁移新块；流式块 replaceChild 原地替换（避免闪烁）
+                    var moved = false;
+                    var _mi;
+                    for (_mi = 0; _mi < blocks.length; _mi++) {{
+                        var _mel = blocks[_mi];
+                        var _mbk = _mel.getAttribute('data-block-key');
+                        var _mtid = _mel.getAttribute('data-tool-call-id');
+                        var _dup = (_mbk && toolContent.querySelector('[data-block-key="' + _mbk + '"]'))
+                                || (_mtid && toolContent.querySelector('[data-tool-call-id="' + _mtid + '"]'));
+                        if (_dup) {{
+                            if (_mel.parentNode === container) _mel.remove();
+                        }} else if (_mel.classList.contains('think-streaming') && _oldThinkStreaming) {{
+                            if (_mel.parentNode === container && _oldThinkStreaming.parentNode) {{
+                                _oldThinkStreaming.parentNode.replaceChild(_mel, _oldThinkStreaming);
+                            }}
+                        }} else if (_mel.parentNode === container) {{
+                            toolContent.appendChild(_mel);
+                            moved = true;
+                        }}
+                    }}
+                    // data-order 补齐 + 流式锚点 floor 修正
+                    var _streamFloors = (window.__pendingStreamFloors || []).slice();
+                    var _allKids = Array.prototype.slice.call(toolContent.children);
+                    var _sf;
+                    for (_sf = 0; _sf < _allKids.length; _sf++) {{
+                        if (_allKids[_sf].getAttribute('data-streaming') === 'true') {{
+                            var _sfOd = parseFloat(_allKids[_sf].getAttribute('data-order'));
+                            if (!isNaN(_sfOd)) _streamFloors.push(Math.floor(_sfOd));
+                        }}
+                    }}
+                    var _assignedDataOrder = false;
+                    var _oa;
+                    for (_oa = 0; _oa < _allKids.length; _oa++) {{
+                        var _oaKid = _allKids[_oa];
+                        if (_oaKid.getAttribute('data-order') !== null) continue;
+                        var _oaBk = _oaKid.getAttribute('data-block-key');
+                        var _oaTid = _oaKid.getAttribute('data-tool-call-id');
+                        var _oaPos = (_oaBk && posMap['bk:' + _oaBk] !== undefined)
+                            ? posMap['bk:' + _oaBk]
+                            : (_oaTid && posMap['tcid:' + _oaTid] !== undefined)
+                                ? posMap['tcid:' + _oaTid]
+                                : null;
+                        if (_oaPos === null) continue;
+                        var _oaBefore = 0;
+                        var _sf2;
+                        for (_sf2 = 0; _sf2 < _streamFloors.length; _sf2++) {{
+                            if (_streamFloors[_sf2] <= _oaPos) _oaBefore++;
+                        }}
+                        _oaKid.setAttribute('data-order', String(_oaPos + _oaBefore));
+                        _assignedDataOrder = true;
+                    }}
+                    // 顺序 diff：键序列未变时跳过 sort
+                    var _curKeys = [];
+                    var _curKids = toolContent.children;
+                    var _ci;
+                    for (_ci = 0; _ci < _curKids.length; _ci++) {{
+                        var _ck = _curKids[_ci];
+                        var _ckbk = _ck.getAttribute('data-block-key');
+                        var _cktid = _ck.getAttribute('data-tool-call-id');
+                        if (_ckbk) _curKeys.push('bk:' + _ckbk);
+                        else if (_cktid) _curKeys.push('tcid:' + _cktid);
+                        else _curKeys.push('idx:' + _ci);
+                    }}
+                    var _lastOrder = toolContent.__lastOrder;
+                    var _orderChanged = _assignedDataOrder || !_lastOrder || _lastOrder.length !== _curKeys.length;
+                    var _di;
+                    if (!_orderChanged) {{
+                        for (_di = 0; _di < _curKeys.length; _di++) {{
+                            if (_curKeys[_di] !== _lastOrder[_di]) {{
+                                _orderChanged = true;
+                                break;
+                            }}
+                        }}
+                    }}
+                    if (_orderChanged) {{
+                        var _sortedChildren = Array.prototype.slice.call(toolContent.children).sort(function(a, b) {{
+                            function getPos(el) {{
+                                // F1：运行中工具块强制沉底（最新活动最下）
+                                if (el.classList && el.classList.contains('tool-streaming-block')) return 1e9;
+                                var od = el.getAttribute('data-order');
+                                if (od !== null) return parseFloat(od);
+                                var bk = el.getAttribute('data-block-key');
+                                var tid = el.getAttribute('data-tool-call-id');
+                                if (bk && posMap['bk:' + bk] !== undefined) return posMap['bk:' + bk];
+                                if (tid && posMap['tcid:' + tid] !== undefined) return posMap['tcid:' + tid];
+                                if (el._posIdx !== undefined) return el._posIdx;
+                                return 1e9;
+                            }}
+                            return getPos(a) - getPos(b);
+                        }});
+                        var _ri;
+                        for (_ri = 0; _ri < _sortedChildren.length; _ri++) {{
+                            toolContent.appendChild(_sortedChildren[_ri]);
+                        }}
+                        toolContent.__lastOrder = _curKeys;
+                    }}
+                    toolSection.style.display = toolContent.children.length > 0 ? '' : 'none';
+                    if (moved || toolContent.children.length > 0) _updateToolSectionHeader();
+                    if (window._streamingActive && window._toolCompactMode) _scrollToolContentToBottom(true);
+                }}
+
+                function updateContentAppend(newHtml) {{
+                    const container = document.getElementById('content-placeholder');
+                    if (!container) return;
+                    container.querySelectorAll('[data-incremental="true"]').forEach(function(el) {{ el.remove(); }});
+                    container.insertAdjacentHTML('beforeend', newHtml);
+                    if (window._toolCompactMode) reorganizeContent();
+                    container.querySelectorAll('table:not(.code-table)').forEach(function(table) {{
+                        if (table.parentNode && table.parentNode.classList.contains('table-scroll-wrapper')) return;
+                        var wrapper = document.createElement('div');
+                        wrapper.className = 'table-scroll-wrapper';
+                        table.parentNode.insertBefore(wrapper, table);
+                        wrapper.appendChild(table);
+                    }});
+                    if (typeof restoreCollapsibleStates === 'function') restoreCollapsibleStates(container);
+                    window._suppressScrollEvent = true;
+                    if (!window._userScrolledWithin) {{
+                        document.body.scrollTop = document.body.scrollHeight;
+                    }} else {{
+                        var _bd = Math.abs(document.body.scrollHeight - document.body.scrollTop - document.body.clientHeight);
+                        if (_bd < {AUTO_SCROLL_THRESHOLD}) {{
+                            document.body.scrollTop = document.body.scrollHeight;
+                            window._userScrolledWithin = false;
+                        }}
+                    }}
+                    window._prevScrollTop = document.body.scrollTop;
+                    window._autoScrollTime = performance.now();
+                    window._suppressScrollEvent = false;
+                    if (window.echarts) {{
+                        container.querySelectorAll('.echarts-container').forEach(function(el) {{
+                            try {{
+                                var jsonB64 = el.getAttribute('data-echarts-json');
+                                if (!jsonB64 || el._echartInited) return;
+                                var _bytes = Uint8Array.from(atob(jsonB64), function(c) {{ return c.charCodeAt(0); }});
+                                var option = JSON.parse(new TextDecoder('utf-8').decode(_bytes));
+                                var chart = echarts.init(el, 'dark');
+                                chart.setOption(option);
+                                el._echartInited = true;
+                                var _ro = new ResizeObserver(function() {{ chart.resize(); }});
+                                _ro.observe(el);
+                            }} catch(e) {{ console.error('ECharts init error:', e); }}
+                        }});
+                    }}
+                    setTimeout(() => reportHeight(), 30);
+                }}
+
+                // 工具与思考区头部折叠/展开
+                function _toggleToolSection(sep, evt) {{
+                    var toolSection = document.getElementById('tool-section');
+                    if (!sep || !toolSection) return;
+                    if (evt) {{ evt.stopPropagation(); evt.preventDefault(); }}
+                    var collapsed = toolSection.getAttribute('data-collapsed') === 'true';
+                    toolSection.setAttribute('data-collapsed', collapsed ? 'false' : 'true');
+                    sep.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+                    try {{ sessionStorage.setItem('_toolSectionCollapsed', collapsed ? '0' : '1'); }} catch(_err) {{}}
+                    var tc = document.getElementById('tool-content');
+                    if (tc) {{
+                        var onEnd = function() {{
+                            tc.removeEventListener('transitionend', onEnd);
+                            reportHeight();
+                        }};
+                        tc.addEventListener('transitionend', onEnd);
+                        setTimeout(function() {{ tc.removeEventListener('transitionend', onEnd); reportHeight(); }}, 260);
+                    }}
+                }}
+
                 document.addEventListener('click', e => {{
+                    const sep = e.target.closest('#tool-separator');
+                    if (sep) {{
+                        _toggleToolSection(sep, e);
+                        return;
+                    }}
                     const btn = e.target.closest('button[data-action]');
                     if (btn) {{
                         const act = btn.getAttribute('data-action');
@@ -4247,9 +4796,42 @@ class CodeWebViewer(QWebEngineView):
 
 
 
-    def finish_streaming(self):
+    def finish_streaming(self, keep_dock: bool = False):
+        """流式结束收尾。
+
+        Args:
+            keep_dock: True 时保留坞态（简洁模式下工具区仍沉底）——流式文本可能
+                先于工具结果结束（S1：dock 归位早于工具完成），此时不应立即归位，
+                等最后一个工具完成时再由 append_tool_result 兜底归位。
+        """
         self._streaming = False
+        # [B1] 流式结束：差量缓存失效（尾部未闭合内容需全量渲染收尾），
+        # 清空稳定区避免差量/全量混合导致重复段落。
+        self._needs_full_render = True
+        self._stable_html = ""
+        self._stable_md_len = 0
+        # [B3] 流式结束：递增渲染序号使在途线程池任务过期；pending 积压清空。
+        self._render_seq += 1
+        self._render_pending = None
+        # [B2] 流式结束：重置工具 DOM 脏标记（防残留脏状态误走整页 save/restore）。
+        self._tool_dom_dirty = False
+        # 流式结束：坞态归位（简洁模式下工具区从底部回到顶部）。
+        # 🆕 F2（S1）：keep_dock=True 时保留坞态——流式文本先于工具结果结束是
+        # 常见时序（工具执行耗时 > 文本流式），立即归位会让用户看到
+        # "工具还在运行但工具区已回顶部"的跳动。归位推迟到最后一个工具完成时。
+        if not keep_dock:
+            self._sync_streaming_dock(False)
+        # 流式结束：清除流式语义缓存 HTML（thinking 渲染成 .think-streaming 无
+        # data-block-key，复用会导致坞态归位时思考块与工具块错序）。
+        self._cached_streaming_html = None
+        self._processed_md_hash = 0
+        self._cached_raw_md_hash = 0
+        self._think_text_streaming_started = False
+        self._reasoning_streaming_started = False
         self._schedule_render(immediate=True)
+        # 🚀 [PERF] 延迟工具区折叠，让 WebEngine 先完成 _schedule_render 的
+        # 布局/绘制后再执行 DOM 属性操作，分离连续 runJavaScript 阻塞。
+        QTimer.singleShot(0, self._auto_collapse_tool_section)
 
     def _cleanup_render_cache(self):
         """清理渲染缓存，降低内存占用（流式完成后调用）"""
@@ -5488,7 +6070,13 @@ class PlainTextViewer(QWidget):
             self.text_edit.document().setTextWidth(vp_width)
         self._schedule_update_height()
 
-    def finish_streaming(self):
+    def finish_streaming(self, keep_dock: bool = False):
+        """流式结束收尾。
+
+        🆕 F4：与 CodeWebViewer.finish_streaming 保持相同签名——MessageCard.
+        finish_streaming 统一以 keep_dock=self._has_active_tools() 调用两个 Viewer。
+        PlainTextViewer 无 dock 概念（用户卡片无工具与思考折叠框），忽略该参数。
+        """
         self._schedule_update_height()
 
     def _schedule_update_height(self):
@@ -5854,6 +6442,9 @@ class MessageCard(SimpleCardWidget):
         # 工具参数首次到达跟踪：每个 tool_call_id 第一次 update_tool_streaming 时
         # 触发"标记当前思考块为完成"，避免 reasoning→tool_call 切换时思考块残留"思考中"
         self._tool_args_first_seen_ids: set = set()
+        # 工具调用启动序号：tool_call_id → 递增序号（同锚点工具按调用序细分，
+        # _has_active_tools / 归位判定 / data-order 基准用）
+        self._tool_call_order: Dict[str, int] = {}
         self._pending_content: Optional[str] = None
         self._reasoning_total_len = 0  # reasoning 内容总长度计数器，避免每次遍历
         self._viewer_container = QWidget(self)
@@ -6356,6 +6947,9 @@ class MessageCard(SimpleCardWidget):
             return
         self._streaming = True
         self._pulse_phase = 0.0
+        # 流式开始：开启坞态（简洁模式下工具区沉底，实时展示执行中的工具/思考）
+        if self.viewer and hasattr(self.viewer, "_sync_streaming_dock"):
+            self.viewer._sync_streaming_dock(True)
         try:
             self._anim_timer.start(50)  # 80→50ms，帧率从12.5fps提升到20fps
         except RuntimeError:
@@ -6982,6 +7576,11 @@ class MessageCard(SimpleCardWidget):
 
             self.viewer = CodeWebViewer(self)
             self.viewer._lazy_markdown_cb = lambda: content_to_markdown(self._content_data)
+            # 标记是否为历史会话：非流式加载的历史消息自动折叠工具区
+            self.viewer._is_history = not self._streaming
+            # 让 viewer 的 restore 逻辑知道哪些工具结果已到达，
+            # 避免全量重渲染时把已完成的运行框以“运行中”状态复活。
+            self.viewer._restore_finished_ids = self._finished_streaming_ids
             self.viewer.codeActionRequested.connect(self.actionRequested.emit)
             self.viewer.contextActionRequested.connect(self.contextActionRequested.emit)
             self.viewer.contentHeightChanged.connect(self._update_height)
@@ -7042,11 +7641,31 @@ class MessageCard(SimpleCardWidget):
             # 性能优化：不立即执行 content_to_markdown，设懒回调让 _perform_update
             # 在渲染定时器到期时执行（多个 chunk 在窗口期内只转换一次，避免白费）
             self.viewer._lazy_markdown_cb = lambda: content_to_markdown(self._content_data)
-            # 流式模式下增量追加纯文本到 DOM，让用户立即看到文字
-            if self._streaming:
+            # 🆕 检测未闭合  thinking 标签：静默累积不触发增量渲染，与 append_reasoning
+            # 策略一致——避免思考文本逐行以普通正文注入 #content-placeholder 堆叠成
+            # 高块，待  response 闭合后才折叠成 think-compact（高块闪现后消失）。
+            last_block = self._content_data[-1] if self._content_data else None
+            last_text = last_block.get("text", "") if isinstance(last_block, dict) else ""
+            _think_unclosed = _has_unclosed_think(last_text)
+            # 流式模式下增量追加纯文本到 DOM，让用户立即看到文字。
+            # think 未闭合期间**不**调用 _append_text_incremental（静默累积、仅靠全量
+            # 渲染落地）；think 已闭合 / 无 think 标签时保持原有增量注入行为不变。
+            if self._streaming and not _think_unclosed:
                 self.viewer._append_text_incremental(text)
-            self.viewer._schedule_render(immediate=False)
+            if _think_unclosed:
+                # 首 chunk：立即渲染一次显示"深度思考中..." spinner
+                if not self.viewer._think_text_streaming_started:
+                    self.viewer._think_text_streaming_started = True
+                    self.viewer._thinking_finalized = False
+                    self.viewer._schedule_render(immediate=True)
+                # 后续 chunk：静默累积，不触发防御性渲染
+                self.viewer._schedule_render(immediate=False)
+                self._content_just_loaded = True
+                return
+            #  thinking 已闭合或无 think 标签：恢复正常渲染
+            self.viewer._think_text_streaming_started = False
             self._content_just_loaded = True
+            self.viewer._schedule_render(immediate=False)
             return
 
         self._content_data = str(self._content_data or "") + str(text or "")
@@ -7083,6 +7702,14 @@ class MessageCard(SimpleCardWidget):
         if not self._lazy_rendered or not self.viewer:
             self._pending_content = self._content_data
             return
+        # 🐛 就近恢复 viewer 流式模式：finish_streaming 后 viewer._streaming=False，
+        # 但工具结果可能在新一轮流式开始后才到达。先恢复再更新 callback，
+        # 与 start_streaming_anim 中的恢复形成双重保险。
+        if self.viewer and not self.viewer._streaming:
+            self.viewer._streaming = True
+        # 同步已完成工具集合给 viewer，供 restore 逻辑判断运行框是否可复活
+        if self.viewer:
+            self.viewer._restore_finished_ids = self._finished_streaming_ids
         # 增量注入：直接通过 JS 追加工具块 HTML，跳过全量 markdown 重建
         # 避免 content_to_markdown() 遍历全部 content_data 持有 GIL 导致拖动卡顿
         try:
@@ -7207,6 +7834,28 @@ class MessageCard(SimpleCardWidget):
             self.viewer.page().runJavaScript(js_code)
         except Exception as e:
             logger.warning(f"增量工具块注入失败: {e}")
+        # 🆕 F2（S1 归位兜底）：最后一个工具完成时关闭坞态。
+        # 流式文本可能先于工具结果结束（finish_streaming(keep_dock=True) 保留了坞态），
+        # 此处是归位时机：所有已登记工具都完成 → 工具区从坞态沉底回到顶部。
+        # ⚠️ 必须 hasattr 守卫：stub viewer（测试桩）无 _sync_streaming_dock 方法。
+        # 🐛 归位判据必须用 MessageCard 层 self._streaming（viewer 层状态可能被
+        # 恢复逻辑污染）；lambda 捕获动态判空——0ms 内 viewer 被 cleanup 置 None
+        # 时避免 AttributeError。
+        try:
+            if (
+                self.viewer is not None
+                and hasattr(self.viewer, "_sync_streaming_dock")
+                and not self._streaming
+                and not self._has_active_tools()
+            ):
+                QTimer.singleShot(
+                    0,
+                    lambda: self.viewer._sync_streaming_dock(False)
+                    if self.viewer is not None
+                    else None,
+                )
+        except Exception:
+            pass
 
     def _copy_user_message(self):
         """用户卡片工具栏「复制」：直接复制全文，不走 actionRequested 信号链
@@ -7488,6 +8137,9 @@ class MessageCard(SimpleCardWidget):
         # 已完成参数接收或已追加工具结果的不再更新，防止完成态被退回 streaming 状态
         if tool_call_id in self._finished_streaming_ids:
             return
+        # 🆕 登记工具启动序号（_has_active_tools 归位判据 / data-order 基准用）
+        if tool_call_id not in self._tool_call_order:
+            self._tool_call_order[tool_call_id] = len(self._tool_call_order)
         # 🆕 第一次工具参数到达时，标记当前思考块为完成态（💡）
         # 修复 bug：reasoning 流结束 → tool_call 开始时，思考块 DOM 还显示"思考中"
         self._maybe_finish_thinking_for_tool(tool_call_id)
@@ -7680,7 +8332,9 @@ class MessageCard(SimpleCardWidget):
     def finish_streaming(self):
         try:
             if self.viewer is not None and hasattr(self.viewer, 'finish_streaming'):
-                self.viewer.finish_streaming()
+                # 流式文本可能先于工具结果结束（S1）→ 还有工具在运行则保留坞态，
+                # 等最后一个工具完成时由 append_tool_result 兜底归位。
+                self.viewer.finish_streaming(keep_dock=self._has_active_tools())
                 if hasattr(self.viewer, '_cleanup_render_cache'):
                     self.viewer._cleanup_render_cache()
         except RuntimeError:
@@ -7754,6 +8408,9 @@ class MessageCard(SimpleCardWidget):
         self._pending_content = None  # 待渲染内容
         self._finished_streaming_ids.clear()  # 流式 ID 集合
         self._tool_args_first_seen_ids.clear()
+        # 工具启动序号清空：cleanup 后 _has_active_tools() 若被误调，
+        # 残留登记会误判"仍有活跃工具"导致 dock 归位逻辑失效
+        self._tool_call_order.clear()
 
         # 清理 markdown_cache 如果存在
         if hasattr(self, '_markdown_cache') and self._markdown_cache:

@@ -8,8 +8,11 @@
 
 提供同步和后台两种执行模式。
 """
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -17,8 +20,263 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
+from loguru import logger
 from app.tools.result import ToolResult
 from app.tools.command_safety import needs_shell, classify_command, run_safe, run_with_shell
+
+
+# ── findstr 管道符修复 ────────────────────────────────────────────────
+# Windows cmd.exe 即使在双引号内也会把 | 当管道解析，导致
+# findstr /n "pattern1|pattern2" 静默失败。自动转换为 /c: 语法。
+
+
+def _fix_findstr_pipe(command: str) -> str:
+    """将 findstr 正则中的 | 转换为 /c: 语法，避免被 cmd.exe 当管道。
+
+    findstr /n "mousePressEvent|mouseReleaseEvent" file
+    → findstr /n /c:"mousePressEvent" /c:"mouseReleaseEvent" file
+
+    注意：re.search 而非 re.match，以支持管道和复合命令中的 findstr。
+    正则支持 \\" 转义引号，避免遇到 \\"elapsed\\" 时提前截断。
+    """
+    if sys.platform != "win32":
+        return command
+
+    # 如果命令已包含 /c: 语法，跳过避免双重转换
+    if "/c:" in command:
+        return command
+
+    # 匹配 findstr [flags] "pattern" — 支持 \" 转义引号
+    FINDSTR_RE = re.compile(r'(findstr\s+(?:\S+\s+)*)"((?:[^"\\]|\\.)*)"', re.IGNORECASE)
+    m = FINDSTR_RE.search(command)
+    if not m:
+        return command
+
+    prefix = command[: m.start(1)] + m.group(1)  # 含 findstr 标志
+    pattern = m.group(2)                          # "error|warning"
+    suffix = command[m.end():]                    # 剩余部分
+
+    if "|" not in pattern:
+        return command
+
+    parts = pattern.split("|")
+    # cmd.exe 中双引号内 " 需要写成 "" ，重建 /c:"..." 时做转义
+    def _cmd_escape(s: str) -> str:
+        return s.replace('"', '""')
+
+    rebuilt = prefix.rstrip() + " " + " ".join(f'/c:"{_cmd_escape(p)}"' for p in parts) + suffix
+    logger.debug(f"[Bash] findstr pipe fix: {command[:80]}... → {rebuilt[:80]}...")
+    return rebuilt
+
+
+# ── 内联脚本自动转临时文件 ──────────────────────────────────────────────
+# Windows cmd 无法可靠处理多行/嵌套引号的 python -c "..." 等内联脚本，
+# 自动将其写入临时文件再执行，对所有解释器通用。
+
+_INTERPRETERS = frozenset({"python", "python3", "node", "ruby", "perl", "php"})
+_SCRIPT_FLAGS = frozenset({"-c", "-e"})
+_SCRIPT_EXT = {
+    "python": ".py",
+    "python3": ".py",
+    "node": ".js",
+    "ruby": ".rb",
+    "perl": ".pl",
+    "php": ".php",
+}
+
+
+def _parse_inline_script(command: str) -> Optional[dict]:
+    """
+    解析内联脚本命令，返回 {interpreter, flag, script, rest}。
+
+    逐字符扫描寻找匹配的引号，正确处理 \\" 转义。
+    仅当命令格式为：解释器 -c/-e "脚本内容" [剩余参数] 时匹配。
+    """
+    cmd = command.strip()
+    # 1. 提取解释器
+    parts = cmd.split(None, 2)
+    if len(parts) < 3:
+        return None
+    interpreter, flag, rest = parts[0], parts[1], parts[2]
+    if interpreter not in _INTERPRETERS or flag not in _SCRIPT_FLAGS:
+        return None
+
+    # 2. 找到第一个引号
+    quote_char = None
+    script_start = -1
+    for i, ch in enumerate(rest):
+        if ch in ('"', "'"):
+            quote_char = ch
+            script_start = i + 1
+            break
+    if quote_char is None or script_start >= len(rest):
+        return None
+
+    # 3. 逐字符扫描找匹配的结束引号（处理 \\" 转义）
+    script_end = -1
+    i = script_start
+    while i < len(rest):
+        ch = rest[i]
+        if ch == "\\":
+            i += 2  # 跳过转义序列
+            continue
+        if ch == quote_char:
+            script_end = i
+            break
+        i += 1
+
+    if script_end == -1:
+        return None  # 没有匹配的结束引号
+
+    script = rest[script_start:script_end]
+    rest_after = rest[script_end + 1 :].strip()
+
+    return {
+        "interpreter": interpreter,
+        "flag": flag,
+        "script": script,
+        "rest": rest_after,
+        "outer_quote": quote_char,
+    }
+
+
+def _rewrite_inline_script(command: str) -> tuple[str, Optional[str]]:
+    """
+    检测内联脚本命令，有多行/引号嵌套时自动写入临时文件。
+
+    支持两种场景：
+    1. 命令以解释器开头: python -c "多行脚本"
+    2. 链式命令中包含: cd xxx && python -c "多行脚本"
+
+    Args:
+        command: 原始命令
+
+    Returns:
+        (最终命令, 临时文件路径) — 无需改写则后者为 None
+    """
+    parsed = _parse_inline_script(command)
+    if not parsed:
+        # 命令不是以解释器开头，尝试扫描整个命令找内联脚本
+        command, tmp = _scan_and_rewrite_chain(command)
+        return command, tmp
+
+    script = parsed["script"]
+
+    # 只有脚本含换行才改写为临时文件。
+    # 简单的引号嵌套（has_same_quote）无需改写——Path A (shell=False)
+    # 通过 shlex.split 已能正确处理，走 rewrite 反而引入转义问题。
+    has_newline = "\n" in script
+    if not has_newline:
+        return command, None
+
+    # 反转义 shell 转义序列：\\ → \ , \" → "
+    # 原始脚本中的 \" 是为 shell 准备的转义，Python 源码文件不认
+    script = script.replace("\\\\", "\\").replace('\\"', '"')
+
+    ext = _SCRIPT_EXT.get(parsed["interpreter"], ".py")
+    fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="drifox_inline_", text=True)
+    try:
+        os.write(fd, script.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+    # 使用正斜杠避免 Windows 路径转义问题
+    # 路径加引号：避免临时目录含空格时 shlex.split 切碎路径 → FileNotFoundError
+    safe_path = tmp_path.replace("\\", "/")
+    new_cmd = f'{parsed["interpreter"]} "{safe_path}"'
+    if parsed["rest"]:
+        new_cmd += f" {parsed['rest']}"
+    return new_cmd, tmp_path
+
+
+def _scan_and_rewrite_chain(command: str) -> tuple[str, Optional[str]]:
+    """扫描链式命令中的内联脚本并改写为临时文件。
+
+    例如: cd xxx && python -c "多行脚本" → cd xxx && python "temp.py"
+    """
+    if sys.platform != "win32":
+        return command, None
+
+    # 构建解释器+标志的搜索模式: python -c, node -e, 等等
+    interp_pattern = "|".join(_INTERPRETERS)
+    flag_pattern = "|".join(_SCRIPT_FLAGS)
+    # 找到命令中任意位置的 解释器 标志 组合
+    pattern = re.compile(rf"\b({interp_pattern})\s+({flag_pattern})\s+", re.IGNORECASE)
+
+    result_cmd = command
+    any_rewritten = False
+    tmp_files = []
+
+    # 从后往前替换，避免偏移问题
+    matches = list(pattern.finditer(result_cmd))
+    for m in reversed(matches):
+        interp = m.group(1)
+        flag = m.group(2)
+        start = m.end()  # 引号开始位置
+
+        # 找引号内的脚本
+        rest = result_cmd[start:]
+        quote_char = None
+        script_start = -1
+        for i, ch in enumerate(rest):
+            if ch in ('"', "'"):
+                quote_char = ch
+                script_start = i + 1
+                break
+        if quote_char is None or script_start >= len(rest):
+            continue
+
+        # 找匹配的结束引号
+        script_end = -1
+        i = script_start
+        while i < len(rest):
+            ch = rest[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote_char:
+                script_end = i
+                break
+            i += 1
+
+        if script_end == -1:
+            continue
+
+        script = rest[script_start:script_end]
+        if "\n" not in script:
+            continue  # 无换行，不需要改写
+
+        # 改写为临时文件
+        script = script.replace("\\\\", "\\").replace('\\"', '"')
+        ext = _SCRIPT_EXT.get(interp.lower(), ".py")
+        fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="drifox_inline_", text=True)
+        try:
+            os.write(fd, script.encode("utf-8"))
+        finally:
+            os.close(fd)
+        tmp_files.append(tmp_path)
+
+        safe_path = tmp_path.replace("\\", "/")
+        # 替换原文中的内联脚本部分（去掉 -c/-e 标志，直接用脚本文件）
+        # m.start() = "python" 的起始位置，m.end() = "-c " 之后的引号前位置
+        before = result_cmd[: m.start()]  # "cd xxx && " 部分
+        after = result_cmd[start + script_end + 1:]  # 跳过结束引号
+        result_cmd = f'{before}{interp} "{safe_path}"{after}'
+        any_rewritten = True
+        logger.debug(f"[Bash] chain inline script → temp: {tmp_path}")
+
+    if any_rewritten:
+        return result_cmd, tmp_files[0] if len(tmp_files) == 1 else tmp_files[0]
+    return command, None
+
+
+def _cleanup_script_temp(path: Optional[str]) -> None:
+    """安全删除临时脚本文件"""
+    if path:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 def _smart_decode(data: bytes, command: str = "") -> str:
@@ -140,6 +398,17 @@ class BackgroundTaskManager:
     def reset_instance(cls):
         """重置单例（仅用于测试）"""
         cls._instance = None
+
+    @classmethod
+    def clear_workdir_getter(cls):
+        """解除单例对最后窗口 workdir getter 的持有（泄漏修复 6c）。
+
+        窗口关闭时由 TerminalTools.cleanup() 调用：置 None 后 _effective_workdir
+        回退静态缓存 _workdir（由 BuiltinTools.set_workdir 随项目切换更新），
+        功能不中断，且已关闭窗口的 getter 闭包不再被单例强引用。
+        """
+        if cls._instance is not None:
+            cls._instance._get_workdir = None
 
     def set_workdir(self, workdir: Path):
         """设置工作目录"""
@@ -340,6 +609,16 @@ class TerminalTools:
     @property
     def workdir(self) -> Path:
         return self._owner.workdir
+
+    def cleanup(self):
+        """窗口关闭时解除 BackgroundTaskManager 单例对 workdir getter 的持有（泄漏修复 6c）。
+
+        BackgroundTaskManager 是全局单例，__init__ 注册的 lambda 捕获 self
+        （TerminalTools），单例强引用它 → 窗口对象树无法回收。窗口关闭链
+        （backend.cleanup → tool_executor.cleanup）调用本方法后，getter 置空，
+        _effective_workdir 回退静态缓存，功能不中断。
+        """
+        BackgroundTaskManager.clear_workdir_getter()
 
     def execute_bash(self, command: str, timeout: int = 120) -> ToolResult:
         """执行 shell 命令，支持可靠的 timeout
